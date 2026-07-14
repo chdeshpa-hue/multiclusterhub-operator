@@ -89,7 +89,7 @@ const (
 	// FailedApplyingComponent is added when a component template fails to apply
 	FailedApplyingComponent = "FailedApplyingComponent"
 
-	// WaitingForMCEReason is added when the hub is waiting for MultiClusterEngine to be ready
+// WaitingForMCEReason is added when the hub is waiting for MultiClusterEngine to be ready
 	WaitingForMCEReason = "WaitingForMCE"
 
 	// WaitingForNamespaceReason is added when the hub is waiting for a namespace to be created
@@ -97,7 +97,29 @@ const (
 
 	// ComponentNotReadyReason is added when a prerequisite component is not yet available
 	ComponentNotReadyReason = "ComponentNotReady"
+
+// Reasons for HubCondition FinalizeProgress (MultiClusterHub deletion / uninstall visibility)
+	FinalizePhaseStartingReason                 = "FinalizeStarting"
+	FinalizePhaseApplicationSubscriptionsReason = "FinalizeApplicationSubscriptions"
+	FinalizePhaseHubComponentsReason            = "FinalizeHubComponents"
+	FinalizePhaseClusterBackupNamespaceReason   = "FinalizeClusterBackupNamespace"
+	FinalizePhaseClusterRolesReason             = "FinalizeClusterRoles"
+	FinalizePhaseClusterRoleBindingsReason      = "FinalizeClusterRoleBindings"
+	FinalizePhaseMultiClusterEngineReason       = "FinalizeMultiClusterEngine"
+	FinalizePhaseOrphanMultiClusterEngineReason = "FinalizeOrphanMultiClusterEngine"
+
+	maxFinalizeProgressMessageLen = 4096
 )
+)
+
+// RecordFinalizeProgress sets status.conditions FinalizeProgress for visibility while the hub finalizer runs.
+func RecordFinalizeProgress(m *operatorsv1.MultiClusterHub, phaseReason string, detail string) {
+	msg := detail
+	if len(msg) > maxFinalizeProgressMessageLen {
+		msg = msg[:maxFinalizeProgressMessageLen] + "… (truncated)"
+	}
+	SetHubCondition(&m.Status, *NewHubCondition(operatorsv1.FinalizeProgress, metav1.ConditionTrue, phaseReason, msg))
+}
 
 var (
 	prevAvailability = make(map[string]bool)

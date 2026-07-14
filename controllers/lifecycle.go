@@ -41,6 +41,7 @@ import (
 
 func (r *MultiClusterHubReconciler) finalizeHub(ctx context.Context, reqLogger logr.Logger,
 	m *operatorv1.MultiClusterHub, ocpConsole, isSTSEnabled bool) error {
+	RecordFinalizeProgress(m, FinalizePhaseStartingReason, "MultiClusterHub finalization sequence started.")
 	if err := r.cleanupAppSubscriptions(ctx, reqLogger, m); err != nil {
 		return err
 	}
@@ -53,20 +54,19 @@ func (r *MultiClusterHubReconciler) finalizeHub(ctx context.Context, reqLogger l
 			continue
 		}
 
-		result, err := r.ensureNoComponent(ctx, m, c, r.CacheSpec, isSTSEnabled)
-		if err != nil || result != (ctrl.Result{}) {
-			msg := fmt.Sprintf("Waiting for component %s to terminate", c)
-			if err != nil {
-				msg = fmt.Sprintf("%s: %s", msg, err.Error())
-			}
-			condition := NewHubCondition(operatorv1.Terminating, metav1.ConditionTrue, DeleteTimestampReason, msg)
-			SetHubCondition(&m.Status, *condition)
+RecordFinalizeProgress(m, FinalizePhaseHubComponentsReason,
+			fmt.Sprintf("Removing hub component %q (Helm template resources and related cleanup).", c))
 
-			if err != nil {
-				reqLogger.Info("Component removal incomplete", "component", c, "reason", err.Error())
-				return err
-			}
-			reqLogger.Info("Component removal requires requeue", "component", c)
+		result, err := r.ensureNoComponent(context.TODO(), m, c, r.CacheSpec, isSTSEnabled)
+		if err != nil {
+			RecordFinalizeProgress(m, FinalizePhaseHubComponentsReason,
+				fmt.Sprintf("Removing hub component %q reported an error: %v.", c, err))
+			return err
+		}
+
+		if result != (ctrl.Result{}) {
+			RecordFinalizeProgress(m, FinalizePhaseHubComponentsReason,
+				fmt.Sprintf("Removing hub component %q incomplete; reconciler will retry (blocked resources may still terminate).", c))
 			return errors.NewBadRequest(fmt.Sprintf("Requeue needed for component: %v", c))
 		}
 	}
@@ -92,6 +92,7 @@ func (r *MultiClusterHubReconciler) finalizeHub(ctx context.Context, reqLogger l
 		}
 	}
 
+	RemoveHubCondition(&m.Status, operatorv1.FinalizeProgress)
 	reqLogger.Info("Successfully finalized multiClusterHub")
 	return nil
 }
