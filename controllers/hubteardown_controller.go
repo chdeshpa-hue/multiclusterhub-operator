@@ -487,7 +487,7 @@ func (r *HubTeardownReconciler) markWarningsEmitted(ctx context.Context, td *ope
 func (r *HubTeardownReconciler) ensureOLMGate(ctx context.Context, log logr.Logger) error {
 	sub, err := r.findACMSubscription(ctx)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if isNoMatchError(err) {
 			return nil
 		}
 		return err

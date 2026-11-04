@@ -140,8 +140,8 @@ func (r *HubTeardownReconciler) phaseGateOLMSubscription(ctx context.Context, lo
 
 	sub, err := r.findACMSubscription(ctx)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			log.Info("No ACM Subscription found, skipping OLM gate")
+		if isNoMatchError(err) {
+			log.Info("ACM Subscription API not present or no Subscription found, skipping OLM gate")
 			return true, nil
 		}
 		return false, fmt.Errorf("finding ACM subscription: %w", err)
@@ -1422,7 +1422,7 @@ func (r *HubTeardownReconciler) isNamespaceEmpty(ctx context.Context, ns string)
 func (r *HubTeardownReconciler) releaseOLMGate(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error) {
 	sub, err := r.findACMSubscription(ctx)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if isNoMatchError(err) {
 			return true, nil
 		}
 		return false, fmt.Errorf("finding ACM subscription for gate release: %w", err)
@@ -1569,74 +1569,25 @@ func (r *HubTeardownReconciler) phaseRemoveOLMOperator(ctx context.Context, log 
 
 	sub, err := r.findACMSubscription(ctx)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if isNoMatchError(err) {
 			log.Info("ACM Subscription already gone, checking for lingering CSV")
 			if deleted, delErr := r.deleteLingeringACMCSV(ctx, log, td); delErr != nil {
 				return false, fmt.Errorf("deleting lingering ACM CSV: %w", delErr)
 			} else if deleted {
 				log.Info("Deleted lingering ACM CSV after Subscription was already gone")
 			}
-			return true, nil
+			if err := r.cleanupTeardownJob(ctx, log, td); err != nil {
+				log.Error(err, "Failed to cleanup teardown Job (non-fatal)")
+			}
+			return r.persistCompleteAndReleaseFinalizer(ctx, log, td)
 		}
 		return false, fmt.Errorf("finding ACM subscription for removal: %w", err)
 	}
 
-	// Step 1: Persist "Complete" status BEFORE any destructive action.
-	now := metav1.Now()
-	r.setPhaseStatusWithTime(td, operatorv1.TeardownPhaseRemoveOLMOperator, operatorv1.PhaseStateComplete, "Phase completed", &now)
-	td.Status.Phase = operatorv1.TeardownPhaseComplete
-	r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionFalse, "TeardownComplete",
-		"All teardown phases completed successfully.")
-	r.setCondition(td, conditionTypeTeardownComplete, metav1.ConditionTrue, "Complete",
-		"RHACM teardown finished. Review events for cloud resource orphan details.")
-	// Gap 7: Explicitly clear any stale Stalled=True condition when setting Complete.
-	r.setCondition(td, conditionTypeTeardownStalled, metav1.ConditionFalse, "TeardownComplete",
-		"Teardown completed successfully.")
-	// Gap 8: Clear stale blockingResources now that teardown is complete.
-	td.Status.BlockingResources = nil
-	// v11-A: Clear stale dry-run fields so printer columns and conditions
-	// don't mislead support engineers into thinking teardown is incomplete.
-	td.Status.CloudResourceWarnings = nil
-	if td.Status.DryRunReport != nil {
-		td.Status.DryRunReport.TotalBlockingResources = 0
-		td.Status.DryRunReport.TotalCloudRiskResources = 0
-	}
-	r.setCondition(td, conditionTypeCloudResourcesRisk, metav1.ConditionFalse, "TeardownComplete",
-		"Teardown completed — cloud resource warnings cleared.")
-
-	if err := r.Client.Status().Update(ctx, td); err != nil {
-		return false, fmt.Errorf("persisting Complete status before OLM removal: %w", err)
-	}
-	log.Info("Persisted Complete status on HubTeardown CR")
-
-	// Step 2: Verify status was actually persisted via uncached read.
-	// In degraded API server scenarios the cached client may report success
-	// while the write was lost. Do not proceed to self-destruct without
-	// confirming the terminal status is durable.
-	verified := &operatorv1.HubTeardown{}
-	verifyKey := types.NamespacedName{Name: td.Name, Namespace: td.Namespace}
-	if err := r.UncachedClient.Get(ctx, verifyKey, verified); err != nil {
-		return false, fmt.Errorf("read-back verification failed: %w", err)
-	}
-	if verified.Status.Phase != operatorv1.TeardownPhaseComplete {
-		log.Info("Read-back shows status not yet Complete, retrying", "readBackPhase", verified.Status.Phase)
-		return false, nil
-	}
-	log.Info("Read-back confirmed Complete status is persisted")
-
-	// Step 3: Re-fetch the CR to get a fresh resourceVersion, then remove
-	// the finalizer. This avoids the conflict error that occurs when the
-	// status update in Step 1 changes the resourceVersion under us.
-	fresh := &operatorv1.HubTeardown{}
-	if err := r.Client.Get(ctx, verifyKey, fresh); err != nil {
-		return false, fmt.Errorf("re-fetching HubTeardown for finalizer removal: %w", err)
-	}
-	if controllerutil.ContainsFinalizer(fresh, teardownJobFinalizer) {
-		controllerutil.RemoveFinalizer(fresh, teardownJobFinalizer)
-		if err := r.Client.Update(ctx, fresh); err != nil {
-			return false, fmt.Errorf("removing teardown finalizer: %w", err)
-		}
-		log.Info("Removed teardown finalizer from HubTeardown CR")
+	// Steps 1-3: persist terminal status and release the finalizer BEFORE any
+	// destructive action.
+	if done, err := r.persistCompleteAndReleaseFinalizer(ctx, log, td); err != nil || !done {
+		return done, err
 	}
 
 	r.Recorder.Event(td, corev1.EventTypeNormal, "TeardownComplete",
@@ -1666,7 +1617,7 @@ func (r *HubTeardownReconciler) phaseRemoveOLMOperator(ctx context.Context, log 
 	// Subscription/CSV, leaving them orphaned in multicluster-engine namespace.
 	mceSub, mceErr := r.findMCESubscription(ctx)
 	if mceErr != nil {
-		if !errors.IsNotFound(mceErr) {
+		if !isNoMatchError(mceErr) {
 			log.Error(mceErr, "Failed to find MCE Subscription")
 		}
 	} else {
@@ -1768,6 +1719,72 @@ func (r *HubTeardownReconciler) findMCESubscription(ctx context.Context) (*unstr
 
 // deleteLingeringACMCSV finds and deletes any ACM ClusterServiceVersion that
 // still exists after the Subscription has been removed.
+// persistCompleteAndReleaseFinalizer writes the terminal Complete status, verifies
+// the write through an uncached read, then removes the teardown finalizer. Every
+// exit path of phaseRemoveOLMOperator must call it so that a hub without an OLM
+// Subscription still reaches a durable terminal state.
+func (r *HubTeardownReconciler) persistCompleteAndReleaseFinalizer(
+	ctx context.Context,
+	log logr.Logger,
+	td *operatorv1.HubTeardown,
+) (bool, error) {
+	now := metav1.Now()
+	r.setPhaseStatusWithTime(td, operatorv1.TeardownPhaseRemoveOLMOperator, operatorv1.PhaseStateComplete, "Phase completed", &now)
+	td.Status.Phase = operatorv1.TeardownPhaseComplete
+	r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionFalse, "TeardownComplete",
+		"All teardown phases completed successfully.")
+	r.setCondition(td, conditionTypeTeardownComplete, metav1.ConditionTrue, "Complete",
+		"RHACM teardown finished. Review events for cloud resource orphan details.")
+	// Gap 7: Explicitly clear any stale Stalled=True condition when setting Complete.
+	r.setCondition(td, conditionTypeTeardownStalled, metav1.ConditionFalse, "TeardownComplete",
+		"Teardown completed successfully.")
+	// Gap 8: Clear stale blockingResources now that teardown is complete.
+	td.Status.BlockingResources = nil
+	// v11-A: Clear stale dry-run fields so printer columns and conditions
+	// don't mislead support engineers into thinking teardown is incomplete.
+	td.Status.CloudResourceWarnings = nil
+	if td.Status.DryRunReport != nil {
+		td.Status.DryRunReport.TotalBlockingResources = 0
+		td.Status.DryRunReport.TotalCloudRiskResources = 0
+	}
+	r.setCondition(td, conditionTypeCloudResourcesRisk, metav1.ConditionFalse, "TeardownComplete",
+		"Teardown completed — cloud resource warnings cleared.")
+
+	if err := r.Client.Status().Update(ctx, td); err != nil {
+		return false, fmt.Errorf("persisting Complete status before OLM removal: %w", err)
+	}
+	log.Info("Persisted Complete status on HubTeardown CR")
+
+	// Verify the write through an uncached read. In degraded API server scenarios
+	// the cached client may report success while the write was lost. Do not proceed
+	// to self-destruct without confirming the terminal status is durable.
+	verified := &operatorv1.HubTeardown{}
+	verifyKey := types.NamespacedName{Name: td.Name, Namespace: td.Namespace}
+	if err := r.UncachedClient.Get(ctx, verifyKey, verified); err != nil {
+		return false, fmt.Errorf("read-back verification failed: %w", err)
+	}
+	if verified.Status.Phase != operatorv1.TeardownPhaseComplete {
+		log.Info("Read-back shows status not yet Complete, retrying", "readBackPhase", verified.Status.Phase)
+		return false, nil
+	}
+	log.Info("Read-back confirmed Complete status is persisted")
+
+	// Re-fetch the CR for a fresh resourceVersion before removing the finalizer,
+	// so the status update above does not invalidate the write.
+	fresh := &operatorv1.HubTeardown{}
+	if err := r.Client.Get(ctx, verifyKey, fresh); err != nil {
+		return false, fmt.Errorf("re-fetching HubTeardown for finalizer removal: %w", err)
+	}
+	if controllerutil.ContainsFinalizer(fresh, teardownJobFinalizer) {
+		controllerutil.RemoveFinalizer(fresh, teardownJobFinalizer)
+		if err := r.Client.Update(ctx, fresh); err != nil {
+			return false, fmt.Errorf("removing teardown finalizer: %w", err)
+		}
+		log.Info("Removed teardown finalizer from HubTeardown CR")
+	}
+	return true, nil
+}
+
 func (r *HubTeardownReconciler) deleteLingeringACMCSV(
 	ctx context.Context,
 	log logr.Logger,

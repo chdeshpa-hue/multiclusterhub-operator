@@ -10,12 +10,15 @@ import (
 
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -59,12 +62,16 @@ var _ = Describe("HubTeardown controller", func() {
 		Expect(cfg).NotTo(BeNil())
 
 		Expect(operatorv1.AddToScheme(clientScheme)).Should(Succeed())
+		Expect(corev1.AddToScheme(clientScheme)).Should(Succeed())
 		Expect(batchv1.AddToScheme(clientScheme)).Should(Succeed())
 		Expect(apixv1.AddToScheme(clientScheme)).Should(Succeed())
 		Expect(subv1alpha1.AddToScheme(clientScheme)).Should(Succeed())
 
 		k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
 			Scheme: clientScheme,
+			Controller: config.Controller{
+				SkipNameValidation: ptr.To(true),
+			},
 			Metrics: metricsserver.Options{
 				BindAddress: "0",
 			},
@@ -87,6 +94,9 @@ var _ = Describe("HubTeardown controller", func() {
 		Expect(tdReconciler.SetupWithManager(k8sManager)).Should(Succeed())
 
 		ctxTD, cancelTD = context.WithCancel(context.Background())
+		Expect(client.IgnoreAlreadyExists(uncachedClient.Create(ctxTD, &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: tdNs},
+		}))).To(Succeed())
 		go func() {
 			defer GinkgoRecover()
 			Expect(k8sManager.Start(ctxTD)).Should(Succeed())

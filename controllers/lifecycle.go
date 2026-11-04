@@ -54,19 +54,23 @@ func (r *MultiClusterHubReconciler) finalizeHub(ctx context.Context, reqLogger l
 			continue
 		}
 
-RecordFinalizeProgress(m, FinalizePhaseHubComponentsReason,
+		RecordFinalizeProgress(m, FinalizePhaseHubComponentsReason,
 			fmt.Sprintf("Removing hub component %q (Helm template resources and related cleanup).", c))
 
-		result, err := r.ensureNoComponent(context.TODO(), m, c, r.CacheSpec, isSTSEnabled)
+		result, err := r.ensureNoComponent(ctx, m, c, r.CacheSpec, isSTSEnabled)
 		if err != nil {
 			RecordFinalizeProgress(m, FinalizePhaseHubComponentsReason,
 				fmt.Sprintf("Removing hub component %q reported an error: %v.", c, err))
+			SetHubCondition(&m.Status, *NewHubCondition(operatorv1.Terminating, metav1.ConditionTrue, DeleteTimestampReason,
+				fmt.Sprintf("Waiting for component %s to terminate: %s", c, err.Error())))
 			return err
 		}
 
 		if result != (ctrl.Result{}) {
 			RecordFinalizeProgress(m, FinalizePhaseHubComponentsReason,
 				fmt.Sprintf("Removing hub component %q incomplete; reconciler will retry (blocked resources may still terminate).", c))
+			SetHubCondition(&m.Status, *NewHubCondition(operatorv1.Terminating, metav1.ConditionTrue, DeleteTimestampReason,
+				fmt.Sprintf("Waiting for component %s to terminate", c)))
 			return errors.NewBadRequest(fmt.Sprintf("Requeue needed for component: %v", c))
 		}
 	}

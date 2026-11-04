@@ -73,7 +73,7 @@ func (r *MultiClusterHubReconciler) cleanupClusterRoleBindings(ctx context.Conte
 
 func (r *MultiClusterHubReconciler) cleanupMultiClusterEngine(ctx context.Context, log logr.Logger,
 	m *operatorsv1.MultiClusterHub) error {
-	RecordFinalizeProgress(m, FinalizePhaseMultiClusterEngineReason,
+	RecordFinalizeProgress(m, FinalizePhaseMultiClusterEngineReason, "Resolving managed MultiClusterEngine.")
 	mce, err := multiclusterengineutils.GetManagedMCE(ctx, r.Client)
 	if err != nil && !apimeta.IsNoMatchError(err) {
 		RecordFinalizeProgress(m, FinalizePhaseMultiClusterEngineReason,
@@ -93,8 +93,10 @@ func (r *MultiClusterHubReconciler) cleanupMultiClusterEngine(ctx context.Contex
 				fmt.Sprintf("Deleting MultiClusterEngine failed: %v", err))
 			return err
 		}
-RecordFinalizeProgress(m, FinalizePhaseMultiClusterEngineReason,
+		RecordFinalizeProgress(m, FinalizePhaseMultiClusterEngineReason,
 			"MultiClusterEngine delete requested; waiting for the resource and its dependents to finalize.")
+		SetHubCondition(&m.Status, *NewHubCondition(operatorsv1.Terminating, metav1.ConditionTrue, DeleteTimestampReason,
+			fmt.Sprintf("Waiting for MultiClusterEngine %s to terminate", mce.GetName())))
 		return fmt.Errorf("MCE has not yet been terminated")
 	}
 
@@ -207,8 +209,10 @@ RecordFinalizeProgress(m, FinalizePhaseMultiClusterEngineReason,
 			if err != nil && !errors.IsNotFound(err) {
 				return err
 			}
-RecordFinalizeProgress(m, FinalizePhaseMultiClusterEngineReason,
-				"Waiting for multicluster-engine namespace to terminate.")
+			RecordFinalizeProgress(m, FinalizePhaseMultiClusterEngineReason,
+				fmt.Sprintf("Waiting for namespace %s to terminate.", nsName))
+			SetHubCondition(&m.Status, *NewHubCondition(operatorsv1.Terminating, metav1.ConditionTrue, DeleteTimestampReason,
+				fmt.Sprintf("Waiting for namespace %s to terminate", nsName)))
 			return fmt.Errorf("namespace has not yet been terminated")
 		}
 	} else {
@@ -221,9 +225,7 @@ RecordFinalizeProgress(m, FinalizePhaseMultiClusterEngineReason,
 func (r *MultiClusterHubReconciler) cleanupNamespaces(ctx context.Context, reqLogger logr.Logger,
 	m *operatorsv1.MultiClusterHub) error {
 	RecordFinalizeProgress(m, FinalizePhaseClusterBackupNamespaceReason,
-	RecordFinalizeProgress(m, FinalizePhaseClusterBackupNamespaceReason,
-	RecordFinalizeProgress(m, FinalizePhaseClusterBackupNamespaceReason,
-	ctx := context.Background()
+		fmt.Sprintf("Deleting cluster backup namespace %q.", utils.ClusterSubscriptionNamespace))
 	clusterBackupNamespace := &corev1.Namespace{}
 	err := r.Client.Get(ctx, types.NamespacedName{Name: utils.ClusterSubscriptionNamespace}, clusterBackupNamespace)
 	if errors.IsNotFound(err) {
@@ -267,7 +269,7 @@ func (r *MultiClusterHubReconciler) cleanupNamespaces(ctx context.Context, reqLo
 }
 func (r *MultiClusterHubReconciler) cleanupAppSubscriptions(ctx context.Context, reqLogger logr.Logger,
 	m *operatorsv1.MultiClusterHub) error {
-	RecordFinalizeProgress(m, FinalizePhaseApplicationSubscriptionsReason,
+	RecordFinalizeProgress(m, FinalizePhaseApplicationSubscriptionsReason, "Deleting Application Subscriptions and HelmReleases.")
 	installerLabels := client.MatchingLabels{
 		"installer.name":      m.GetName(),
 		"installer.namespace": m.GetNamespace(),
@@ -370,7 +372,7 @@ func (r *MultiClusterHubReconciler) cleanupAppSubscriptions(ctx context.Context,
 
 func (r *MultiClusterHubReconciler) orphanOwnedMultiClusterEngine(ctx context.Context, reqLogger logr.Logger,
 	m *operatorsv1.MultiClusterHub) error {
-	RecordFinalizeProgress(m, FinalizePhaseOrphanMultiClusterEngineReason,
+	RecordFinalizeProgress(m, FinalizePhaseOrphanMultiClusterEngineReason, "Orphaning MultiClusterEngine not owned by this MultiClusterHub.")
 	mce, err := multiclusterengineutils.GetManagedMCE(ctx, r.Client)
 	if mce == nil {
 		// MCE does not exist

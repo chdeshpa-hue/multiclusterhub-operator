@@ -512,7 +512,7 @@ func newTestScheme() *runtime.Scheme {
 	return s
 }
 
-func newTestReconciler() *HubTeardownReconciler {
+func newTeardownTestReconciler() *HubTeardownReconciler {
 	s := newTestScheme()
 	return &HubTeardownReconciler{
 		Client:   fake.NewClientBuilder().WithScheme(s).Build(),
@@ -532,7 +532,7 @@ func TestEnsureTeardownJob_CreatesJob(t *testing.T) {
 		},
 	}
 
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 	os.Setenv("OPERATOR_IMAGE", "quay.io/test/operator:latest")
 	defer os.Unsetenv("OPERATOR_IMAGE")
 
@@ -591,7 +591,7 @@ func TestEnsureTeardownJob_NoImageSkips(t *testing.T) {
 		},
 	}
 
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 	os.Unsetenv("OPERATOR_IMAGE")
 	os.Unsetenv("RELATED_IMAGE_MULTICLUSTERHUB_OPERATOR")
 
@@ -622,7 +622,7 @@ func TestEnsureTeardownJob_Idempotent(t *testing.T) {
 		},
 	}
 
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 	os.Setenv("OPERATOR_IMAGE", "quay.io/test/operator:latest")
 	defer os.Unsetenv("OPERATOR_IMAGE")
 
@@ -689,7 +689,7 @@ func TestCleanupTeardownJob_NotFound(t *testing.T) {
 		},
 	}
 
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 	ctx := context.Background()
 	log := ctrllog.Log.WithName("test")
 
@@ -1021,7 +1021,7 @@ func TestEnsureOLMGate_NoSubscriptionIsNoop(t *testing.T) {
 }
 
 func TestShouldResolveStuckFinalizers(t *testing.T) {
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 	pastTime := metav1.NewTime(time.Now().Add(-10 * time.Minute))
 	recentTime := metav1.NewTime(time.Now().Add(-30 * time.Second))
 
@@ -1146,7 +1146,7 @@ func TestDeleteAgentInstallWebhooks_DeletesVWC(t *testing.T) {
 
 func TestDeleteAgentInstallWebhooks_NoWebhooksIsNoop(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 
 	td := &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
@@ -1161,7 +1161,7 @@ func TestDeleteAgentInstallWebhooks_NoWebhooksIsNoop(t *testing.T) {
 
 func TestResolveMCHBlockingFinalizers_NoMatchIsNoop(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 
 	td := &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
@@ -1181,7 +1181,7 @@ func TestResolveMCHBlockingFinalizers_NoMatchIsNoop(t *testing.T) {
 
 func TestEnsureMCEDeleted_NoMatchIsNoop(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 
 	td := &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
@@ -1196,7 +1196,7 @@ func TestEnsureMCEDeleted_NoMatchIsNoop(t *testing.T) {
 
 func TestCleanupLocalCluster_NoMatchIsNoop(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 
 	td := &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
@@ -1211,7 +1211,7 @@ func TestCleanupLocalCluster_NoMatchIsNoop(t *testing.T) {
 
 func TestPhaseMonitorMCEChain_AllGoneCompletesPhase(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 
 	td := &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
@@ -1237,7 +1237,7 @@ func TestPhaseGateOLMSubscription_CommentVerification(t *testing.T) {
 	// Verify the OLM gate comment exists (Gap 5) by checking the function's
 	// behavior: when no Subscription exists, the phase completes.
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 
 	td := &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
@@ -1408,7 +1408,7 @@ func TestPhaseRemoveOLMOperator_DeletesMCESubscriptionAndCSV(t *testing.T) {
 
 func TestSweepMCSAndCMA_NoMatchIsNoop(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 	log := ctrllog.Log.WithName("test")
 
 	td := &operatorv1.HubTeardown{
@@ -1422,7 +1422,7 @@ func TestSweepMCSAndCMA_NoMatchIsNoop(t *testing.T) {
 
 func TestEnsureMCEDeleted_NoMatchIsNoop_v11(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	r := newTestReconciler()
+	r := newTeardownTestReconciler()
 	log := ctrllog.Log.WithName("test")
 
 	td := &operatorv1.HubTeardown{

@@ -89,7 +89,7 @@ const (
 	// FailedApplyingComponent is added when a component template fails to apply
 	FailedApplyingComponent = "FailedApplyingComponent"
 
-// WaitingForMCEReason is added when the hub is waiting for MultiClusterEngine to be ready
+	// WaitingForMCEReason is added when the hub is waiting for MultiClusterEngine to be ready
 	WaitingForMCEReason = "WaitingForMCE"
 
 	// WaitingForNamespaceReason is added when the hub is waiting for a namespace to be created
@@ -98,7 +98,7 @@ const (
 	// ComponentNotReadyReason is added when a prerequisite component is not yet available
 	ComponentNotReadyReason = "ComponentNotReady"
 
-// Reasons for HubCondition FinalizeProgress (MultiClusterHub deletion / uninstall visibility)
+	// Reasons for HubCondition FinalizeProgress (MultiClusterHub deletion / uninstall visibility)
 	FinalizePhaseStartingReason                 = "FinalizeStarting"
 	FinalizePhaseApplicationSubscriptionsReason = "FinalizeApplicationSubscriptions"
 	FinalizePhaseHubComponentsReason            = "FinalizeHubComponents"
@@ -109,7 +109,6 @@ const (
 	FinalizePhaseOrphanMultiClusterEngineReason = "FinalizeOrphanMultiClusterEngine"
 
 	maxFinalizeProgressMessageLen = 4096
-)
 )
 
 // RecordFinalizeProgress sets status.conditions FinalizeProgress for visibility while the hub finalizer runs.
