@@ -247,7 +247,7 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 	if td.Status.ActiveSince == nil {
 		return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
 	}
-	if r.isPhaseComplete(td, operatorv1.TeardownPhaseRemoveOLMOperator) {
+	if r.isPhaseComplete(td, operatorv1.TeardownPhaseVerifying) {
 		if r.isConditionTrue(td, conditionTypeTeardownStalled) {
 			r.setCondition(td, conditionTypeTeardownStalled, metav1.ConditionFalse, "TeardownComplete",
 				"Teardown completed successfully; stall condition cleared.")
@@ -275,7 +275,7 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 		if !td.Spec.ApprovedDestructiveActions {
 			switch td.Status.Phase {
 			case operatorv1.TeardownPhaseDisableAddons, operatorv1.TeardownPhaseDetachManagedClusters,
-				operatorv1.TeardownPhaseCleanOrphans, operatorv1.TeardownPhaseDeleteMCH:
+				operatorv1.TeardownPhaseDeleteMCH:
 				stalledMsg += " Consider setting spec.approvedDestructiveActions=true to resolve stuck Tier 2 finalizers."
 			}
 		}
@@ -305,16 +305,6 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 		log.Error(err, "Failed to ensure teardown Job (controller will continue without resilient Job)")
 	}
 
-	// Re-verify the OLM gate finalizer on every active reconcile. If an admin
-	// or OLM catalog update removed it, re-add it to prevent the operator from
-	// being deleted mid-teardown. Only skip if we're past CleanOrphans (gate
-	// was intentionally released).
-	if !r.isPhaseComplete(td, operatorv1.TeardownPhaseCleanOrphans) {
-		if err := r.ensureOLMGate(ctx, log); err != nil {
-			log.Error(err, "Failed to re-verify OLM gate finalizer")
-		}
-	}
-
 	// Clear WaitingForApproval if the user has now granted the required approvals.
 	if td.Spec.ApprovedDestructiveActions || td.Spec.AcknowledgeCloudResourceRisk {
 		r.clearWaitingForApproval(td)
@@ -336,23 +326,31 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 	return result, nil
 }
 
-// executePhases runs through teardown phases in order, resuming from the last completed phase.
-func (r *HubTeardownReconciler) executePhases(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (ctrl.Result, error) {
-	phases := []struct {
-		phase   operatorv1.TeardownPhase
-		execute func(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error)
-	}{
-		{operatorv1.TeardownPhaseGateOLMSubscription, r.phaseGateOLMSubscription},
+// teardownPhaseStep is one entry in the ordered teardown plan.
+type teardownPhaseStep struct {
+	phase   operatorv1.TeardownPhase
+	execute func(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error)
+}
+
+// teardownPhasePlan is the ordered plan. GateOLMSubscription, CleanOrphans and
+// RemoveOLMOperator are absent by design: the operator is preserved (D-G) and
+// Verify owns the terminal write.
+func (r *HubTeardownReconciler) teardownPhasePlan() []teardownPhaseStep {
+	return []teardownPhaseStep{
 		{operatorv1.TeardownPhaseRemoveBlockingCRs, r.phaseRemoveBlockingCRs},
 		{operatorv1.TeardownPhaseDisableAddons, r.phaseDisableAddons},
 		{operatorv1.TeardownPhaseDeleteInfrastructureCRs, r.phaseDeleteInfrastructureCRs},
 		{operatorv1.TeardownPhaseDetachManagedClusters, r.phaseDetachManagedClusters},
 		{operatorv1.TeardownPhaseDeleteMCH, r.phaseDeleteMCH},
 		{operatorv1.TeardownPhaseMonitorMCEChain, r.phaseMonitorMCEChain},
-		{operatorv1.TeardownPhaseCleanOrphans, r.phaseCleanOrphans},
 		{operatorv1.TeardownPhaseDeleteACMCRDs, r.phaseDeleteACMCRDs},
-		{operatorv1.TeardownPhaseRemoveOLMOperator, r.phaseRemoveOLMOperator},
+		{operatorv1.TeardownPhaseVerifying, r.phaseVerify},
 	}
+}
+
+// executePhases runs through teardown phases in order, resuming from the last completed phase.
+func (r *HubTeardownReconciler) executePhases(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (ctrl.Result, error) {
+	phases := r.teardownPhasePlan()
 
 	for _, p := range phases {
 		if r.isPhaseComplete(td, p.phase) {
@@ -397,10 +395,8 @@ func (r *HubTeardownReconciler) executePhases(ctx context.Context, log logr.Logg
 		}
 	}
 
-	// phaseRemoveOLMOperator handles persisting Complete status, removing the
-	// finalizer, and deleting the Subscription/CSV itself — all before the
-	// self-destructive CSV deletion. By the time we reach here the CR is
-	// already in its terminal state. Nothing left to do.
+	// Verify wrote the terminal phase (Complete or CompleteWithResidue) and the
+	// residue report. Nothing left to do: the operator is preserved (D-G).
 	return ctrl.Result{}, nil
 }
 
@@ -495,31 +491,6 @@ func (r *HubTeardownReconciler) markWarningsEmitted(ctx context.Context, td *ope
 	if err := r.Client.Update(ctx, td); err != nil {
 		ctrllog.FromContext(ctx).Error(err, "Failed to mark warnings as emitted")
 	}
-}
-
-// ensureOLMGate re-verifies the teardown gate finalizer on the ACM Subscription.
-// Called on every active reconcile to guard against manual removal or OLM
-// catalog reconciliation recreating the Subscription without the gate.
-func (r *HubTeardownReconciler) ensureOLMGate(ctx context.Context, log logr.Logger) error {
-	sub, err := r.findACMSubscription(ctx)
-	if err != nil {
-		if isNoMatchError(err) {
-			return nil
-		}
-		return err
-	}
-	for _, f := range sub.GetFinalizers() {
-		if f == teardownGateFinalizer {
-			return nil
-		}
-	}
-	patch := client.MergeFrom(sub.DeepCopy())
-	sub.SetFinalizers(append(sub.GetFinalizers(), teardownGateFinalizer))
-	if err := r.Client.Patch(ctx, sub, patch); err != nil {
-		return fmt.Errorf("re-adding gate finalizer to Subscription: %w", err)
-	}
-	log.Info("Re-added OLM gate finalizer (was missing)", "subscription", sub.GetName())
-	return nil
 }
 
 func (r *HubTeardownReconciler) SetupWithManager(mgr ctrl.Manager) error {

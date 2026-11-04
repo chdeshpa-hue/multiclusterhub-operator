@@ -56,10 +56,21 @@ var _ = Describe("HubTeardown status schema", func() {
 		for _, phase := range []TeardownPhase{
 			TeardownPhaseVerifying,
 			TeardownPhaseCompleteWithResidue,
-			TeardownPhaseCleanOrphans,
+			TeardownPhaseEscalating,
 		} {
 			ht.Status.Phase = phase
 			Expect(k8sClient.Status().Update(ctx, ht)).To(Succeed(), "phase %q should be accepted", phase)
+		}
+
+		// Deleted phases must no longer be accepted: leaving them in the enum
+		// would let a stale CR re-enter a phase whose implementation is gone.
+		for _, removed := range []TeardownPhase{
+			TeardownPhase("GateOLMSubscription"),
+			TeardownPhase("CleanOrphans"),
+			TeardownPhase("RemoveOLMOperator"),
+		} {
+			ht.Status.Phase = removed
+			Expect(k8sClient.Status().Update(ctx, ht)).NotTo(Succeed(), "removed phase %q must be rejected", removed)
 		}
 
 		ht.Status.Phase = TeardownPhase("Verify")

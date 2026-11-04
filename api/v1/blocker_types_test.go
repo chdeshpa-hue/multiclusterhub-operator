@@ -170,10 +170,10 @@ func TestBlockerDeepCopyIsIndependent(t *testing.T) {
 // duplicated string value would make the generated enum list ambiguous.
 func TestTeardownPhaseValuesAreUnique(t *testing.T) {
 	values := []TeardownPhase{
-		TeardownPhaseDryRun, TeardownPhaseGateOLMSubscription, TeardownPhaseRemoveBlockingCRs,
+		TeardownPhaseDryRun, TeardownPhaseRemoveBlockingCRs,
 		TeardownPhaseDisableAddons, TeardownPhaseDeleteInfrastructureCRs, TeardownPhaseDetachManagedClusters,
-		TeardownPhaseDeleteMCH, TeardownPhaseMonitorMCEChain, TeardownPhaseCleanOrphans,
-		TeardownPhaseDeleteACMCRDs, TeardownPhaseRemoveOLMOperator, TeardownPhaseComplete,
+		TeardownPhaseDeleteMCH, TeardownPhaseMonitorMCEChain,
+		TeardownPhaseDeleteACMCRDs, TeardownPhaseComplete,
 		TeardownPhaseFailed, TeardownPhaseNotStarted, TeardownPhaseInspecting,
 		TeardownPhaseReportReady, TeardownPhaseConsentRequired, TeardownPhasePreparing,
 		TeardownPhaseHandedOff, TeardownPhaseStalled, TeardownPhaseEscalating,
@@ -186,8 +186,8 @@ func TestTeardownPhaseValuesAreUnique(t *testing.T) {
 		}
 		seen[v] = true
 	}
-	if len(seen) != 23 {
-		t.Fatalf("expected 23 distinct phase values, got %d", len(seen))
+	if len(seen) != 20 {
+		t.Fatalf("expected 20 distinct phase values, got %d", len(seen))
 	}
 	if TeardownPhaseComplete == TeardownPhaseCompleteWithResidue {
 		t.Fatalf("Complete and CompleteWithResidue must be distinct terminal states")

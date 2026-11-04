@@ -353,16 +353,13 @@ spec:
                     description: Phase is the mirrored phase of the referenced HubTeardown.
                     enum:
                     - DryRun
-                    - GateOLMSubscription
                     - RemoveBlockingCRs
                     - DisableAddons
                     - DeleteInfrastructureCRs
                     - DetachManagedClusters
                     - DeleteMCH
                     - MonitorMCEChain
-                    - CleanOrphans
                     - DeleteACMCRDs
-                    - RemoveOLMOperator
                     - Complete
                     - Failed
                     - NotStarted

@@ -9,8 +9,10 @@ import (
 	"time"
 
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -66,6 +68,8 @@ var _ = Describe("HubTeardown controller", func() {
 		Expect(batchv1.AddToScheme(clientScheme)).Should(Succeed())
 		Expect(apixv1.AddToScheme(clientScheme)).Should(Succeed())
 		Expect(subv1alpha1.AddToScheme(clientScheme)).Should(Succeed())
+		Expect(admissionregistrationv1.AddToScheme(clientScheme)).Should(Succeed())
+		Expect(rbacv1.AddToScheme(clientScheme)).Should(Succeed())
 
 		k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
 			Scheme: clientScheme,

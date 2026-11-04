@@ -300,13 +300,6 @@ func (r *HubTeardownReconciler) buildDryRunReport(graph *DependencyGraph) *opera
 
 	var phases []operatorv1.PlannedPhase
 
-	// Phase: GateOLMSubscription
-	phases = append(phases, operatorv1.PlannedPhase{
-		Phase:             operatorv1.TeardownPhaseGateOLMSubscription,
-		Action:            "Add finalizer to ACM OLM Subscription to prevent operator removal during teardown",
-		ResourcesAffected: 1,
-	})
-
 	// Phase: RemoveBlockingCRs
 	blockingDetails := make([]string, 0)
 	blockingCount := 0
@@ -409,7 +402,20 @@ func (r *HubTeardownReconciler) buildDryRunReport(graph *DependencyGraph) *opera
 		Details:           mceDetails,
 	})
 
-	// Phase: CleanOrphans
+	// Phase: DeleteACMCRDs
+	crdCount := 0
+	for _, dr := range graph.DiscoveredResources {
+		if dr.Ref.Kind != "HubTeardown" {
+			crdCount++
+		}
+	}
+	phases = append(phases, operatorv1.PlannedPhase{
+		Phase:             operatorv1.TeardownPhaseDeleteACMCRDs,
+		Action:            "Remove all ACM/MCE CRDs (HubTeardown CRD is preserved)",
+		ResourcesAffected: crdCount,
+	})
+
+	// Phase: Verify
 	orphanDetails := make([]string, 0)
 	cloudRiskCount := 0
 	for _, cr := range graph.CloudRiskResources {
@@ -431,38 +437,17 @@ func (r *HubTeardownReconciler) buildDryRunReport(graph *DependencyGraph) *opera
 		orphanDetails = append(orphanDetails, detail)
 	}
 	phases = append(phases, operatorv1.PlannedPhase{
-		Phase:              operatorv1.TeardownPhaseCleanOrphans,
-		Action:             "Detect and resolve stuck-terminating resources after MCE chain completes",
+		Phase:              operatorv1.TeardownPhaseVerifying,
+		Action:             "Verify the postcondition and report residue; the operator, its namespace, the CR and the report are expected survivors",
 		ResourcesAffected:  len(graph.CloudRiskResources) + len(graph.NonCloudFinalizerResources),
 		CloudRiskResources: cloudRiskCount,
 		Details:            orphanDetails,
 	})
 
-	// Phase: DeleteACMCRDs
-	crdCount := 0
-	for _, dr := range graph.DiscoveredResources {
-		if dr.Ref.Kind != "HubTeardown" {
-			crdCount++
-		}
-	}
-	phases = append(phases, operatorv1.PlannedPhase{
-		Phase:             operatorv1.TeardownPhaseDeleteACMCRDs,
-		Action:            "Remove all ACM/MCE CRDs (HubTeardown CRD is preserved)",
-		ResourcesAffected: crdCount,
-	})
-
-	// Phase: RemoveOLMOperator
-	phases = append(phases, operatorv1.PlannedPhase{
-		Phase:             operatorv1.TeardownPhaseRemoveOLMOperator,
-		Action:            "Delete ACM and MCE Subscriptions and CSVs, self-destruct",
-		ResourcesAffected: 2,
-		Details:           []string{"ACM Subscription + CSV", "MCE Subscription + CSV"},
-	})
-
 	// Phase: Complete
 	phases = append(phases, operatorv1.PlannedPhase{
 		Phase:             operatorv1.TeardownPhaseComplete,
-		Action:            "Release OLM Subscription gate finalizer, emit teardown summary",
+		Action:            "Verify writes the terminal phase (Complete or CompleteWithResidue) and the residue report",
 		ResourcesAffected: 1,
 	})
 

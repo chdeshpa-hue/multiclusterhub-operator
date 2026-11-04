@@ -192,16 +192,13 @@ spec:
                         of the additive API change.
                       enum:
                       - DryRun
-                      - GateOLMSubscription
                       - RemoveBlockingCRs
                       - DisableAddons
                       - DeleteInfrastructureCRs
                       - DetachManagedClusters
                       - DeleteMCH
                       - MonitorMCEChain
-                      - CleanOrphans
                       - DeleteACMCRDs
-                      - RemoveOLMOperator
                       - Complete
                       - Failed
                       - NotStarted
@@ -483,16 +480,13 @@ spec:
                           description: Phase name (matches TeardownPhase enum).
                           enum:
                           - DryRun
-                          - GateOLMSubscription
                           - RemoveBlockingCRs
                           - DisableAddons
                           - DeleteInfrastructureCRs
                           - DetachManagedClusters
                           - DeleteMCH
                           - MonitorMCEChain
-                          - CleanOrphans
                           - DeleteACMCRDs
-                          - RemoveOLMOperator
                           - Complete
                           - Failed
                           - NotStarted
@@ -551,16 +545,13 @@ spec:
                   process.
                 enum:
                 - DryRun
-                - GateOLMSubscription
                 - RemoveBlockingCRs
                 - DisableAddons
                 - DeleteInfrastructureCRs
                 - DetachManagedClusters
                 - DeleteMCH
                 - MonitorMCEChain
-                - CleanOrphans
                 - DeleteACMCRDs
-                - RemoveOLMOperator
                 - Complete
                 - Failed
                 - NotStarted
@@ -592,16 +583,13 @@ spec:
                       description: Phase name.
                       enum:
                       - DryRun
-                      - GateOLMSubscription
                       - RemoveBlockingCRs
                       - DisableAddons
                       - DeleteInfrastructureCRs
                       - DetachManagedClusters
                       - DeleteMCH
                       - MonitorMCEChain
-                      - CleanOrphans
                       - DeleteACMCRDs
-                      - RemoveOLMOperator
                       - Complete
                       - Failed
                       - NotStarted
@@ -644,6 +632,83 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              residue:
+                description: |-
+                  Residue is the Verify phase's postcondition record. It is written only
+                  in a terminal phase, because it is the one field that must be written
+                  after the MultiClusterHub no longer exists.
+                properties:
+                  complete:
+                    description: |-
+                      Complete is true only when nothing outside ExpectedSurvivors remains AND
+                      the inventory was complete. An incomplete inventory cannot prove
+                      absence, so it can never produce Complete.
+                    type: boolean
+                  completeWithResidueReason:
+                    description: |-
+                      CompleteWithResidueReason names why Complete was refused when the
+                      inventory was incomplete. Empty when Complete is true or when ordinary
+                      residue is the reason.
+                    type: string
+                  expectedSurvivors:
+                    description: ExpectedSurvivors are objects the teardown deliberately
+                      leaves behind.
+                    items:
+                      description: ResidueItem identifies one object seen at Verify
+                        time.
+                      properties:
+                        apiVersion:
+                          description: APIVersion is group/version when known.
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                        reason:
+                          description: Reason explains why the item is expected, or
+                            why it is residue.
+                          type: string
+                      required:
+                      - kind
+                      - name
+                      - reason
+                      type: object
+                    type: array
+                  observedAt:
+                    description: ObservedAt is when Verify ran.
+                    format: date-time
+                    type: string
+                  residue:
+                    description: Residue is everything else that Verify observed.
+                    items:
+                      description: ResidueItem identifies one object seen at Verify
+                        time.
+                      properties:
+                        apiVersion:
+                          description: APIVersion is group/version when known.
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                        reason:
+                          description: Reason explains why the item is expected, or
+                            why it is residue.
+                          type: string
+                      required:
+                      - kind
+                      - name
+                      - reason
+                      type: object
+                    type: array
+                required:
+                - complete
+                - observedAt
+                type: object
               summary:
                 description: Summary is the never-truncated aggregate over the complete
                   blocker list.

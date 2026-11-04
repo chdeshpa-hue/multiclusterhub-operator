@@ -14,6 +14,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -348,26 +349,25 @@ func TestBuildDryRunReport(t *testing.T) {
 		t.Errorf("TotalCloudRiskResources = %d, want 1", report.TotalCloudRiskResources)
 	}
 
-	if len(report.PlannedPhases) != 11 {
-		t.Errorf("PlannedPhases count = %d, want 11", len(report.PlannedPhases))
+	if len(report.PlannedPhases) != 9 {
+		t.Errorf("PlannedPhases count = %d, want 9", len(report.PlannedPhases))
 	}
 
 	if report.Summary == "" {
 		t.Error("Summary is empty")
 	}
 
-	// Verify phase order (all 11 phases including DeleteInfrastructureCRs, DeleteACMCRDs, RemoveOLMOperator)
+	// Verify phase order. GateOLMSubscription, CleanOrphans and RemoveOLMOperator
+	// are deleted: the operator is preserved (D-G) and Verify owns the terminal write.
 	expectedPhases := []operatorv1.TeardownPhase{
-		operatorv1.TeardownPhaseGateOLMSubscription,
 		operatorv1.TeardownPhaseRemoveBlockingCRs,
 		operatorv1.TeardownPhaseDisableAddons,
 		operatorv1.TeardownPhaseDeleteInfrastructureCRs,
 		operatorv1.TeardownPhaseDetachManagedClusters,
 		operatorv1.TeardownPhaseDeleteMCH,
 		operatorv1.TeardownPhaseMonitorMCEChain,
-		operatorv1.TeardownPhaseCleanOrphans,
 		operatorv1.TeardownPhaseDeleteACMCRDs,
-		operatorv1.TeardownPhaseRemoveOLMOperator,
+		operatorv1.TeardownPhaseVerifying,
 		operatorv1.TeardownPhaseComplete,
 	}
 
@@ -442,15 +442,15 @@ func TestIsPhaseComplete(t *testing.T) {
 	td := &operatorv1.HubTeardown{
 		Status: operatorv1.HubTeardownStatus{
 			Phases: []operatorv1.TeardownPhaseStatus{
-				{Phase: operatorv1.TeardownPhaseGateOLMSubscription, State: operatorv1.PhaseStateComplete},
+				{Phase: operatorv1.TeardownPhaseDeleteMCH, State: operatorv1.PhaseStateComplete},
 				{Phase: operatorv1.TeardownPhaseRemoveBlockingCRs, State: operatorv1.PhaseStateInProgress},
 				{Phase: operatorv1.TeardownPhaseDisableAddons, State: operatorv1.PhaseStateSkipped},
 			},
 		},
 	}
 
-	if !r.isPhaseComplete(td, operatorv1.TeardownPhaseGateOLMSubscription) {
-		t.Error("Expected GateOLMSubscription to be complete")
+	if !r.isPhaseComplete(td, operatorv1.TeardownPhaseDeleteMCH) {
+		t.Error("Expected DeleteMCH to be complete")
 	}
 	if r.isPhaseComplete(td, operatorv1.TeardownPhaseRemoveBlockingCRs) {
 		t.Error("Expected RemoveBlockingCRs to NOT be complete (InProgress)")
@@ -458,8 +458,8 @@ func TestIsPhaseComplete(t *testing.T) {
 	if !r.isPhaseComplete(td, operatorv1.TeardownPhaseDisableAddons) {
 		t.Error("Expected DisableAddons to be complete (Skipped counts as complete)")
 	}
-	if r.isPhaseComplete(td, operatorv1.TeardownPhaseDeleteMCH) {
-		t.Error("Expected DeleteMCH to NOT be complete (not in list)")
+	if r.isPhaseComplete(td, operatorv1.TeardownPhaseMonitorMCEChain) {
+		t.Error("Expected MonitorMCEChain to NOT be complete (not in list)")
 	}
 }
 
@@ -467,11 +467,11 @@ func TestSetPhaseStatus(t *testing.T) {
 	r := &HubTeardownReconciler{}
 	td := &operatorv1.HubTeardown{}
 
-	r.setPhaseStatus(td, operatorv1.TeardownPhaseGateOLMSubscription, operatorv1.PhaseStateInProgress, "Starting")
+	r.setPhaseStatus(td, operatorv1.TeardownPhaseDeleteMCH, operatorv1.PhaseStateInProgress, "Starting")
 	if len(td.Status.Phases) != 1 {
 		t.Fatalf("Expected 1 phase, got %d", len(td.Status.Phases))
 	}
-	if td.Status.Phases[0].Phase != operatorv1.TeardownPhaseGateOLMSubscription {
+	if td.Status.Phases[0].Phase != operatorv1.TeardownPhaseDeleteMCH {
 		t.Error("Wrong phase name")
 	}
 	if td.Status.Phases[0].State != operatorv1.PhaseStateInProgress {
@@ -482,7 +482,7 @@ func TestSetPhaseStatus(t *testing.T) {
 	}
 
 	// Update existing phase
-	r.setPhaseStatus(td, operatorv1.TeardownPhaseGateOLMSubscription, operatorv1.PhaseStateComplete, "Done")
+	r.setPhaseStatus(td, operatorv1.TeardownPhaseDeleteMCH, operatorv1.PhaseStateComplete, "Done")
 	if len(td.Status.Phases) != 1 {
 		t.Fatalf("Expected 1 phase after update, got %d", len(td.Status.Phases))
 	}
@@ -509,6 +509,7 @@ func newTestScheme() *runtime.Scheme {
 	_ = apixv1.AddToScheme(s)
 	_ = subv1alpha1.AddToScheme(s)
 	_ = admissionregistrationv1.AddToScheme(s)
+	_ = rbacv1.AddToScheme(s)
 	return s
 }
 
@@ -997,29 +998,6 @@ func TestPhaseDeleteInfrastructureCRs_SkipsGateWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestEnsureOLMGate_NoSubscriptionIsNoop(t *testing.T) {
-	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-
-	s := newTestScheme()
-	subv1alpha1Scheme := runtime.NewScheme()
-	_ = operatorv1.AddToScheme(subv1alpha1Scheme)
-
-	r := &HubTeardownReconciler{
-		Client:   fake.NewClientBuilder().WithScheme(s).Build(),
-		Scheme:   s,
-		Log:      ctrllog.Log,
-		Recorder: record.NewFakeRecorder(10),
-	}
-
-	ctx := context.Background()
-	log := ctrllog.Log.WithName("test")
-
-	err := r.ensureOLMGate(ctx, log)
-	if err != nil {
-		t.Errorf("ensureOLMGate should be a no-op when no Subscription exists, got error: %v", err)
-	}
-}
-
 func TestShouldResolveStuckFinalizers(t *testing.T) {
 	r := newTeardownTestReconciler()
 	pastTime := metav1.NewTime(time.Now().Add(-10 * time.Minute))
@@ -1230,177 +1208,6 @@ func TestPhaseMonitorMCEChain_AllGoneCompletesPhase(t *testing.T) {
 	}
 	if !done {
 		t.Error("Expected phase to complete when all resources are gone, got done=false")
-	}
-}
-
-func TestPhaseGateOLMSubscription_CommentVerification(t *testing.T) {
-	// Verify the OLM gate comment exists (Gap 5) by checking the function's
-	// behavior: when no Subscription exists, the phase completes.
-	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	r := newTeardownTestReconciler()
-
-	td := &operatorv1.HubTeardown{
-		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
-	}
-	ctx := context.Background()
-	log := ctrllog.Log.WithName("test")
-
-	done, err := r.phaseGateOLMSubscription(ctx, log, td)
-	if err != nil {
-		t.Fatalf("phaseGateOLMSubscription error: %v", err)
-	}
-	if !done {
-		t.Error("Expected phase to complete when no Subscription exists")
-	}
-}
-
-func TestPhaseRemoveOLMOperator_ClearsStalledAndBlockingResources(t *testing.T) {
-	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	s := newTestScheme()
-
-	// Create an ACM Subscription so phaseRemoveOLMOperator doesn't exit early.
-	acmSub := &subv1alpha1.Subscription{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "acm-sub",
-			Namespace: "open-cluster-management",
-		},
-		Spec: &subv1alpha1.SubscriptionSpec{
-			Package: "advanced-cluster-management",
-		},
-		Status: subv1alpha1.SubscriptionStatus{
-			InstalledCSV: "",
-		},
-	}
-
-	td := &operatorv1.HubTeardown{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "teardown",
-			Namespace: "open-cluster-management",
-		},
-		Status: operatorv1.HubTeardownStatus{
-			// Pre-set Stalled=True to simulate the stalled state.
-			Conditions: []metav1.Condition{
-				{
-					Type:   "Stalled",
-					Status: metav1.ConditionTrue,
-					Reason: "TeardownStalled",
-				},
-			},
-			// Pre-set blocking resources to simulate stale entries.
-			BlockingResources: []operatorv1.BlockingResource{
-				{Kind: "ManagedCluster", Name: "fake-imported-cluster"},
-			},
-		},
-	}
-
-	cb := fake.NewClientBuilder().WithScheme(s).
-		WithObjects(acmSub, td).
-		WithStatusSubresource(td)
-	fakeClient := cb.Build()
-	r := &HubTeardownReconciler{
-		Client:         fakeClient,
-		UncachedClient: fakeClient, // same client works for test read-back
-		Scheme:         s,
-		Log:            ctrllog.Log,
-		Recorder:       record.NewFakeRecorder(10),
-	}
-
-	ctx := context.Background()
-	log := ctrllog.Log.WithName("test")
-
-	done, err := r.phaseRemoveOLMOperator(ctx, log, td)
-	if err != nil {
-		t.Fatalf("phaseRemoveOLMOperator error: %v", err)
-	}
-	if !done {
-		t.Error("Expected phase to complete, got done=false")
-	}
-
-	// Gap 7: Verify Stalled condition was set to False.
-	fetched := &operatorv1.HubTeardown{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: td.Name, Namespace: td.Namespace}, fetched); err != nil {
-		t.Fatalf("Failed to fetch HubTeardown: %v", err)
-	}
-	foundStalledFalse := false
-	for _, c := range fetched.Status.Conditions {
-		if c.Type == "Stalled" {
-			if c.Status == metav1.ConditionFalse {
-				foundStalledFalse = true
-			} else {
-				t.Errorf("Stalled condition should be False, got %v", c.Status)
-			}
-		}
-	}
-	if !foundStalledFalse {
-		t.Error("Expected Stalled=False condition after phaseRemoveOLMOperator completes")
-	}
-
-	// Gap 8: Verify BlockingResources was cleared.
-	if len(fetched.Status.BlockingResources) != 0 {
-		t.Errorf("BlockingResources should be nil/empty after phaseRemoveOLMOperator, got %v", fetched.Status.BlockingResources)
-	}
-}
-
-func TestPhaseRemoveOLMOperator_DeletesMCESubscriptionAndCSV(t *testing.T) {
-	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	s := newTestScheme()
-
-	// Create ACM Subscription (required for phase entry).
-	acmSub := &subv1alpha1.Subscription{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "acm-sub",
-			Namespace: "open-cluster-management",
-		},
-		Spec: &subv1alpha1.SubscriptionSpec{
-			Package: "advanced-cluster-management",
-		},
-	}
-
-	// Create MCE Subscription.
-	mceSub := &subv1alpha1.Subscription{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "mce-sub",
-			Namespace: "multicluster-engine",
-		},
-		Spec: &subv1alpha1.SubscriptionSpec{
-			Package: "multicluster-engine",
-		},
-	}
-
-	td := &operatorv1.HubTeardown{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "teardown",
-			Namespace: "open-cluster-management",
-		},
-	}
-
-	cb := fake.NewClientBuilder().WithScheme(s).
-		WithObjects(acmSub, mceSub, td).
-		WithStatusSubresource(td)
-	fakeClient := cb.Build()
-	r := &HubTeardownReconciler{
-		Client:         fakeClient,
-		UncachedClient: fakeClient,
-		Scheme:         s,
-		Log:            ctrllog.Log,
-		Recorder:       record.NewFakeRecorder(10),
-	}
-
-	ctx := context.Background()
-	log := ctrllog.Log.WithName("test")
-
-	done, err := r.phaseRemoveOLMOperator(ctx, log, td)
-	if err != nil {
-		t.Fatalf("phaseRemoveOLMOperator error: %v", err)
-	}
-	if !done {
-		t.Error("Expected phase to complete, got done=false")
-	}
-
-	// Gap 6: Verify MCE Subscription was deleted.
-	_, mceErr := r.findMCESubscription(ctx)
-	if mceErr == nil {
-		t.Error("Expected MCE Subscription to be deleted, but it still exists")
 	}
 }
 

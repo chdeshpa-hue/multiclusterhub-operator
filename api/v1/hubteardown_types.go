@@ -13,21 +13,18 @@ import (
 // cutover is pending. Removing the legacy values is part of that cutover, not
 // of the additive API change.
 //
-// +kubebuilder:validation:Enum=DryRun;GateOLMSubscription;RemoveBlockingCRs;DisableAddons;DeleteInfrastructureCRs;DetachManagedClusters;DeleteMCH;MonitorMCEChain;CleanOrphans;DeleteACMCRDs;RemoveOLMOperator;Complete;Failed;NotStarted;Inspecting;ReportReady;ConsentRequired;Preparing;HandedOff;Stalled;Escalating;Verifying;CompleteWithResidue
+// +kubebuilder:validation:Enum=DryRun;RemoveBlockingCRs;DisableAddons;DeleteInfrastructureCRs;DetachManagedClusters;DeleteMCH;MonitorMCEChain;DeleteACMCRDs;Complete;Failed;NotStarted;Inspecting;ReportReady;ConsentRequired;Preparing;HandedOff;Stalled;Escalating;Verifying;CompleteWithResidue
 type TeardownPhase string
 
 const (
 	TeardownPhaseDryRun                  TeardownPhase = "DryRun"
-	TeardownPhaseGateOLMSubscription     TeardownPhase = "GateOLMSubscription"
 	TeardownPhaseRemoveBlockingCRs       TeardownPhase = "RemoveBlockingCRs"
 	TeardownPhaseDisableAddons           TeardownPhase = "DisableAddons"
 	TeardownPhaseDeleteInfrastructureCRs TeardownPhase = "DeleteInfrastructureCRs"
 	TeardownPhaseDetachManagedClusters   TeardownPhase = "DetachManagedClusters"
 	TeardownPhaseDeleteMCH               TeardownPhase = "DeleteMCH"
 	TeardownPhaseMonitorMCEChain         TeardownPhase = "MonitorMCEChain"
-	TeardownPhaseCleanOrphans            TeardownPhase = "CleanOrphans"
 	TeardownPhaseDeleteACMCRDs           TeardownPhase = "DeleteACMCRDs"
-	TeardownPhaseRemoveOLMOperator       TeardownPhase = "RemoveOLMOperator"
 	TeardownPhaseComplete                TeardownPhase = "Complete"
 	TeardownPhaseFailed                  TeardownPhase = "Failed"
 )
@@ -139,6 +136,12 @@ type HubTeardownStatus struct {
 	// +optional
 	ReportRef *corev1.LocalObjectReference `json:"reportRef,omitempty"`
 
+	// Residue is the Verify phase's postcondition record. It is written only
+	// in a terminal phase, because it is the one field that must be written
+	// after the MultiClusterHub no longer exists.
+	// +optional
+	Residue *ResidueReport `json:"residue,omitempty"`
+
 	// ActiveSince is the timestamp when the teardown transitioned from
 	// dry-run to active execution. Used to calculate overall stall timeout.
 	// +optional
@@ -169,6 +172,48 @@ type DryRunReport struct {
 
 	// TotalCloudRiskResources is the count of resources with Tier 1 finalizers.
 	TotalCloudRiskResources int `json:"totalCloudRiskResources"`
+}
+
+// ResidueReport is the observable postcondition of a teardown. Expected
+// survivors are listed separately: under D-G the operator and its namespace
+// are preserved on purpose, and a report that called them residue would make
+// every successful teardown look failed.
+type ResidueReport struct {
+	// ObservedAt is when Verify ran.
+	ObservedAt metav1.Time `json:"observedAt"`
+
+	// Complete is true only when nothing outside ExpectedSurvivors remains AND
+	// the inventory was complete. An incomplete inventory cannot prove
+	// absence, so it can never produce Complete.
+	Complete bool `json:"complete"`
+
+	// CompleteWithResidueReason names why Complete was refused when the
+	// inventory was incomplete. Empty when Complete is true or when ordinary
+	// residue is the reason.
+	// +optional
+	CompleteWithResidueReason string `json:"completeWithResidueReason,omitempty"`
+
+	// ExpectedSurvivors are objects the teardown deliberately leaves behind.
+	// +optional
+	ExpectedSurvivors []ResidueItem `json:"expectedSurvivors,omitempty"`
+
+	// Residue is everything else that Verify observed.
+	// +optional
+	Residue []ResidueItem `json:"residue,omitempty"`
+}
+
+// ResidueItem identifies one object seen at Verify time.
+type ResidueItem struct {
+	// APIVersion is group/version when known.
+	// +optional
+	APIVersion string `json:"apiVersion,omitempty"`
+
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace,omitempty"`
+
+	// Reason explains why the item is expected, or why it is residue.
+	Reason string `json:"reason"`
 }
 
 // PlannedPhase describes what a single teardown phase will do.
