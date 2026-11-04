@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // ObjectRef is one cluster object, identified by group/kind/namespace/name.
@@ -20,6 +21,14 @@ type ObjectRef struct {
 	Kind      string `json:"kind"`
 	Namespace string `json:"namespace,omitempty"`
 	Name      string `json:"name"`
+
+	// SecretType and ServiceAccount carry the evidence used to recognise a
+	// platform-managed service-account token. Generated Secret names cannot be
+	// allowlisted, so the object is classified by what it is instead. Both are
+	// empty for other kinds, for non-token Secrets, and for snapshots written
+	// before the fields existed.
+	SecretType     string `json:"secretType,omitempty"`
+	ServiceAccount string `json:"serviceAccount,omitempty"`
 }
 
 // WebhookRef is an admission webhook and the namespace of its backing Service.
@@ -187,6 +196,18 @@ func Evaluate(in Input, p Policy) Report {
 	for _, obj := range in.OperatorNamespaceObjects {
 		if _, ok := keepObjects[objectKey(obj.Group, obj.Kind, obj.Namespace, obj.Name)]; ok {
 			report.Expected = append(report.Expected, residueItem(obj, "declared expected survivor"))
+			continue
+		}
+		// A service-account token is created by the control plane, not chosen
+		// by the operator, and its name carries a generated suffix. The type is
+		// the evidence; the annotation names the account and is detail, not the
+		// gate (a partial object is still a token).
+		if obj.Kind == "Secret" && obj.SecretType == string(corev1.SecretTypeServiceAccountToken) {
+			reason := "platform-managed service-account token"
+			if obj.ServiceAccount != "" {
+				reason += " for ServiceAccount " + obj.ServiceAccount
+			}
+			report.Expected = append(report.Expected, residueItem(obj, reason))
 			continue
 		}
 		if !in.SnapshotPresent {

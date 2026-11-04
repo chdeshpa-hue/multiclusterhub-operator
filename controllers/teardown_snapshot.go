@@ -26,8 +26,8 @@ const (
 )
 
 // operatorNamespaceSnapshot is the pre-teardown record of the objects Verify
-// later has to classify. It stores identity only: no Secret data and no object
-// bodies ever enter this record.
+// later has to classify. It stores identity and Secret type metadata only: no
+// Secret data and no object bodies ever enter this record.
 type operatorNamespaceSnapshot struct {
 	Teardown   string             `json:"teardown"`
 	Namespace  string             `json:"namespace"`
@@ -77,11 +77,19 @@ func (r *HubTeardownReconciler) listOperatorNamespaceObjects(ctx context.Context
 		incomplete = append(incomplete, "secrets: "+err.Error())
 	} else {
 		for i := range secretList.Items {
-			objects = append(objects, verify.ObjectRef{
+			secret := &secretList.Items[i]
+			ref := verify.ObjectRef{
 				Kind:      "Secret",
-				Namespace: secretList.Items[i].Namespace,
-				Name:      secretList.Items[i].Name,
-			})
+				Namespace: secret.Namespace,
+				Name:      secret.Name,
+			}
+			// Only a token Secret needs the extra evidence; recording the type
+			// of every Secret would widen the snapshot without a consumer.
+			if secret.Type == corev1.SecretTypeServiceAccountToken {
+				ref.SecretType = string(secret.Type)
+				ref.ServiceAccount = secret.Annotations[corev1.ServiceAccountNameKey]
+			}
+			objects = append(objects, ref)
 		}
 	}
 

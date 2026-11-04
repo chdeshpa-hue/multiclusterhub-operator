@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stolostron/multiclusterhub-operator/pkg/verify"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
@@ -212,5 +213,79 @@ func TestApplyInspectionRecordsSnapshotFailure(t *testing.T) {
 	}
 	if reason := conditionReason(td, conditionTypeInspectIncomplete); reason != "SnapshotFailed" {
 		t.Errorf("InspectIncomplete reason = %q, want SnapshotFailed", reason)
+	}
+}
+
+func tokenSecret(namespace, name, serviceAccount, value string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   namespace,
+			Name:        name,
+			Annotations: map[string]string{corev1.ServiceAccountNameKey: serviceAccount},
+		},
+		Type: corev1.SecretTypeServiceAccountToken,
+		Data: map[string][]byte{"token": []byte(value)},
+	}
+}
+
+// C-1: the single lister records the evidence the verifier needs, and records
+// nothing extra for Secrets that are not tokens.
+func TestListOperatorNamespaceObjectsCapturesTokenEvidence(t *testing.T) {
+	td := handoffTestCR()
+	r := newHandoffReconciler(t,
+		tokenSecret(td.Namespace, "builder-token-abcde", "builder", "super-secret-value"),
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: td.Namespace, Name: "pull-secret"},
+			Type:       corev1.SecretTypeDockercfg,
+		},
+	)
+
+	objects, incomplete := r.listOperatorNamespaceObjects(context.Background(), td)
+	if len(incomplete) != 0 {
+		t.Fatalf("incomplete = %v", incomplete)
+	}
+
+	byName := map[string]verify.ObjectRef{}
+	for _, obj := range objects {
+		byName[obj.Name] = obj
+	}
+	token, ok := byName["builder-token-abcde"]
+	if !ok {
+		t.Fatalf("token Secret missing from observation: %+v", objects)
+	}
+	if token.SecretType != string(corev1.SecretTypeServiceAccountToken) {
+		t.Errorf("secretType = %q", token.SecretType)
+	}
+	if token.ServiceAccount != "builder" {
+		t.Errorf("serviceAccount = %q, want builder", token.ServiceAccount)
+	}
+	if pull := byName["pull-secret"]; pull.SecretType != "" || pull.ServiceAccount != "" {
+		t.Errorf("non-token Secret carries evidence fields: %+v", pull)
+	}
+}
+
+// C-2: the snapshot carries the type and account name, never the token value.
+func TestEnsureOperatorNamespaceSnapshotRecordsTokenEvidence(t *testing.T) {
+	td := handoffTestCR()
+	r := newHandoffReconciler(t,
+		tokenSecret(td.Namespace, "builder-token-abcde", "builder", "super-secret-value"))
+
+	cm, _, err := r.ensureOperatorNamespaceSnapshot(context.Background(), td)
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	if strings.Contains(cm.Data[snapshotKeyObjects], "super-secret-value") {
+		t.Fatal("snapshot recorded Secret material")
+	}
+	snapshot := decodeSnapshot(t, cm)
+	if len(snapshot.Objects) != 1 {
+		t.Fatalf("snapshot objects = %+v", snapshot.Objects)
+	}
+	obj := snapshot.Objects[0]
+	if obj.SecretType != string(corev1.SecretTypeServiceAccountToken) {
+		t.Errorf("secretType = %q", obj.SecretType)
+	}
+	if obj.ServiceAccount != "builder" {
+		t.Errorf("serviceAccount = %q, want builder", obj.ServiceAccount)
 	}
 }
