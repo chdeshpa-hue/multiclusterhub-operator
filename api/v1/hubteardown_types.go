@@ -7,6 +7,12 @@ import (
 )
 
 // TeardownPhase represents the current high-level phase of the teardown process.
+//
+// Both the legacy and the prototype values are accepted while the controller
+// cutover is pending. Removing the legacy values is part of that cutover, not
+// of the additive API change.
+//
+// +kubebuilder:validation:Enum=DryRun;GateOLMSubscription;RemoveBlockingCRs;DisableAddons;DeleteInfrastructureCRs;DetachManagedClusters;DeleteMCH;MonitorMCEChain;CleanOrphans;DeleteACMCRDs;RemoveOLMOperator;Complete;Failed;NotStarted;Inspecting;ReportReady;ConsentRequired;Preparing;HandedOff;Stalled;Escalating;Verifying;CompleteWithResidue
 type TeardownPhase string
 
 const (
@@ -23,6 +29,22 @@ const (
 	TeardownPhaseRemoveOLMOperator       TeardownPhase = "RemoveOLMOperator"
 	TeardownPhaseComplete                TeardownPhase = "Complete"
 	TeardownPhaseFailed                  TeardownPhase = "Failed"
+)
+
+// Prototype phase model (RFE-9332 §2.1). These values are additive: the
+// legacy phase constants above stay until the controller cutover, because
+// they carry 60+ references across six controller files.
+const (
+	TeardownPhaseNotStarted          TeardownPhase = "NotStarted"
+	TeardownPhaseInspecting          TeardownPhase = "Inspecting"
+	TeardownPhaseReportReady         TeardownPhase = "ReportReady"
+	TeardownPhaseConsentRequired     TeardownPhase = "ConsentRequired"
+	TeardownPhasePreparing           TeardownPhase = "Preparing"
+	TeardownPhaseHandedOff           TeardownPhase = "HandedOff"
+	TeardownPhaseStalled             TeardownPhase = "Stalled"
+	TeardownPhaseEscalating          TeardownPhase = "Escalating"
+	TeardownPhaseVerifying           TeardownPhase = "Verifying"
+	TeardownPhaseCompleteWithResidue TeardownPhase = "CompleteWithResidue"
 )
 
 // TeardownPhaseState tracks whether an individual phase has completed.
@@ -86,6 +108,23 @@ type HubTeardownStatus struct {
 	// and their platform-specific risk descriptions.
 	// +optional
 	CloudResourceWarnings []CloudResourceWarning `json:"cloudResourceWarnings,omitempty"`
+
+	// Summary is the never-truncated aggregate over the complete blocker list.
+	// +optional
+	Summary *BlockerSummary `json:"summary,omitempty"`
+
+	// Blockers is a capped view of the complete blocker list. The cap keeps
+	// status small enough that admission and etcd never reject the update: 32
+	// leaves room for roughly 8KB of Blocker JSON, well inside the 1.5MB
+	// object limit when combined with the existing status arrays.
+	// The complete list always lives in the report ConfigMap.
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	Blockers []Blocker `json:"blockers,omitempty"`
+
+	// BlockersTruncated is the number of blockers omitted from Blockers.
+	// +optional
+	BlockersTruncated int32 `json:"blockersTruncated,omitempty"`
 
 	// ActiveSince is the timestamp when the teardown transitioned from
 	// dry-run to active execution. Used to calculate overall stall timeout.

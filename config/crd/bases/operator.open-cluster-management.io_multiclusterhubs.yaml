@@ -337,6 +337,108 @@ spec:
               phase:
                 description: Represents the running phase of the MultiClusterHub
                 type: string
+              uninstall:
+                description: |-
+                  Uninstall mirrors the state of a HubTeardown targeting this hub. It is a
+                  read-only projection: the authoritative record is the HubTeardown CR and
+                  the report ConfigMap. Nothing in the uninstall path may make a decision
+                  from this field. Absent when no HubTeardown targets this hub.
+                properties:
+                  lastInspection:
+                    description: LastInspection is when the referenced HubTeardown
+                      last ran an inspection.
+                    format: date-time
+                    type: string
+                  phase:
+                    description: Phase is the mirrored phase of the referenced HubTeardown.
+                    enum:
+                    - DryRun
+                    - GateOLMSubscription
+                    - RemoveBlockingCRs
+                    - DisableAddons
+                    - DeleteInfrastructureCRs
+                    - DetachManagedClusters
+                    - DeleteMCH
+                    - MonitorMCEChain
+                    - CleanOrphans
+                    - DeleteACMCRDs
+                    - RemoveOLMOperator
+                    - Complete
+                    - Failed
+                    - NotStarted
+                    - Inspecting
+                    - ReportReady
+                    - ConsentRequired
+                    - Preparing
+                    - HandedOff
+                    - Stalled
+                    - Escalating
+                    - Verifying
+                    - CompleteWithResidue
+                    type: string
+                  reportRef:
+                    description: ReportRef names the ConfigMap holding the complete
+                      report.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  summary:
+                    description: Summary is the never-truncated aggregate over the
+                      blocker list.
+                    properties:
+                      byClassification:
+                        additionalProperties:
+                          format: int32
+                          type: integer
+                        description: ByClassification counts blockers per classification.
+                        type: object
+                      requiringConsent:
+                        description: |-
+                          RequiringConsent is the number of blockers whose SuggestedAction needs
+                          explicit administrator approval.
+                        format: int32
+                        type: integer
+                      total:
+                        description: Total is the number of blockers in the complete
+                          report.
+                        format: int32
+                        type: integer
+                    required:
+                    - requiringConsent
+                    - total
+                    type: object
+                  teardownRef:
+                    description: |-
+                      TeardownRef is the name of the HubTeardown driving this uninstall.
+                      LocalObjectReference carries no namespace, so readers resolve it in the
+                      MultiClusterHub's namespace.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - lastInspection
+                - phase
+                - summary
+                - teardownRef
+                type: object
             type: object
         type: object
     served: true

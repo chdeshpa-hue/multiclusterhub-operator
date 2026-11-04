@@ -107,6 +107,210 @@ spec:
                   dry-run to active execution. Used to calculate overall stall timeout.
                 format: date-time
                 type: string
+              blockers:
+                description: |-
+                  Blockers is a capped view of the complete blocker list. The cap keeps
+                  status small enough that admission and etcd never reject the update: 32
+                  leaves room for roughly 8KB of Blocker JSON, well inside the 1.5MB
+                  object limit when combined with the existing status arrays.
+                  The complete list always lives in the report ConfigMap.
+                items:
+                  description: |-
+                    Blocker is the single record consumed by the report, status, MCH mirror and
+                    verification. UID is the identity and the join key; name is report-only.
+                  properties:
+                    apiVersion:
+                      type: string
+                    blockedSince:
+                      format: date-time
+                      type: string
+                    classification:
+                      description: Classification names the failure mode a Blocker
+                        represents.
+                      type: string
+                    cloudRisk:
+                      description: CloudRisk records the consequence of acting outside
+                        the cluster.
+                      properties:
+                        mayOrphan:
+                          type: boolean
+                        platform:
+                          type: string
+                        resourceType:
+                          type: string
+                      required:
+                      - mayOrphan
+                      - platform
+                      - resourceType
+                      type: object
+                    consentReason:
+                      type: string
+                    controllerAlive:
+                      type: boolean
+                    controllerEvidence:
+                      items:
+                        description: Evidence is one observation, with where it was
+                          read from.
+                        properties:
+                          detail:
+                            type: string
+                          kind:
+                            description: EvidenceKind identifies one observation that
+                              bears on ownership.
+                            type: string
+                          observed:
+                            format: date-time
+                            type: string
+                          source:
+                            type: string
+                        required:
+                        - detail
+                        - kind
+                        - observed
+                        - source
+                        type: object
+                      type: array
+                    deletionTimestamp:
+                      format: date-time
+                      type: string
+                    finalizers:
+                      items:
+                        type: string
+                      type: array
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    observedInPhase:
+                      description: |-
+                        TeardownPhase represents the current high-level phase of the teardown process.
+
+                        Both the legacy and the prototype values are accepted while the controller
+                        cutover is pending. Removing the legacy values is part of that cutover, not
+                        of the additive API change.
+                      enum:
+                      - DryRun
+                      - GateOLMSubscription
+                      - RemoveBlockingCRs
+                      - DisableAddons
+                      - DeleteInfrastructureCRs
+                      - DetachManagedClusters
+                      - DeleteMCH
+                      - MonitorMCEChain
+                      - CleanOrphans
+                      - DeleteACMCRDs
+                      - RemoveOLMOperator
+                      - Complete
+                      - Failed
+                      - NotStarted
+                      - Inspecting
+                      - ReportReady
+                      - ConsentRequired
+                      - Preparing
+                      - HandedOff
+                      - Stalled
+                      - Escalating
+                      - Verifying
+                      - CompleteWithResidue
+                      type: string
+                    ownership:
+                      description: OwnershipVerdict is the answer plus the evidence
+                        that produced it.
+                      properties:
+                        confidence:
+                          description: |-
+                            Confidence is the maximum confidence over the evidence list. It is never a
+                            sum: two Weak observations do not make a Strong one.
+                          type: string
+                        evidence:
+                          items:
+                            description: Evidence is one observation, with where it
+                              was read from.
+                            properties:
+                              detail:
+                                type: string
+                              kind:
+                                description: EvidenceKind identifies one observation
+                                  that bears on ownership.
+                                type: string
+                              observed:
+                                format: date-time
+                                type: string
+                              source:
+                                type: string
+                            required:
+                            - detail
+                            - kind
+                            - observed
+                            - source
+                            type: object
+                          type: array
+                        owned:
+                          type: boolean
+                      required:
+                      - confidence
+                      - evidence
+                      - owned
+                      type: object
+                    owningController:
+                      description: ControllerRef identifies the workload that should
+                        process a finalizer.
+                      properties:
+                        finalizerDomain:
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                        resolution:
+                          description: |-
+                            ControllerResolution records how the controller responsible for a finalizer
+                            was identified.
+                          type: string
+                      required:
+                      - finalizerDomain
+                      - kind
+                      - name
+                      - resolution
+                      type: object
+                    relatedFix:
+                      type: string
+                    requiresConsent:
+                      type: boolean
+                    suggestedAction:
+                      description: |-
+                        SuggestedAction is the policy's suggestion. A human or a later automation
+                        performs it.
+                      type: string
+                    uid:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                  required:
+                  - apiVersion
+                  - blockedSince
+                  - classification
+                  - kind
+                  - name
+                  - observedInPhase
+                  - ownership
+                  - requiresConsent
+                  - suggestedAction
+                  - uid
+                  type: object
+                maxItems: 32
+                type: array
+              blockersTruncated:
+                description: BlockersTruncated is the number of blockers omitted from
+                  Blockers.
+                format: int32
+                type: integer
               blockingResources:
                 description: |-
                   BlockingResources lists resources that prevent MCH deletion via
@@ -277,6 +481,30 @@ spec:
                           type: array
                         phase:
                           description: Phase name (matches TeardownPhase enum).
+                          enum:
+                          - DryRun
+                          - GateOLMSubscription
+                          - RemoveBlockingCRs
+                          - DisableAddons
+                          - DeleteInfrastructureCRs
+                          - DetachManagedClusters
+                          - DeleteMCH
+                          - MonitorMCEChain
+                          - CleanOrphans
+                          - DeleteACMCRDs
+                          - RemoveOLMOperator
+                          - Complete
+                          - Failed
+                          - NotStarted
+                          - Inspecting
+                          - ReportReady
+                          - ConsentRequired
+                          - Preparing
+                          - HandedOff
+                          - Stalled
+                          - Escalating
+                          - Verifying
+                          - CompleteWithResidue
                           type: string
                         resourcesAffected:
                           description: ResourcesAffected is the count of resources
@@ -314,6 +542,30 @@ spec:
               phase:
                 description: Phase is the current high-level phase of the teardown
                   process.
+                enum:
+                - DryRun
+                - GateOLMSubscription
+                - RemoveBlockingCRs
+                - DisableAddons
+                - DeleteInfrastructureCRs
+                - DetachManagedClusters
+                - DeleteMCH
+                - MonitorMCEChain
+                - CleanOrphans
+                - DeleteACMCRDs
+                - RemoveOLMOperator
+                - Complete
+                - Failed
+                - NotStarted
+                - Inspecting
+                - ReportReady
+                - ConsentRequired
+                - Preparing
+                - HandedOff
+                - Stalled
+                - Escalating
+                - Verifying
+                - CompleteWithResidue
                 type: string
               phases:
                 description: Phases tracks the status of each teardown phase.
@@ -331,6 +583,30 @@ spec:
                       type: string
                     phase:
                       description: Phase name.
+                      enum:
+                      - DryRun
+                      - GateOLMSubscription
+                      - RemoveBlockingCRs
+                      - DisableAddons
+                      - DeleteInfrastructureCRs
+                      - DetachManagedClusters
+                      - DeleteMCH
+                      - MonitorMCEChain
+                      - CleanOrphans
+                      - DeleteACMCRDs
+                      - RemoveOLMOperator
+                      - Complete
+                      - Failed
+                      - NotStarted
+                      - Inspecting
+                      - ReportReady
+                      - ConsentRequired
+                      - Preparing
+                      - HandedOff
+                      - Stalled
+                      - Escalating
+                      - Verifying
+                      - CompleteWithResidue
                       type: string
                     startTime:
                       description: StartTime is when this phase began executing.
@@ -344,6 +620,30 @@ spec:
                   - state
                   type: object
                 type: array
+              summary:
+                description: Summary is the never-truncated aggregate over the complete
+                  blocker list.
+                properties:
+                  byClassification:
+                    additionalProperties:
+                      format: int32
+                      type: integer
+                    description: ByClassification counts blockers per classification.
+                    type: object
+                  requiringConsent:
+                    description: |-
+                      RequiringConsent is the number of blockers whose SuggestedAction needs
+                      explicit administrator approval.
+                    format: int32
+                    type: integer
+                  total:
+                    description: Total is the number of blockers in the complete report.
+                    format: int32
+                    type: integer
+                required:
+                - requiringConsent
+                - total
+                type: object
             type: object
         type: object
     served: true

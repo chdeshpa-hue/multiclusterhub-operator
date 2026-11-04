@@ -197,6 +197,36 @@ type MultiClusterHubStatus struct {
 
 	// MCEVersionCompliance tracks whether the MCE version meets the required channel version
 	MCEVersionCompliance *MCEVersionComplianceStatus `json:"mceVersionCompliance,omitempty"`
+
+	// Uninstall mirrors the state of a HubTeardown targeting this hub. It is a
+	// read-only projection: the authoritative record is the HubTeardown CR and
+	// the report ConfigMap. Nothing in the uninstall path may make a decision
+	// from this field. Absent when no HubTeardown targets this hub.
+	// +optional
+	Uninstall *UninstallMirror `json:"uninstall,omitempty"`
+}
+
+// UninstallMirror is the status-only projection of a HubTeardown onto the
+// MultiClusterHub. It carries counts, never the blocker list, so that a
+// consumer watching only the MCH can see progress by following teardownRef.
+type UninstallMirror struct {
+	// TeardownRef is the name of the HubTeardown driving this uninstall.
+	// LocalObjectReference carries no namespace, so readers resolve it in the
+	// MultiClusterHub's namespace.
+	TeardownRef corev1.LocalObjectReference `json:"teardownRef"`
+
+	// Phase is the mirrored phase of the referenced HubTeardown.
+	Phase TeardownPhase `json:"phase"`
+
+	// Summary is the never-truncated aggregate over the blocker list.
+	Summary BlockerSummary `json:"summary"`
+
+	// LastInspection is when the referenced HubTeardown last ran an inspection.
+	LastInspection metav1.Time `json:"lastInspection"`
+
+	// ReportRef names the ConfigMap holding the complete report.
+	// +optional
+	ReportRef *corev1.LocalObjectReference `json:"reportRef,omitempty"`
 }
 
 // StatusCondition contains condition information.
