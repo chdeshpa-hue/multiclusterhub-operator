@@ -924,7 +924,7 @@ func (r *HubTeardownReconciler) phaseMonitorMCEChain(ctx context.Context, log lo
 // ensureMCEDeleted drives MCE deletion. With DF-2 (backplane-operator
 // ClusterManager delete ordering), the natural chain (MCE operator ->
 // ClusterManager -> OCM hub cleanup) completes without intervention.
-// If stuck, the escalation path resolves the finalizer under its own identity.
+// If stuck, the handoff path resolves the finalizer under its own identity.
 func (r *HubTeardownReconciler) ensureMCEDeleted(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) error {
 	mceGVK := schema.GroupVersionKind{
 		Group:   "multicluster.openshift.io",
@@ -946,7 +946,7 @@ func (r *HubTeardownReconciler) ensureMCEDeleted(ctx context.Context, log logr.L
 		if mce.GetDeletionTimestamp() != nil {
 			// With DF-2, backplane waits for ClusterManager finalization before
 			// deleting templates — the natural MCE->CM chain completes without
-			// intervention. If stuck, the escalation path resolves the finalizer
+			// intervention. If stuck, the handoff path resolves the finalizer
 			// under its own identity.
 			log.Info("MCE is deleting, waiting for natural chain to complete", "name", mce.GetName())
 			return nil
@@ -1121,7 +1121,7 @@ func (r *HubTeardownReconciler) phaseDeleteACMCRDs(ctx context.Context, log logr
 		for j := range list.Items {
 			item := &list.Items[j]
 			if item.GetDeletionTimestamp() != nil && len(item.GetFinalizers()) > 0 {
-				log.Info("Stuck-terminating CR blocks CRD deletion — the escalation path must resolve this finalizer",
+				log.Info("Stuck-terminating CR blocks CRD deletion — the handoff path must resolve this finalizer",
 					"crd", crd.Name, "cr", item.GetName(), "namespace", item.GetNamespace(),
 					"finalizers", item.GetFinalizers())
 				return false, nil

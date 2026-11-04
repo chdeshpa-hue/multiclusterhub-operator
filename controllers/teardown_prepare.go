@@ -27,21 +27,21 @@ const (
 	progressKeyPhases       = "phases.json"
 	progressLabelProgress   = "operator.open-cluster-management.io/teardown-progress"
 
-	// prepareResyncInterval is how long the prepare Job waits before re-running
+	// jobResyncInterval is how long the prepare Job waits before re-running
 	// a phase that reported "not done yet".
-	prepareResyncInterval = 15 * time.Second
+	jobResyncInterval = 15 * time.Second
 )
 
-// preparePhaseRecord is one line of the Job's progress record.
-type preparePhaseRecord struct {
+// jobPhaseRecord is one line of the Job's progress record.
+type jobPhaseRecord struct {
 	Phase   operatorv1.TeardownPhase      `json:"phase"`
 	State   operatorv1.TeardownPhaseState `json:"state"`
 	Message string                        `json:"message,omitempty"`
 	Time    metav1.Time                   `json:"time"`
 }
 
-type prepareProgress struct {
-	Phases []preparePhaseRecord `json:"phases"`
+type jobProgress struct {
+	Phases []jobPhaseRecord `json:"phases"`
 }
 
 // preparePhasePlan is the work that runs in the Job. It is separate from the
@@ -72,17 +72,17 @@ func progressConfigMapName(td *operatorv1.HubTeardown) string {
 	return progressConfigMapPrefix + td.Name[:minInt(keep, len(td.Name))] + suffix
 }
 
-func (r *HubTeardownReconciler) loadPrepareProgress(ctx context.Context, td *operatorv1.HubTeardown) (*prepareProgress, error) {
+func (r *HubTeardownReconciler) loadJobProgress(ctx context.Context, td *operatorv1.HubTeardown) (*jobProgress, error) {
 	cm := &corev1.ConfigMap{}
 	key := types.NamespacedName{Name: progressConfigMapName(td), Namespace: teardownNamespace(td)}
 	if err := r.Client.Get(ctx, key, cm); err != nil {
 		if errors.IsNotFound(err) {
-			return &prepareProgress{}, nil
+			return &jobProgress{}, nil
 		}
 		return nil, fmt.Errorf("reading prepare progress: %w", err)
 	}
 
-	progress := &prepareProgress{}
+	progress := &jobProgress{}
 	raw := cm.Data[progressKeyPhases]
 	if raw == "" {
 		return progress, nil
@@ -90,12 +90,12 @@ func (r *HubTeardownReconciler) loadPrepareProgress(ctx context.Context, td *ope
 	if err := json.Unmarshal([]byte(raw), progress); err != nil {
 		// A corrupt record is treated as "nothing recorded". The caller must
 		// never read corruption as completion.
-		return &prepareProgress{}, nil
+		return &jobProgress{}, nil
 	}
 	return progress, nil
 }
 
-func (r *HubTeardownReconciler) savePrepareProgress(ctx context.Context, td *operatorv1.HubTeardown, progress *prepareProgress) error {
+func (r *HubTeardownReconciler) saveJobProgress(ctx context.Context, td *operatorv1.HubTeardown, progress *jobProgress) error {
 	body, err := json.Marshal(progress)
 	if err != nil {
 		return fmt.Errorf("encoding prepare progress: %w", err)
@@ -136,7 +136,7 @@ func (r *HubTeardownReconciler) savePrepareProgress(ctx context.Context, td *ope
 	return nil
 }
 
-func recordPreparePhase(progress *prepareProgress, phase operatorv1.TeardownPhase, state operatorv1.TeardownPhaseState, message string) {
+func recordJobPhase(progress *jobProgress, phase operatorv1.TeardownPhase, state operatorv1.TeardownPhaseState, message string) {
 	now := metav1.Now()
 	for i := range progress.Phases {
 		if progress.Phases[i].Phase == phase {
@@ -146,12 +146,12 @@ func recordPreparePhase(progress *prepareProgress, phase operatorv1.TeardownPhas
 			return
 		}
 	}
-	progress.Phases = append(progress.Phases, preparePhaseRecord{
+	progress.Phases = append(progress.Phases, jobPhaseRecord{
 		Phase: phase, State: state, Message: message, Time: now,
 	})
 }
 
-func preparePhaseState(progress *prepareProgress, phase operatorv1.TeardownPhase) operatorv1.TeardownPhaseState {
+func jobPhaseState(progress *jobProgress, phase operatorv1.TeardownPhase) operatorv1.TeardownPhaseState {
 	for _, record := range progress.Phases {
 		if record.Phase == phase {
 			return record.State
@@ -161,7 +161,7 @@ func preparePhaseState(progress *prepareProgress, phase operatorv1.TeardownPhase
 }
 
 // nopRecorder satisfies record.EventRecorder without writing events. The Job
-// runs as the escalation identity, which deliberately has no create verb, and
+// runs as the handoff identity, which deliberately has no create verb, and
 // its real record is the progress ConfigMap, not the event stream.
 type nopRecorder struct{}
 
@@ -174,12 +174,23 @@ func (nopRecorder) AnnotatedEventf(runtime.Object, map[string]string, string, st
 // no watch, no leader election and no status writes, so it can never be a second
 // writer over the HubTeardown status.
 func RunPrepareJob(ctx context.Context, c client.Client, dc discovery.DiscoveryInterface, name, namespace string) error {
+	r, td, log, deadline, err := newJobReconciler(ctx, c, dc, name, namespace, "prepare")
+	if err != nil || r == nil {
+		return err
+	}
+	return r.runJobLoop(ctx, log, td, r.preparePhasePlan(), deadline, jobResyncInterval)
+}
+
+// newJobReconciler builds the reconciler a one-shot Job runs with. It returns a
+// nil reconciler and nil error when the CR is already gone: a Job that outlives
+// its teardown has nothing to do.
+func newJobReconciler(ctx context.Context, c client.Client, dc discovery.DiscoveryInterface, name, namespace, job string) (*HubTeardownReconciler, *operatorv1.HubTeardown, logr.Logger, time.Time, error) {
 	td := &operatorv1.HubTeardown{}
 	if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, td); err != nil {
 		if errors.IsNotFound(err) {
-			return nil
+			return nil, nil, logr.Logger{}, time.Time{}, nil
 		}
-		return fmt.Errorf("reading HubTeardown %s/%s: %w", namespace, name, err)
+		return nil, nil, logr.Logger{}, time.Time{}, fmt.Errorf("reading HubTeardown %s/%s: %w", namespace, name, err)
 	}
 
 	maxDur := defaultMaxDuration
@@ -194,15 +205,15 @@ func RunPrepareJob(ctx context.Context, c client.Client, dc discovery.DiscoveryI
 		DiscoveryClient: dc,
 		Recorder:        nopRecorder{},
 	}
-	log := ctrllog.FromContext(ctx).WithName("prepare")
-	return r.runPrepareLoop(ctx, log, td, r.preparePhasePlan(), time.Now().Add(maxDur), prepareResyncInterval)
+	log := ctrllog.FromContext(ctx).WithName(job)
+	return r, td, log, time.Now().Add(maxDur), nil
 }
 
-// runPrepareLoop executes the plan until every phase reports done or the
+// runJobLoop executes the plan until every phase reports done or the
 // deadline passes. It is separate from RunPrepareJob so tests can drive it with
 // synthetic phases and a short resync.
-func (r *HubTeardownReconciler) runPrepareLoop(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown, plan []teardownPhaseStep, deadline time.Time, resync time.Duration) error {
-	progress, err := r.loadPrepareProgress(ctx, td)
+func (r *HubTeardownReconciler) runJobLoop(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown, plan []teardownPhaseStep, deadline time.Time, resync time.Duration) error {
+	progress, err := r.loadJobProgress(ctx, td)
 	if err != nil {
 		return err
 	}
@@ -210,35 +221,35 @@ func (r *HubTeardownReconciler) runPrepareLoop(ctx context.Context, log logr.Log
 	for {
 		pending := false
 		for _, step := range plan {
-			if preparePhaseState(progress, step.phase) == operatorv1.PhaseStateComplete {
+			if jobPhaseState(progress, step.phase) == operatorv1.PhaseStateComplete {
 				continue
 			}
 
-			recordPreparePhase(progress, step.phase, operatorv1.PhaseStateInProgress, "Executing phase")
-			if err := r.savePrepareProgress(ctx, td, progress); err != nil {
+			recordJobPhase(progress, step.phase, operatorv1.PhaseStateInProgress, "Executing phase")
+			if err := r.saveJobProgress(ctx, td, progress); err != nil {
 				return err
 			}
 
 			done, execErr := step.execute(ctx, log, td)
 			if execErr != nil {
-				recordPreparePhase(progress, step.phase, operatorv1.PhaseStateFailed, execErr.Error())
-				if saveErr := r.savePrepareProgress(ctx, td, progress); saveErr != nil {
+				recordJobPhase(progress, step.phase, operatorv1.PhaseStateFailed, execErr.Error())
+				if saveErr := r.saveJobProgress(ctx, td, progress); saveErr != nil {
 					log.Error(saveErr, "Failed to record phase failure", "phase", step.phase)
 				}
 				return fmt.Errorf("phase %s failed: %w", step.phase, execErr)
 			}
 
 			if !done {
-				recordPreparePhase(progress, step.phase, operatorv1.PhaseStateInProgress, "Waiting for phase to complete")
-				if err := r.savePrepareProgress(ctx, td, progress); err != nil {
+				recordJobPhase(progress, step.phase, operatorv1.PhaseStateInProgress, "Waiting for phase to complete")
+				if err := r.saveJobProgress(ctx, td, progress); err != nil {
 					return err
 				}
 				pending = true
 				break
 			}
 
-			recordPreparePhase(progress, step.phase, operatorv1.PhaseStateComplete, "Phase completed")
-			if err := r.savePrepareProgress(ctx, td, progress); err != nil {
+			recordJobPhase(progress, step.phase, operatorv1.PhaseStateComplete, "Phase completed")
+			if err := r.saveJobProgress(ctx, td, progress); err != nil {
 				return err
 			}
 			log.Info("Prepare phase complete", "phase", step.phase)
@@ -251,10 +262,10 @@ func (r *HubTeardownReconciler) runPrepareLoop(ctx context.Context, log logr.Log
 		if time.Now().After(deadline) {
 			for _, record := range progress.Phases {
 				if record.State == operatorv1.PhaseStateInProgress {
-					recordPreparePhase(progress, record.Phase, operatorv1.PhaseStateFailed, "Deadline exceeded")
+					recordJobPhase(progress, record.Phase, operatorv1.PhaseStateFailed, "Deadline exceeded")
 				}
 			}
-			if err := r.savePrepareProgress(ctx, td, progress); err != nil {
+			if err := r.saveJobProgress(ctx, td, progress); err != nil {
 				log.Error(err, "Failed to record deadline")
 			}
 			return fmt.Errorf("prepare phases did not complete before the deadline")
@@ -268,36 +279,57 @@ func (r *HubTeardownReconciler) runPrepareLoop(ctx context.Context, log logr.Log
 	}
 }
 
-// prepareProgressComplete is what the operator uses to decide whether the Job
-// has finished. Absence of a record is never read as completion.
-func (r *HubTeardownReconciler) prepareProgressComplete(ctx context.Context, td *operatorv1.HubTeardown) (bool, *prepareProgress, error) {
-	progress, err := r.loadPrepareProgress(ctx, td)
+// jobProgressComplete reports whether every phase of one plan has been recorded
+// complete by its Job. Absence of a record is never read as completion, and a
+// plan only ever answers for its own phases.
+func (r *HubTeardownReconciler) jobProgressComplete(ctx context.Context, td *operatorv1.HubTeardown, plan []teardownPhaseStep) (bool, *jobProgress, error) {
+	progress, err := r.loadJobProgress(ctx, td)
 	if err != nil {
 		return false, nil, err
 	}
-	for _, step := range r.preparePhasePlan() {
-		if preparePhaseState(progress, step.phase) != operatorv1.PhaseStateComplete {
+	for _, step := range plan {
+		if jobPhaseState(progress, step.phase) != operatorv1.PhaseStateComplete {
 			return false, progress, nil
 		}
 	}
 	return true, progress, nil
 }
 
-// mirrorPrepareProgress copies completed prepare phases into the status record.
-// The operator stays the only writer of status; the Job only writes progress.
-func (r *HubTeardownReconciler) mirrorPrepareProgress(td *operatorv1.HubTeardown, progress *prepareProgress) {
+// prepareProgressComplete is what the operator uses to decide whether the
+// prepare Job has finished.
+func (r *HubTeardownReconciler) prepareProgressComplete(ctx context.Context, td *operatorv1.HubTeardown) (bool, *jobProgress, error) {
+	return r.jobProgressComplete(ctx, td, r.preparePhasePlan())
+}
+
+// handoffProgressComplete is the same question for the handoff Job.
+func (r *HubTeardownReconciler) handoffProgressComplete(ctx context.Context, td *operatorv1.HubTeardown) (bool, *jobProgress, error) {
+	return r.jobProgressComplete(ctx, td, r.handoffPhasePlan())
+}
+
+// mirrorJobProgress copies the completed phases of one plan into the status
+// record. The operator stays the only writer of status; the Job only writes
+// progress.
+func (r *HubTeardownReconciler) mirrorJobProgress(td *operatorv1.HubTeardown, progress *jobProgress, plan []teardownPhaseStep, by string) {
 	if progress == nil {
 		return
 	}
-	for _, step := range r.preparePhasePlan() {
+	for _, step := range plan {
 		for _, record := range progress.Phases {
 			if record.Phase != step.phase || record.State != operatorv1.PhaseStateComplete {
 				continue
 			}
 			if !r.isPhaseComplete(td, step.phase) {
 				now := record.Time
-				r.setPhaseStatusWithTime(td, step.phase, operatorv1.PhaseStateComplete, "Phase completed by prepare Job", &now)
+				r.setPhaseStatusWithTime(td, step.phase, operatorv1.PhaseStateComplete, "Phase completed by "+by+" Job", &now)
 			}
 		}
 	}
+}
+
+func (r *HubTeardownReconciler) mirrorPrepareProgress(td *operatorv1.HubTeardown, progress *jobProgress) {
+	r.mirrorJobProgress(td, progress, r.preparePhasePlan(), "prepare")
+}
+
+func (r *HubTeardownReconciler) mirrorHandoffProgress(td *operatorv1.HubTeardown, progress *jobProgress) {
+	r.mirrorJobProgress(td, progress, r.handoffPhasePlan(), "handoff")
 }

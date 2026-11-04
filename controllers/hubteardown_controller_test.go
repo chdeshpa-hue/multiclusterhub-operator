@@ -209,7 +209,7 @@ var _ = Describe("HubTeardown controller", func() {
 
 		Consistently(func() bool {
 			job := &batchv1.Job{}
-			err := k8sClient.Get(ctxTD, types.NamespacedName{Name: teardownJobName, Namespace: tdNs}, job)
+			err := k8sClient.Get(ctxTD, types.NamespacedName{Name: prepareJobName, Namespace: tdNs}, job)
 			return err == nil
 		}, time.Second*2, tdInterval).Should(BeFalse(), "no Job may exist before consent")
 	})
@@ -220,7 +220,7 @@ var _ = Describe("HubTeardown controller", func() {
 
 		// The role ships with the bundle; envtest installs CRDs only.
 		Expect(k8sClient.Create(ctxTD, &rbacv1.ClusterRole{
-			ObjectMeta: metav1.ObjectMeta{Name: escalationRoleName},
+			ObjectMeta: metav1.ObjectMeta{Name: handoffRoleName},
 		})).Should(Succeed())
 
 		td := &operatorv1.HubTeardown{
@@ -238,11 +238,11 @@ var _ = Describe("HubTeardown controller", func() {
 
 		Eventually(func() string {
 			job := &batchv1.Job{}
-			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: teardownJobName, Namespace: tdNs}, job); err != nil {
+			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: prepareJobName, Namespace: tdNs}, job); err != nil {
 				return ""
 			}
 			return job.Spec.Template.Spec.ServiceAccountName
-		}, tdTimeout, tdInterval).Should(Equal(escalationSAName), "Job must run as the escalation identity")
+		}, tdTimeout, tdInterval).Should(Equal(handoffSAName), "Job must run as the handoff identity")
 
 		Eventually(func() string {
 			fetched := &operatorv1.HubTeardown{}
@@ -259,9 +259,9 @@ var _ = Describe("HubTeardown controller", func() {
 
 		// The Job pod cannot run in envtest, so record its progress the way the
 		// Job does. The operator must then continue with its own plan.
-		progress := &prepareProgress{}
+		progress := &jobProgress{}
 		for _, step := range (&HubTeardownReconciler{}).preparePhasePlan() {
-			recordPreparePhase(progress, step.phase, operatorv1.PhaseStateComplete, "seeded by envtest")
+			recordJobPhase(progress, step.phase, operatorv1.PhaseStateComplete, "seeded by envtest")
 		}
 		body, err := json.Marshal(progress)
 		Expect(err).NotTo(HaveOccurred())
@@ -269,6 +269,52 @@ var _ = Describe("HubTeardown controller", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: progressConfigMapName(td), Namespace: tdNs},
 			Data:       map[string]string{progressKeyPhases: string(body)},
 		})).Should(Succeed())
+
+		// The prepare Job must reach a terminal condition before the handoff Job
+		// may start (D9b-2): the Job controller would set it, so the spec sets it.
+		Eventually(func() error {
+			job := &batchv1.Job{}
+			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: prepareJobName, Namespace: tdNs}, job); err != nil {
+				return err
+			}
+			if len(job.Status.Conditions) > 0 && job.Status.Conditions[0].Status == corev1.ConditionTrue {
+				return nil
+			}
+			now := metav1.Now()
+			job.Status.StartTime = &now
+			job.Status.CompletionTime = &now
+			// Kubernetes 1.31+ requires SuccessCriteriaMet before Complete, and
+			// rejects a finished Job without startTime/completionTime.
+			job.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+				{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue},
+			}
+			return k8sClient.Status().Update(ctxTD, job)
+		}, tdTimeout, tdInterval).Should(Succeed())
+
+		// The handoff Job is the only executor of MonitorMCEChain and
+		// DeleteACMCRDs. It must appear only after the prepare Job is terminal.
+		handoffJob := &batchv1.Job{}
+		Eventually(func() error {
+			return k8sClient.Get(ctxTD, types.NamespacedName{Name: handoffJobName, Namespace: tdNs}, handoffJob)
+		}, tdTimeout, tdInterval).Should(Succeed())
+		Expect(handoffJob.Spec.Template.Spec.ServiceAccountName).Should(Equal(handoffSAName))
+		Expect(handoffJob.Spec.Template.Spec.Containers[0].Args).Should(ContainElement("--teardown-plan=handoff"))
+
+		// Record the handoff plan's completion the way the Job does. The operator
+		// reads completion from the progress record, not from the Job condition,
+		// so nothing else has to be simulated here.
+		cm := &corev1.ConfigMap{}
+		Expect(k8sClient.Get(ctxTD, types.NamespacedName{Name: progressConfigMapName(td), Namespace: tdNs}, cm)).Should(Succeed())
+		all := &jobProgress{}
+		Expect(json.Unmarshal([]byte(cm.Data[progressKeyPhases]), all)).Should(Succeed())
+		for _, step := range (&HubTeardownReconciler{}).handoffPhasePlan() {
+			recordJobPhase(all, step.phase, operatorv1.PhaseStateComplete, "seeded by envtest")
+		}
+		body, err = json.Marshal(all)
+		Expect(err).NotTo(HaveOccurred())
+		cm.Data[progressKeyPhases] = string(body)
+		Expect(k8sClient.Update(ctxTD, cm)).Should(Succeed())
 
 		Eventually(func() operatorv1.TeardownPhase {
 			fetched := &operatorv1.HubTeardown{}

@@ -540,13 +540,13 @@ func TestEnsureTeardownJob_CreatesJob(t *testing.T) {
 	ctx := context.Background()
 	log := ctrllog.Log.WithName("test")
 
-	if err := r.ensureTeardownJob(ctx, log, td); err != nil {
-		t.Fatalf("ensureTeardownJob failed: %v", err)
+	if err := r.ensurePrepareJob(ctx, log, td); err != nil {
+		t.Fatalf("ensurePrepareJob failed: %v", err)
 	}
 
 	job := &batchv1.Job{}
 	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      teardownJobName,
+		Name:      prepareJobName,
 		Namespace: td.Namespace,
 	}, job)
 	if err != nil {
@@ -561,8 +561,11 @@ func TestEnsureTeardownJob_CreatesJob(t *testing.T) {
 	if container.Image != "quay.io/test/operator:latest" {
 		t.Errorf("expected image quay.io/test/operator:latest, got %s", container.Image)
 	}
-	if len(container.Args) != 1 || container.Args[0] != "--teardown-mode" {
-		t.Errorf("expected args [--teardown-mode], got %v", container.Args)
+	if len(container.Args) != 1 || container.Args[0] != "--teardown-plan=prepare" {
+		t.Errorf("expected args [--teardown-plan=prepare], got %v", container.Args)
+	}
+	if job.Spec.Template.Labels["operator.open-cluster-management.io/teardown-plan"] != TeardownPlanPrepare {
+		t.Errorf("plan label missing or wrong: %v", job.Spec.Template.Labels)
 	}
 
 	foundName, foundNs := false, false
@@ -599,13 +602,13 @@ func TestEnsureTeardownJob_NoImageSkips(t *testing.T) {
 	ctx := context.Background()
 	log := ctrllog.Log.WithName("test")
 
-	if err := r.ensureTeardownJob(ctx, log, td); err != nil {
-		t.Fatalf("ensureTeardownJob should not fail when image is unset: %v", err)
+	if err := r.ensurePrepareJob(ctx, log, td); err != nil {
+		t.Fatalf("ensurePrepareJob should not fail when image is unset: %v", err)
 	}
 
 	job := &batchv1.Job{}
 	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      teardownJobName,
+		Name:      prepareJobName,
 		Namespace: td.Namespace,
 	}, job)
 	if err == nil {
@@ -630,12 +633,12 @@ func TestEnsureTeardownJob_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	log := ctrllog.Log.WithName("test")
 
-	if err := r.ensureTeardownJob(ctx, log, td); err != nil {
-		t.Fatalf("first ensureTeardownJob failed: %v", err)
+	if err := r.ensurePrepareJob(ctx, log, td); err != nil {
+		t.Fatalf("first ensurePrepareJob failed: %v", err)
 	}
 
-	if err := r.ensureTeardownJob(ctx, log, td); err != nil {
-		t.Fatalf("second ensureTeardownJob should be idempotent: %v", err)
+	if err := r.ensurePrepareJob(ctx, log, td); err != nil {
+		t.Fatalf("second ensurePrepareJob should be idempotent: %v", err)
 	}
 }
 
@@ -652,7 +655,7 @@ func TestCleanupTeardownJob(t *testing.T) {
 	s := newTestScheme()
 	existingJob := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      teardownJobName,
+			Name:      prepareJobName,
 			Namespace: td.Namespace,
 		},
 	}
@@ -666,13 +669,13 @@ func TestCleanupTeardownJob(t *testing.T) {
 	ctx := context.Background()
 	log := ctrllog.Log.WithName("test")
 
-	if err := r.cleanupTeardownJob(ctx, log, td); err != nil {
-		t.Fatalf("cleanupTeardownJob failed: %v", err)
+	if err := r.cleanupPrepareJob(ctx, log, td); err != nil {
+		t.Fatalf("cleanupPrepareJob failed: %v", err)
 	}
 
 	job := &batchv1.Job{}
 	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      teardownJobName,
+		Name:      prepareJobName,
 		Namespace: td.Namespace,
 	}, job)
 	if err == nil {
@@ -694,12 +697,12 @@ func TestCleanupTeardownJob_NotFound(t *testing.T) {
 	ctx := context.Background()
 	log := ctrllog.Log.WithName("test")
 
-	if err := r.cleanupTeardownJob(ctx, log, td); err != nil {
-		t.Fatalf("cleanupTeardownJob should succeed when Job doesn't exist: %v", err)
+	if err := r.cleanupPrepareJob(ctx, log, td); err != nil {
+		t.Fatalf("cleanupPrepareJob should succeed when Job doesn't exist: %v", err)
 	}
 }
 
-func TestGetTeardownJobStatus(t *testing.T) {
+func TestJobState(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 
 	td := &operatorv1.HubTeardown{
@@ -709,62 +712,26 @@ func TestGetTeardownJobStatus(t *testing.T) {
 		},
 	}
 
+	jobWith := func(name string, conds ...batchv1.JobCondition) *batchv1.Job {
+		return &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "open-cluster-management"},
+			Status:     batchv1.JobStatus{Conditions: conds},
+		}
+	}
+	complete := batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}
+	failed := batchv1.JobCondition{Type: batchv1.JobFailed, Status: corev1.ConditionTrue}
+	running := batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionFalse}
+
 	tests := []struct {
-		name     string
-		job      *batchv1.Job
-		wantType *batchv1.JobConditionType
-		wantNil  bool
+		name         string
+		job          *batchv1.Job
+		wantExists   bool
+		wantTerminal *batchv1.JobConditionType
 	}{
-		{
-			name:    "no Job exists",
-			job:     nil,
-			wantNil: true,
-		},
-		{
-			name: "Job complete",
-			job: &batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      teardownJobName,
-					Namespace: "open-cluster-management",
-				},
-				Status: batchv1.JobStatus{
-					Conditions: []batchv1.JobCondition{
-						{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
-					},
-				},
-			},
-			wantNil: false,
-		},
-		{
-			name: "Job failed",
-			job: &batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      teardownJobName,
-					Namespace: "open-cluster-management",
-				},
-				Status: batchv1.JobStatus{
-					Conditions: []batchv1.JobCondition{
-						{Type: batchv1.JobFailed, Status: corev1.ConditionTrue},
-					},
-				},
-			},
-			wantNil: false,
-		},
-		{
-			name: "Job running (no true condition)",
-			job: &batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      teardownJobName,
-					Namespace: "open-cluster-management",
-				},
-				Status: batchv1.JobStatus{
-					Conditions: []batchv1.JobCondition{
-						{Type: batchv1.JobComplete, Status: corev1.ConditionFalse},
-					},
-				},
-			},
-			wantNil: true,
-		},
+		{name: "no Job exists", job: nil, wantExists: false},
+		{name: "Job complete", job: jobWith(prepareJobName, complete), wantExists: true, wantTerminal: &complete.Type},
+		{name: "Job failed", job: jobWith(prepareJobName, failed), wantExists: true, wantTerminal: &failed.Type},
+		{name: "Job running is present but not terminal", job: jobWith(prepareJobName, running), wantExists: true},
 	}
 
 	for _, tt := range tests {
@@ -781,15 +748,20 @@ func TestGetTeardownJobStatus(t *testing.T) {
 				Recorder: record.NewFakeRecorder(10),
 			}
 
-			condType, err := r.getTeardownJobStatus(context.Background(), td)
+			exists, terminal, err := r.jobState(context.Background(), td, prepareJobName)
 			if err != nil {
-				t.Fatalf("getTeardownJobStatus error: %v", err)
+				t.Fatalf("jobState: %v", err)
 			}
-			if tt.wantNil && condType != nil {
-				t.Errorf("expected nil condition type, got %v", *condType)
+			if exists != tt.wantExists {
+				t.Errorf("exists = %t, want %t", exists, tt.wantExists)
 			}
-			if !tt.wantNil && condType == nil {
-				t.Error("expected non-nil condition type")
+			switch {
+			case tt.wantTerminal == nil && terminal != nil:
+				t.Errorf("terminal = %v, want nil", *terminal)
+			case tt.wantTerminal != nil && terminal == nil:
+				t.Errorf("terminal = nil, want %v", *tt.wantTerminal)
+			case tt.wantTerminal != nil && *terminal != *tt.wantTerminal:
+				t.Errorf("terminal = %v, want %v", *terminal, *tt.wantTerminal)
 			}
 		})
 	}

@@ -208,7 +208,6 @@ spec:
                       - Preparing
                       - HandedOff
                       - Stalled
-                      - Escalating
                       - Verifying
                       - CompleteWithResidue
                       type: string
@@ -496,7 +495,6 @@ spec:
                           - Preparing
                           - HandedOff
                           - Stalled
-                          - Escalating
                           - Verifying
                           - CompleteWithResidue
                           type: string
@@ -568,7 +566,6 @@ spec:
                 - Preparing
                 - HandedOff
                 - Stalled
-                - Escalating
                 - Verifying
                 - CompleteWithResidue
                 type: string
@@ -606,7 +603,6 @@ spec:
                       - Preparing
                       - HandedOff
                       - Stalled
-                      - Escalating
                       - Verifying
                       - CompleteWithResidue
                       type: string

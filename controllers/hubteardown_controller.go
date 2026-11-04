@@ -4,6 +4,7 @@ package controllers
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"time"
 
@@ -114,8 +115,8 @@ func (r *HubTeardownReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Handle CR deletion: remove the finalizer so the CR can be garbage-collected.
 	if teardown.GetDeletionTimestamp() != nil {
 		if controllerutil.ContainsFinalizer(teardown, teardownJobFinalizer) {
-			if err := r.cleanupEscalation(ctx, log, teardown); err != nil {
-				log.Error(err, "Failed to cleanup teardown escalation during CR deletion")
+			if err := r.cleanupHandoff(ctx, log, teardown); err != nil {
+				log.Error(err, "Failed to cleanup teardown handoff during CR deletion")
 			}
 			controllerutil.RemoveFinalizer(teardown, teardownJobFinalizer)
 			if err := r.Client.Update(ctx, teardown); err != nil {
@@ -298,14 +299,14 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 		r.Recorder.Event(td, corev1.EventTypeNormal, "StallCleared", "Teardown no longer stalled")
 	}
 
-	if err := r.ensureEscalation(ctx, log, td); err != nil {
+	if err := r.ensureHandoff(ctx, log, td); err != nil {
 		// Visible, not fatal: teardown can still finish in-process, but the
-		// missing escalation identity must never be silent (J-6).
-		r.setCondition(td, conditionTypeEscalationReady, metav1.ConditionFalse, "EscalationUnavailable", err.Error())
-		log.Error(err, "Failed to ensure teardown escalation (controller will continue without resilient Job)")
+		// missing handoff identity must never be silent (J-6).
+		r.setCondition(td, conditionTypeHandoffReady, metav1.ConditionFalse, "HandoffUnavailable", err.Error())
+		log.Error(err, "Failed to ensure teardown handoff (controller will continue without resilient Job)")
 	} else if teardownConsentGiven(td) {
-		r.setCondition(td, conditionTypeEscalationReady, metav1.ConditionTrue, "EscalationReady",
-			fmt.Sprintf("Escalation Job runs as ServiceAccount %s bound to ClusterRole %s.", escalationSAName, escalationRoleName))
+		r.setCondition(td, conditionTypeHandoffReady, metav1.ConditionTrue, "HandoffReady",
+			fmt.Sprintf("Handoff Job runs as ServiceAccount %s bound to ClusterRole %s.", handoffSAName, handoffRoleName))
 	}
 
 	// The destructive phases run in the Job. The operator holds at the boundary
@@ -334,6 +335,23 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 	}
 	r.mirrorPrepareProgress(td, progress)
 
+	// The prepare Job is done: remove it, then start the handoff Job. The
+	// identity stays in place, and the handoff Job is only created once the
+	// prepare pod has exited, so the shared progress record never has two
+	// writers (D9b-2).
+	if err := r.finishPrepareJob(ctx, log, td); err != nil {
+		log.Error(err, "Failed to finish the prepare Job")
+	}
+	if err := r.ensureHandoffJob(ctx, log, td); err != nil {
+		r.setCondition(td, conditionTypeHandoffReady, metav1.ConditionFalse, "HandoffUnavailable", err.Error())
+		log.Error(err, "Failed to create the handoff Job")
+	}
+	if handoffProgress, err := r.loadJobProgress(ctx, td); err != nil {
+		log.Error(err, "Failed to read handoff progress")
+	} else {
+		r.mirrorHandoffProgress(td, handoffProgress)
+	}
+
 	// Clear WaitingForApproval if the user has now granted the required approvals.
 	if td.Spec.ApprovedDestructiveActions || td.Spec.AcknowledgeCloudResourceRisk {
 		r.clearWaitingForApproval(td)
@@ -347,18 +365,25 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 	// trigger a requeue.
 	result, err := r.executePhases(ctx, log, td)
 	if err != nil {
+		// A handoff Job that ended without recording completion is a terminal
+		// failure, not a wait: the deadline is not the only way out (D9b-3).
+		if stderrors.Is(err, errHandoffJobFailed) {
+			return r.failOnHandoffJob(ctx, log, td, err)
+		}
 		if statusErr := r.Client.Status().Update(ctx, td); statusErr != nil {
 			log.Error(statusErr, "Failed to persist phase failure status")
 		}
 		return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
 	}
 
-	// The Job is only observed after the phases run: its terminal state is the
-	// record of the handoff, and the identity is removed only once it is done.
-	if finishErr := r.finishEscalation(ctx, log, td); finishErr != nil {
-		log.Error(finishErr, "Failed to finish teardown escalation")
-	} else if err := r.Client.Status().Update(ctx, td); err != nil {
-		log.Error(err, "Failed to persist escalation condition")
+	// Verify writes the terminal phase. Once it is complete the handoff Job has
+	// nothing left to do, so the identity and both Jobs go away.
+	if r.isPhaseComplete(td, operatorv1.TeardownPhaseVerifying) {
+		if finishErr := r.finishHandoffJob(ctx, log, td); finishErr != nil {
+			log.Error(finishErr, "Failed to finish teardown handoff")
+		} else if statusErr := r.Client.Status().Update(ctx, td); statusErr != nil {
+			log.Error(statusErr, "Failed to persist handoff condition")
+		}
 	}
 	return result, nil
 }
@@ -372,11 +397,16 @@ type teardownPhaseStep struct {
 // teardownPhasePlan is the ordered plan. GateOLMSubscription, CleanOrphans and
 // RemoveOLMOperator are absent by design: the operator is preserved (D-G) and
 // Verify owns the terminal write.
+//
+// The two Job-owned phases are present as waiters: they keep the phase names and
+// ordering in status, but the operator never executes them (D9b-1). The handoff
+// Job does, under an identity the admin consented to and a deadline the
+// controller cannot give itself.
 func (r *HubTeardownReconciler) teardownPhasePlan() []teardownPhaseStep {
 	return []teardownPhaseStep{
 		{operatorv1.TeardownPhaseDeleteMCH, r.phaseDeleteMCH},
-		{operatorv1.TeardownPhaseMonitorMCEChain, r.phaseMonitorMCEChain},
-		{operatorv1.TeardownPhaseDeleteACMCRDs, r.phaseDeleteACMCRDs},
+		{operatorv1.TeardownPhaseMonitorMCEChain, r.awaitJobPhase(operatorv1.TeardownPhaseMonitorMCEChain)},
+		{operatorv1.TeardownPhaseDeleteACMCRDs, r.awaitJobPhase(operatorv1.TeardownPhaseDeleteACMCRDs)},
 		{operatorv1.TeardownPhaseVerifying, r.phaseVerify},
 	}
 }

@@ -18,7 +18,16 @@ import (
 )
 
 const (
-	teardownJobName      = "hubteardown-cleanup"
+	prepareJobName = "hubteardown-cleanup"
+	handoffJobName = "hubteardown-handoff"
+
+	// teardownPlanFlag selects which plan a Job executes. Both Jobs run the same
+	// binary and differ by exactly this value, so the Job spec is written once.
+	teardownPlanFlag = "--teardown-plan="
+	// TeardownPlanPrepare and TeardownPlanHandoff are the two executable plans.
+	TeardownPlanPrepare = "prepare"
+	TeardownPlanHandoff = "handoff"
+
 	teardownJobFinalizer = "operator.open-cluster-management.io/teardown-job"
 
 	envTeardownName      = "TEARDOWN_NAME"
@@ -26,7 +35,7 @@ const (
 	envPodNamespace      = "POD_NAMESPACE"
 )
 
-// teardownNamespace is the namespace every escalation object lives in. The CR
+// teardownNamespace is the namespace every handoff object lives in. The CR
 // namespace wins; POD_NAMESPACE covers the case where the controller is asked
 // to act on a CR read from the cache before the namespace default is applied.
 func teardownNamespace(td *operatorv1.HubTeardown) string {
@@ -50,13 +59,20 @@ func teardownJobDeadline(td *operatorv1.HubTeardown) *int64 {
 	return &seconds
 }
 
-// ensureTeardownJob creates or verifies the resilient cleanup Job that survives
+// ensurePrepareJob creates or verifies the resilient cleanup Job that survives
 // operator pod deletion. The Job runs the same operator binary with a special
 // entrypoint flag to continue teardown independently.
-func (r *HubTeardownReconciler) ensureTeardownJob(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) error {
+func (r *HubTeardownReconciler) ensurePrepareJob(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) error {
+	return r.ensureJobNamed(ctx, log, td, prepareJobName, TeardownPlanPrepare)
+}
+
+// ensureJobNamed creates the Job that runs one phase set. The prepare Job and
+// the handoff Job differ only by name, plan value and plan label.
+func (r *HubTeardownReconciler) ensureJobNamed(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown, jobName, plan string) error {
+	ns := teardownNamespace(td)
 	jobKey := types.NamespacedName{
-		Name:      teardownJobName,
-		Namespace: td.Namespace,
+		Name:      jobName,
+		Namespace: ns,
 	}
 
 	existing := &batchv1.Job{}
@@ -78,17 +94,16 @@ func (r *HubTeardownReconciler) ensureTeardownJob(ctx context.Context, log logr.
 		return nil
 	}
 
-	ns := teardownNamespace(td)
-
 	backoffLimit := int32(2)
 	ttlSeconds := int32(3600)
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      teardownJobName,
+			Name:      jobName,
 			Namespace: ns,
 			Labels: map[string]string{
 				"app": "hubteardown",
-				"operator.open-cluster-management.io/teardown": "true",
+				"operator.open-cluster-management.io/teardown":      "true",
+				"operator.open-cluster-management.io/teardown-plan": plan,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -99,20 +114,21 @@ func (r *HubTeardownReconciler) ensureTeardownJob(ctx context.Context, log logr.
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
 						"app": "hubteardown",
-						"operator.open-cluster-management.io/teardown": "true",
+						"operator.open-cluster-management.io/teardown":      "true",
+						"operator.open-cluster-management.io/teardown-plan": plan,
 					},
 				},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyOnFailure,
-					// The Job runs as the escalation identity, never as the
+					// Both Jobs run as the handoff identity, never as the
 					// always-on operator ServiceAccount.
-					ServiceAccountName: escalationSAName,
+					ServiceAccountName: handoffSAName,
 					Containers: []corev1.Container{
 						{
 							Name:    "teardown",
 							Image:   operatorImage,
 							Command: []string{"multiclusterhub-operator"},
-							Args:    []string{"--teardown-mode"},
+							Args:    []string{teardownPlanFlag + plan},
 							Env: []corev1.EnvVar{
 								{Name: envTeardownName, Value: td.Name},
 								{Name: envTeardownNamespace, Value: ns},
@@ -135,10 +151,14 @@ func (r *HubTeardownReconciler) ensureTeardownJob(ctx context.Context, log logr.
 	return nil
 }
 
-// cleanupTeardownJob removes the teardown Job when teardown is complete.
-func (r *HubTeardownReconciler) cleanupTeardownJob(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) error {
+// cleanupPrepareJob removes the teardown Job when teardown is complete.
+func (r *HubTeardownReconciler) cleanupPrepareJob(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) error {
+	return r.cleanupJobNamed(ctx, log, td, prepareJobName)
+}
+
+func (r *HubTeardownReconciler) cleanupJobNamed(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown, jobName string) error {
 	jobKey := types.NamespacedName{
-		Name:      teardownJobName,
+		Name:      jobName,
 		Namespace: teardownNamespace(td),
 	}
 
@@ -161,25 +181,30 @@ func (r *HubTeardownReconciler) cleanupTeardownJob(ctx context.Context, log logr
 	return nil
 }
 
-// getTeardownJobStatus returns the current status of the teardown Job.
-func (r *HubTeardownReconciler) getTeardownJobStatus(ctx context.Context, td *operatorv1.HubTeardown) (*batchv1.JobConditionType, error) {
+// jobState reports whether a Job exists and, when it has reached a terminal
+// condition, which one. A running Job returns exists=true with a nil terminal;
+// "not found" returns exists=false. The two are never conflated: the handoff Job
+// must not start while the prepare pod is still writing the shared record.
+func (r *HubTeardownReconciler) jobState(ctx context.Context, td *operatorv1.HubTeardown, jobName string) (bool, *batchv1.JobConditionType, error) {
 	jobKey := types.NamespacedName{
-		Name:      teardownJobName,
+		Name:      jobName,
 		Namespace: teardownNamespace(td),
 	}
 
 	job := &batchv1.Job{}
 	if err := r.Client.Get(ctx, jobKey, job); err != nil {
 		if errors.IsNotFound(err) {
-			return nil, nil
+			return false, nil, nil
 		}
-		return nil, err
+		return false, nil, err
 	}
 
-	for _, cond := range job.Status.Conditions {
+	for i := range job.Status.Conditions {
+		cond := job.Status.Conditions[i]
 		if cond.Status == corev1.ConditionTrue {
-			return &cond.Type, nil
+			terminal := cond.Type
+			return true, &terminal, nil
 		}
 	}
-	return nil, nil
+	return true, nil, nil
 }

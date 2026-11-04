@@ -94,8 +94,8 @@ func TestFailOnTimeout_WritesFailedAndResidue(t *testing.T) {
 		t.Errorf("Progressing=False missing: %+v", td.Status.Conditions)
 	}
 
-	if exists(t, r.Client, types.NamespacedName{Name: teardownJobName, Namespace: td.Namespace}, &batchv1.Job{}) {
-		t.Error("a failed run left the escalation Job running")
+	if exists(t, r.Client, types.NamespacedName{Name: prepareJobName, Namespace: td.Namespace}, &batchv1.Job{}) {
+		t.Error("a failed run left the handoff Job running")
 	}
 }
 

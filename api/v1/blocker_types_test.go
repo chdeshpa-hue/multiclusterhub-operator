@@ -176,7 +176,7 @@ func TestTeardownPhaseValuesAreUnique(t *testing.T) {
 		TeardownPhaseDeleteACMCRDs, TeardownPhaseComplete,
 		TeardownPhaseFailed, TeardownPhaseNotStarted, TeardownPhaseInspecting,
 		TeardownPhaseReportReady, TeardownPhaseConsentRequired, TeardownPhasePreparing,
-		TeardownPhaseHandedOff, TeardownPhaseStalled, TeardownPhaseEscalating,
+		TeardownPhaseHandedOff, TeardownPhaseStalled,
 		TeardownPhaseVerifying, TeardownPhaseCompleteWithResidue,
 	}
 	seen := make(map[TeardownPhase]bool, len(values))
@@ -186,8 +186,8 @@ func TestTeardownPhaseValuesAreUnique(t *testing.T) {
 		}
 		seen[v] = true
 	}
-	if len(seen) != 20 {
-		t.Fatalf("expected 20 distinct phase values, got %d", len(seen))
+	if len(seen) != 19 {
+		t.Fatalf("expected 19 distinct phase values, got %d", len(seen))
 	}
 	if TeardownPhaseComplete == TeardownPhaseCompleteWithResidue {
 		t.Fatalf("Complete and CompleteWithResidue must be distinct terminal states")

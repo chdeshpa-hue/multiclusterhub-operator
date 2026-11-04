@@ -63,20 +63,20 @@ func fixedStep(phase operatorv1.TeardownPhase, done bool, err error) teardownPha
 }
 
 func TestRunPrepareLoop_CompletesAndRecordsProgress(t *testing.T) {
-	td := escalationTestCR()
-	r := newEscalationReconciler(t)
+	td := handoffTestCR()
+	r := newHandoffReconciler(t)
 	plan := []teardownPhaseStep{
 		fixedStep(operatorv1.TeardownPhaseRemoveBlockingCRs, true, nil),
 		fixedStep(operatorv1.TeardownPhaseDisableAddons, true, nil),
 	}
 
-	if err := r.runPrepareLoop(context.Background(), ctrllog.Log, td, plan, time.Now().Add(time.Minute), time.Millisecond); err != nil {
-		t.Fatalf("runPrepareLoop: %v", err)
+	if err := r.runJobLoop(context.Background(), ctrllog.Log, td, plan, time.Now().Add(time.Minute), time.Millisecond); err != nil {
+		t.Fatalf("runJobLoop: %v", err)
 	}
 
-	progress, err := r.loadPrepareProgress(context.Background(), td)
+	progress, err := r.loadJobProgress(context.Background(), td)
 	if err != nil {
-		t.Fatalf("loadPrepareProgress: %v", err)
+		t.Fatalf("loadJobProgress: %v", err)
 	}
 	if len(progress.Phases) != len(plan) {
 		t.Fatalf("recorded %d phases, want %d", len(progress.Phases), len(plan))
@@ -89,12 +89,12 @@ func TestRunPrepareLoop_CompletesAndRecordsProgress(t *testing.T) {
 }
 
 func TestRunPrepareLoop_ResumesFromProgress(t *testing.T) {
-	td := escalationTestCR()
-	r := newEscalationReconciler(t)
+	td := handoffTestCR()
+	r := newHandoffReconciler(t)
 
 	first := operatorv1.TeardownPhaseRemoveBlockingCRs
 	second := operatorv1.TeardownPhaseDisableAddons
-	if err := r.savePrepareProgress(context.Background(), td, &prepareProgress{Phases: []preparePhaseRecord{
+	if err := r.saveJobProgress(context.Background(), td, &jobProgress{Phases: []jobPhaseRecord{
 		{Phase: first, State: operatorv1.PhaseStateComplete, Time: metav1.Now()},
 	}}); err != nil {
 		t.Fatalf("seed progress: %v", err)
@@ -112,8 +112,8 @@ func TestRunPrepareLoop_ResumesFromProgress(t *testing.T) {
 	}
 
 	plan := []teardownPhaseStep{makeStep(first), makeStep(second)}
-	if err := r.runPrepareLoop(context.Background(), ctrllog.Log, td, plan, time.Now().Add(time.Minute), time.Millisecond); err != nil {
-		t.Fatalf("runPrepareLoop: %v", err)
+	if err := r.runJobLoop(context.Background(), ctrllog.Log, td, plan, time.Now().Add(time.Minute), time.Millisecond); err != nil {
+		t.Fatalf("runJobLoop: %v", err)
 	}
 	if ran[first] != 0 {
 		t.Errorf("completed phase %s re-executed %d times", first, ran[first])
@@ -124,8 +124,8 @@ func TestRunPrepareLoop_ResumesFromProgress(t *testing.T) {
 }
 
 func TestRunPrepareLoop_WaitsThenCompletes(t *testing.T) {
-	td := escalationTestCR()
-	r := newEscalationReconciler(t)
+	td := handoffTestCR()
+	r := newHandoffReconciler(t)
 
 	calls := 0
 	step := teardownPhaseStep{
@@ -136,8 +136,8 @@ func TestRunPrepareLoop_WaitsThenCompletes(t *testing.T) {
 		},
 	}
 
-	if err := r.runPrepareLoop(context.Background(), ctrllog.Log, td, []teardownPhaseStep{step}, time.Now().Add(time.Minute), time.Millisecond); err != nil {
-		t.Fatalf("runPrepareLoop: %v", err)
+	if err := r.runJobLoop(context.Background(), ctrllog.Log, td, []teardownPhaseStep{step}, time.Now().Add(time.Minute), time.Millisecond); err != nil {
+		t.Fatalf("runJobLoop: %v", err)
 	}
 	if calls != 2 {
 		t.Errorf("phase executed %d times, want 2 (wait then complete)", calls)
@@ -145,39 +145,39 @@ func TestRunPrepareLoop_WaitsThenCompletes(t *testing.T) {
 }
 
 func TestRunPrepareLoop_Error(t *testing.T) {
-	td := escalationTestCR()
-	r := newEscalationReconciler(t)
+	td := handoffTestCR()
+	r := newHandoffReconciler(t)
 	step := fixedStep(operatorv1.TeardownPhaseDisableAddons, false, fmt.Errorf("boom"))
 
-	err := r.runPrepareLoop(context.Background(), ctrllog.Log, td, []teardownPhaseStep{step}, time.Now().Add(time.Minute), time.Millisecond)
+	err := r.runJobLoop(context.Background(), ctrllog.Log, td, []teardownPhaseStep{step}, time.Now().Add(time.Minute), time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("expected the phase error, got %v", err)
 	}
 
-	progress, _ := r.loadPrepareProgress(context.Background(), td)
+	progress, _ := r.loadJobProgress(context.Background(), td)
 	if progress.Phases[0].State != operatorv1.PhaseStateFailed {
 		t.Errorf("state = %s, want Failed", progress.Phases[0].State)
 	}
 }
 
 func TestRunPrepareLoop_Deadline(t *testing.T) {
-	td := escalationTestCR()
-	r := newEscalationReconciler(t)
+	td := handoffTestCR()
+	r := newHandoffReconciler(t)
 	step := fixedStep(operatorv1.TeardownPhaseDisableAddons, false, nil)
 
-	err := r.runPrepareLoop(context.Background(), ctrllog.Log, td, []teardownPhaseStep{step}, time.Now().Add(-time.Second), time.Millisecond)
+	err := r.runJobLoop(context.Background(), ctrllog.Log, td, []teardownPhaseStep{step}, time.Now().Add(-time.Second), time.Millisecond)
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "deadline") {
 		t.Fatalf("expected a deadline error, got %v", err)
 	}
 
-	progress, _ := r.loadPrepareProgress(context.Background(), td)
+	progress, _ := r.loadJobProgress(context.Background(), td)
 	if progress.Phases[0].State != operatorv1.PhaseStateFailed || !strings.Contains(progress.Phases[0].Message, "Deadline") {
 		t.Errorf("record = %+v, want Failed/Deadline exceeded", progress.Phases[0])
 	}
 }
 
 func TestProgressIsNotAReport(t *testing.T) {
-	td := escalationTestCR()
+	td := handoffTestCR()
 	report := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "hubteardown-report-teardown-20261104t000000z",
@@ -186,11 +186,11 @@ func TestProgressIsNotAReport(t *testing.T) {
 		},
 		Data: map[string]string{reportKeyMeta: `{"digest":"abc"}`},
 	}
-	r := newEscalationReconciler(t, report)
+	r := newHandoffReconciler(t, report)
 
 	step := fixedStep(operatorv1.TeardownPhaseDisableAddons, true, nil)
-	if err := r.runPrepareLoop(context.Background(), ctrllog.Log, td, []teardownPhaseStep{step}, time.Now().Add(time.Minute), time.Millisecond); err != nil {
-		t.Fatalf("runPrepareLoop: %v", err)
+	if err := r.runJobLoop(context.Background(), ctrllog.Log, td, []teardownPhaseStep{step}, time.Now().Add(time.Minute), time.Millisecond); err != nil {
+		t.Fatalf("runJobLoop: %v", err)
 	}
 
 	after := &corev1.ConfigMap{}
@@ -214,8 +214,8 @@ func TestProgressIsNotAReport(t *testing.T) {
 }
 
 func TestPrepareLoopDoesNotWriteStatus(t *testing.T) {
-	td := escalationTestCR()
-	base := newEscalationReconciler(t)
+	td := handoffTestCR()
+	base := newHandoffReconciler(t)
 	calls := []string{}
 	r := &HubTeardownReconciler{
 		Client: &recordingClient{Client: base.Client, calls: &calls},
@@ -224,8 +224,8 @@ func TestPrepareLoopDoesNotWriteStatus(t *testing.T) {
 	}
 
 	step := fixedStep(operatorv1.TeardownPhaseDisableAddons, true, nil)
-	if err := r.runPrepareLoop(context.Background(), ctrllog.Log, td, []teardownPhaseStep{step}, time.Now().Add(time.Minute), time.Millisecond); err != nil {
-		t.Fatalf("runPrepareLoop: %v", err)
+	if err := r.runJobLoop(context.Background(), ctrllog.Log, td, []teardownPhaseStep{step}, time.Now().Add(time.Minute), time.Millisecond); err != nil {
+		t.Fatalf("runJobLoop: %v", err)
 	}
 	for _, call := range calls {
 		if call == "status" {
@@ -235,8 +235,8 @@ func TestPrepareLoopDoesNotWriteStatus(t *testing.T) {
 }
 
 func TestPrepareProgressComplete(t *testing.T) {
-	td := escalationTestCR()
-	r := newEscalationReconciler(t)
+	td := handoffTestCR()
+	r := newHandoffReconciler(t)
 
 	done, _, err := r.prepareProgressComplete(context.Background(), td)
 	if err != nil {
@@ -246,11 +246,11 @@ func TestPrepareProgressComplete(t *testing.T) {
 		t.Error("empty progress read as complete")
 	}
 
-	progress := &prepareProgress{}
+	progress := &jobProgress{}
 	for _, step := range r.preparePhasePlan() {
-		recordPreparePhase(progress, step.phase, operatorv1.PhaseStateComplete, "done")
+		recordJobPhase(progress, step.phase, operatorv1.PhaseStateComplete, "done")
 	}
-	if err := r.savePrepareProgress(context.Background(), td, progress); err != nil {
+	if err := r.saveJobProgress(context.Background(), td, progress); err != nil {
 		t.Fatalf("save progress: %v", err)
 	}
 	done, _, err = r.prepareProgressComplete(context.Background(), td)
@@ -279,10 +279,10 @@ func TestPrepareProgressComplete(t *testing.T) {
 }
 
 func TestMirrorPrepareProgress(t *testing.T) {
-	td := escalationTestCR()
-	r := newEscalationReconciler(t)
-	progress := &prepareProgress{}
-	recordPreparePhase(progress, operatorv1.TeardownPhaseDisableAddons, operatorv1.PhaseStateComplete, "done")
+	td := handoffTestCR()
+	r := newHandoffReconciler(t)
+	progress := &jobProgress{}
+	recordJobPhase(progress, operatorv1.TeardownPhaseDisableAddons, operatorv1.PhaseStateComplete, "done")
 
 	r.mirrorPrepareProgress(td, progress)
 
@@ -295,8 +295,8 @@ func TestMirrorPrepareProgress(t *testing.T) {
 }
 
 func TestRunPrepareJob_MissingCR(t *testing.T) {
-	td := escalationTestCR()
-	r := newEscalationReconciler(t)
+	td := handoffTestCR()
+	r := newHandoffReconciler(t)
 
 	if err := RunPrepareJob(context.Background(), r.Client, nil, td.Name, td.Namespace); err != nil {
 		t.Fatalf("missing CR should be a clean exit, got %v", err)
@@ -304,13 +304,13 @@ func TestRunPrepareJob_MissingCR(t *testing.T) {
 }
 
 func TestProgressConfigMapNameIsStable(t *testing.T) {
-	td := escalationTestCR()
+	td := handoffTestCR()
 	first := progressConfigMapName(td)
 	td.Status.LastInspection = &metav1.Time{Time: time.Now()}
 	if second := progressConfigMapName(td); second != first {
 		t.Errorf("progress name depends on status: %s != %s", second, first)
 	}
-	long := escalationTestCR()
+	long := handoffTestCR()
 	long.Name = strings.Repeat("a", 300)
 	if got := progressConfigMapName(long); len(got) > reportMaxNameLength {
 		t.Errorf("progress name too long: %d chars", len(got))

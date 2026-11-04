@@ -369,7 +369,6 @@ spec:
                     - Preparing
                     - HandedOff
                     - Stalled
-                    - Escalating
                     - Verifying
                     - CompleteWithResidue
                     type: string

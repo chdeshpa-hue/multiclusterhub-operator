@@ -152,15 +152,15 @@ func main() {
 	var leaseDuration time.Duration
 	var renewDeadline time.Duration
 	var retryPeriod time.Duration
-	var teardownMode bool
+	var teardownPlan string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8383", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", true,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&teardownMode, "teardown-mode", false,
-		"Run in teardown-only mode. Only the HubTeardown controller is started "+
-			"with no leader election and no webhooks. Used by the resilient teardown Job.")
+	flag.StringVar(&teardownPlan, "teardown-plan", "",
+		"Run one teardown Job plan to completion and exit, with no manager, no webhooks "+
+			"and no leader election. Valid values: prepare, handoff. Used by the HubTeardown Jobs.")
 	flag.DurationVar(&leaseDuration, "leader-election-lease-duration", 137*time.Second, ""+
 		"The duration that non-leader candidates will wait after observing a leadership "+
 		"renewal until attempting to acquire leadership of a led but unrenewed leader "+
@@ -185,8 +185,8 @@ func main() {
 
 	ctrl.Log.WithName("MultiClusterHub Operator version").Info(fmt.Sprintf("%#v", version.Get()))
 
-	if teardownMode {
-		runTeardownMode()
+	if teardownPlan != "" {
+		runTeardownJobMode(teardownPlan)
 		return
 	}
 
@@ -425,10 +425,22 @@ const (
 	LocalRunMode    = "local"
 )
 
-// runTeardownMode starts a minimal manager that only runs the HubTeardown controller.
-// Used by the resilient teardown Job to continue cleanup if the operator pod is removed.
-func runTeardownMode() {
-	setupLog.Info("Starting in teardown-only mode")
+// runTeardownJobMode runs one Job plan and exits. A Job is a one-shot loop, not
+// a controller: it holds no cache, writes no HubTeardown status and can never be
+// a second writer over the CR.
+func runTeardownJobMode(plan string) {
+	setupLog.Info("Starting in teardown Job mode", "plan", plan)
+
+	var run func(context.Context, client.Client, discovery.DiscoveryInterface, string, string) error
+	switch plan {
+	case controllers.TeardownPlanPrepare:
+		run = controllers.RunPrepareJob
+	case controllers.TeardownPlanHandoff:
+		run = controllers.RunHandoffJob
+	default:
+		setupLog.Error(fmt.Errorf("unknown teardown plan %q", plan), "valid values are prepare and handoff")
+		os.Exit(2)
+	}
 
 	tdName := os.Getenv("TEARDOWN_NAME")
 	tdNamespace := os.Getenv("TEARDOWN_NAMESPACE")
@@ -442,22 +454,22 @@ func runTeardownMode() {
 		Scheme: scheme,
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to create uncached client for teardown mode")
+		setupLog.Error(err, "unable to create uncached client for teardown Job mode")
 		os.Exit(1)
 	}
 
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
 	if err != nil {
-		setupLog.Error(err, "unable to create discovery client for teardown mode")
+		setupLog.Error(err, "unable to create discovery client for teardown Job mode")
 		os.Exit(1)
 	}
 
-	setupLog.Info("Running prepare phases", "teardownName", tdName, "teardownNamespace", tdNamespace)
-	if err := controllers.RunPrepareJob(ctrl.SetupSignalHandler(), uncachedClient, discoveryClient, tdName, tdNamespace); err != nil {
-		setupLog.Error(err, "prepare Job failed")
+	setupLog.Info("Running teardown plan", "plan", plan, "teardownName", tdName, "teardownNamespace", tdNamespace)
+	if err := run(ctrl.SetupSignalHandler(), uncachedClient, discoveryClient, tdName, tdNamespace); err != nil {
+		setupLog.Error(err, "teardown Job failed", "plan", plan)
 		os.Exit(1)
 	}
-	setupLog.Info("Prepare phases complete")
+	setupLog.Info("Teardown plan complete", "plan", plan)
 }
 
 func addMultiClusterEngineWatch(ctx context.Context, mgr ctrl.Manager, uncachedClient client.Client) {

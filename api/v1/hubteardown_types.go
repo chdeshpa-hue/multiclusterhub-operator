@@ -13,7 +13,7 @@ import (
 // cutover is pending. Removing the legacy values is part of that cutover, not
 // of the additive API change.
 //
-// +kubebuilder:validation:Enum=DryRun;RemoveBlockingCRs;DisableAddons;DeleteInfrastructureCRs;DetachManagedClusters;DeleteMCH;MonitorMCEChain;DeleteACMCRDs;Complete;Failed;NotStarted;Inspecting;ReportReady;ConsentRequired;Preparing;HandedOff;Stalled;Escalating;Verifying;CompleteWithResidue
+// +kubebuilder:validation:Enum=DryRun;RemoveBlockingCRs;DisableAddons;DeleteInfrastructureCRs;DetachManagedClusters;DeleteMCH;MonitorMCEChain;DeleteACMCRDs;Complete;Failed;NotStarted;Inspecting;ReportReady;ConsentRequired;Preparing;HandedOff;Stalled;Verifying;CompleteWithResidue
 type TeardownPhase string
 
 const (
@@ -32,6 +32,13 @@ const (
 // Prototype phase model (RFE-9332 §2.1). These values are additive: the
 // legacy phase constants above stay until the controller cutover, because
 // they carry 60+ references across six controller files.
+//
+// NotStarted, ConsentRequired, Preparing, HandedOff and Stalled have no
+// producer yet. The same information is carried by conditions
+// (WaitingForApproval, HandoffReady) and by status.phases, so they are kept as
+// reserved values rather than deleted: a future producer must not have to churn
+// the CRD enum. Inspecting, ReportReady, Verifying and CompleteWithResidue are
+// produced today.
 const (
 	TeardownPhaseNotStarted          TeardownPhase = "NotStarted"
 	TeardownPhaseInspecting          TeardownPhase = "Inspecting"
@@ -40,7 +47,6 @@ const (
 	TeardownPhasePreparing           TeardownPhase = "Preparing"
 	TeardownPhaseHandedOff           TeardownPhase = "HandedOff"
 	TeardownPhaseStalled             TeardownPhase = "Stalled"
-	TeardownPhaseEscalating          TeardownPhase = "Escalating"
 	TeardownPhaseVerifying           TeardownPhase = "Verifying"
 	TeardownPhaseCompleteWithResidue TeardownPhase = "CompleteWithResidue"
 )

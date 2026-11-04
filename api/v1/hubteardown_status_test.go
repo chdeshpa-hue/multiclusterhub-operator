@@ -56,7 +56,6 @@ var _ = Describe("HubTeardown status schema", func() {
 		for _, phase := range []TeardownPhase{
 			TeardownPhaseVerifying,
 			TeardownPhaseCompleteWithResidue,
-			TeardownPhaseEscalating,
 		} {
 			ht.Status.Phase = phase
 			Expect(k8sClient.Status().Update(ctx, ht)).To(Succeed(), "phase %q should be accepted", phase)
