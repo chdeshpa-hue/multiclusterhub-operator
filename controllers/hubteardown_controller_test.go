@@ -5,6 +5,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"time"
@@ -235,6 +236,35 @@ var _ = Describe("HubTeardown controller", func() {
 		}
 
 		Expect(k8sClient.Create(ctxTD, td)).Should(Succeed())
+
+		// Consent is bound to the inspection report (increment 16). Even a CR
+		// created directly in active mode gets a report written on its first
+		// reconcile; the operator then holds at ConsentLapsed until the
+		// acknowledged digest matches that report.
+		Eventually(func() string {
+			fetched := &operatorv1.HubTeardown{}
+			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, fetched); err != nil {
+				return ""
+			}
+			for _, c := range fetched.Status.Conditions {
+				if c.Type == conditionTypeTeardownProgressing && c.Reason == "ConsentLapsed" {
+					return fetched.Status.ReportDigest
+				}
+			}
+			return ""
+		}, tdTimeout, tdInterval).ShouldNot(BeEmpty(), "the operator must write a report and hold for consent")
+
+		Eventually(func() error {
+			fetched := &operatorv1.HubTeardown{}
+			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, fetched); err != nil {
+				return err
+			}
+			if fetched.Status.ReportDigest == "" {
+				return errors.New("no inspection report digest yet")
+			}
+			fetched.Spec.AcknowledgedReportDigest = fetched.Status.ReportDigest
+			return k8sClient.Update(ctxTD, fetched)
+		}, tdTimeout, tdInterval).Should(Succeed(), "the administrator acknowledges the report digest")
 
 		Eventually(func() string {
 			job := &batchv1.Job{}

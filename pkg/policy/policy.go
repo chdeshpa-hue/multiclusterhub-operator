@@ -52,7 +52,7 @@ func Evaluate(b Blocker, consent ConsentState) Decision {
 		}
 	}
 
-	if b.CloudRisk != nil && b.CloudRisk.MayOrphan && !consent.Valid() {
+	if b.CloudRisk != nil && b.CloudRisk.MayOrphan && !consent.CloudRiskValid() {
 		return Decision{
 			Action:          ActionResolveFinalizerWithConsent,
 			RequiresConsent: true,

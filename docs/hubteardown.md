@@ -133,6 +133,23 @@ oc patch hubteardown teardown -n open-cluster-management \
   --type=merge -p '{"spec":{"acknowledgeCloudResourceRisk":true}}'
 ```
 
+**Consent is bound to the report.** Approval flags alone do not start
+destructive work: the controller also requires `spec.acknowledgedReportDigest`
+to equal `status.reportDigest`, the digest of the report it wrote and you read.
+When the report changes the digest changes and consent lapses; the condition
+reports `ConsentLapsed` until the new digest is acknowledged.
+
+```bash
+oc get hubteardown teardown -n open-cluster-management \
+  -o jsonpath='{.status.reportDigest}{"\n"}'
+oc patch hubteardown teardown -n open-cluster-management --type=merge \
+  -p '{"spec":{"acknowledgedReportDigest":"<digest from status>"}}'
+```
+
+A CR created directly with `dryRun: false` gets its report written on the first
+reconcile; acknowledge that digest to proceed. An empty `status.reportDigest`
+means there is nothing to consent to yet.
+
 If teardown exceeds `maxDuration` (default 2 hours), a `Stalled` condition is set with guidance on what is blocking and which approval flags to consider.
 
 ### Step 6: Pause at any time
@@ -170,6 +187,7 @@ Verify cloud resources in the relevant provider console (AWS, Azure, GCP) using 
 | `dryRun` | `bool` | `true` | When true, the controller scans and reports without mutating any resources. Set to false to begin teardown. Can be toggled back to true at any time to pause. |
 | `approvedDestructiveActions` | `bool` | `false` | Enables Tier 2 (non-cloud) finalizer patching for stuck resources. Only evaluated when `dryRun` is false. |
 | `acknowledgeCloudResourceRisk` | `bool` | `false` | Enables Tier 1 (cloud-protecting) finalizer patching. Setting this means you accept that cloud infrastructure (VMs, LBs, storage, DNS) may be orphaned and require manual cleanup. |
+| `acknowledgedReportDigest` | `string` | `""` | Digest of the inspection report the administrator read. Must equal `status.reportDigest` before any destructive phase runs; when the report changes the digest changes and consent lapses. |
 | `forceFinalizerTimeout` | `duration` | `5m` | How long to wait for a controller to process its own finalizer before the teardown controller intervenes. |
 | `maxDuration` | `duration` | `2h` | Maximum wall-clock time for the entire teardown. If exceeded, a `Stalled` condition is set with guidance on what is blocking. |
 

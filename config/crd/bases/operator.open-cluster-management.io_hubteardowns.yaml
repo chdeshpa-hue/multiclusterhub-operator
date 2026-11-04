@@ -71,6 +71,14 @@ spec:
                   infrastructure (VMs, LBs, storage, DNS) may be orphaned and will
                   require manual cleanup in the cloud provider console.
                 type: boolean
+              acknowledgedReportDigest:
+                description: |-
+                  AcknowledgedReportDigest is the digest of the inspection report the
+                  administrator read before approving destructive work. Consent is bound to
+                  this digest: when the report changes, the digest changes and consent
+                  lapses. Required in practice for any destructive phase; an empty value
+                  keeps the teardown parked at ConsentRequired.
+                type: string
               approvedDestructiveActions:
                 description: |-
                   ApprovedDestructiveActions enables Tier 2 (non-cloud) finalizer
@@ -618,6 +626,12 @@ spec:
                   - state
                   type: object
                 type: array
+              reportDigest:
+                description: |-
+                  ReportDigest is the digest of the report named by ReportRef, as recorded
+                  in the report's meta.json. It is what spec.acknowledgedReportDigest is
+                  compared against, so consent never depends on a name that could be reused.
+                type: string
               reportRef:
                 description: |-
                   ReportRef names the ConfigMap holding the complete inspection report.

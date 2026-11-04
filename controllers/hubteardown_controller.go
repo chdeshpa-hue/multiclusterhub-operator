@@ -228,15 +228,17 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 	}
 
 	// Track when active teardown started for overall stall detection.
-	// On the first active reconcile, re-scan the cluster to detect
-	// changes since the dry-run report was generated.
+	// On the first active reconcile, always establish the inspection report:
+	// consent is bound to its digest, so a CR created directly in active mode
+	// has nothing to consent to until the scan has run. When a dry-run report
+	// already exists, the re-scan also records whether the cluster drifted.
 	if td.Status.ActiveSince == nil {
-		if td.Status.DryRunReport != nil {
-			graph, err := r.buildDependencyGraph(ctx, log)
-			if err != nil {
-				log.Error(err, "Failed to re-scan on activation, proceeding with stale report")
-			} else {
-				freshReport := r.buildDryRunReport(graph)
+		graph, err := r.buildDependencyGraph(ctx, log)
+		if err != nil {
+			log.Error(err, "Failed to scan on activation; proceeding without a fresh report")
+		} else {
+			freshReport := r.buildDryRunReport(graph)
+			if td.Status.DryRunReport != nil {
 				oldBlocking := td.Status.DryRunReport.TotalBlockingResources
 				oldCloudRisk := td.Status.DryRunReport.TotalCloudRiskResources
 				if freshReport.TotalBlockingResources != oldBlocking || freshReport.TotalCloudRiskResources != oldCloudRisk {
@@ -250,13 +252,13 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 					r.setCondition(td, conditionTypeDryRunReportStale, metav1.ConditionFalse, "ReportCurrent",
 						"Cluster state matches dry-run report.")
 				}
-				td.Status.DryRunReport = freshReport
-				td.Status.CloudResourceWarnings = r.buildCloudWarnings(ctx, log, graph)
-				if inspectErr := r.applyInspection(ctx, log, td, graph); inspectErr != nil {
-					// The report is the consent anchor, but it must not block an
-					// active teardown whose previous report already exists.
-					log.Error(inspectErr, "Failed to refresh inspection report on activation")
-				}
+			}
+			td.Status.DryRunReport = freshReport
+			td.Status.CloudResourceWarnings = r.buildCloudWarnings(ctx, log, graph)
+			if inspectErr := r.applyInspection(ctx, log, td, graph); inspectErr != nil {
+				// The report is the consent anchor. Record the failure, but do
+				// not stop the clock: the next reconcile retries the scan.
+				log.Error(inspectErr, "Failed to write inspection report on activation")
 			}
 		}
 
@@ -324,8 +326,28 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 	// rather than duplicating them, and holds there entirely until the admin has
 	// authorised destructive work.
 	if !teardownConsentGiven(td) {
-		r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionTrue, "WaitingForApproval",
-			"Destructive prepare phases require spec.approvedDestructiveActions or spec.acknowledgeCloudResourceRisk.")
+		reason := "WaitingForApproval"
+		message := "Destructive prepare phases require spec.approvedDestructiveActions or spec.acknowledgeCloudResourceRisk."
+		if teardownApprovalFlagsSet(td) {
+			// Approval flags without a matching digest is a lapsed consent:
+			// the report changed, or no report was ever written. The empty
+			// case gets its own message because there is nothing to read yet.
+			reason = "ConsentLapsed"
+			if td.Status.ReportDigest == "" {
+				message = "Approval flags are set but no inspection report exists yet " +
+					"(status.reportDigest is empty), so there is nothing to consent to. The operator " +
+					"writes the report when the cluster scan succeeds; then set " +
+					"spec.acknowledgedReportDigest to status.reportDigest."
+			} else {
+				message = fmt.Sprintf("Approval flags are set but consent is bound to the inspection report: "+
+					"spec.acknowledgedReportDigest=%q, status.reportDigest=%q. Read the current report and set "+
+					"the matching digest to continue.", td.Spec.AcknowledgedReportDigest, td.Status.ReportDigest)
+			}
+			if prev := meta.FindStatusCondition(td.Status.Conditions, conditionTypeTeardownProgressing); prev == nil || prev.Reason != reason {
+				r.Recorder.Event(td, corev1.EventTypeWarning, "ConsentLapsed", message)
+			}
+		}
+		r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionTrue, reason, message)
 		if err := r.Client.Status().Update(ctx, td); err != nil {
 			log.Error(err, "Failed to persist approval wait")
 		}

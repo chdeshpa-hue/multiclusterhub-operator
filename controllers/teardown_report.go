@@ -347,6 +347,9 @@ func (r *HubTeardownReconciler) applyInspection(ctx context.Context, log logr.Lo
 	td.Status.Blockers = capped
 	td.Status.BlockersTruncated = truncated
 	td.Status.ReportRef = ref
+	// Consent is compared against this digest, never against the report name:
+	// a name can be reused after retention, a digest cannot.
+	td.Status.ReportDigest = meta.Digest
 	inspected := now
 	td.Status.LastInspection = &inspected
 

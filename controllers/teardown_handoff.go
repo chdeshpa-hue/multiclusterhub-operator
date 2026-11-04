@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-logr/logr"
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
+	"github.com/stolostron/multiclusterhub-operator/pkg/policy"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -29,14 +30,26 @@ const (
 	conditionTypeHandoffReady = "HandoffReady"
 )
 
+// teardownApprovalFlagsSet reports whether either approval flag is on. It says
+// what kind of work is authorised, not which report it was authorised against.
+func teardownApprovalFlagsSet(td *operatorv1.HubTeardown) bool {
+	return td.Spec.ApprovedDestructiveActions || td.Spec.AcknowledgeCloudResourceRisk
+}
+
 // teardownConsentGiven reports whether the admin has authorised destructive
-// work. dryRun=false alone starts the pipeline, but nothing with cluster-wide
-// blast radius is created until one of the approval flags is set.
+// work against the report that currently exists. dryRun=false alone starts the
+// pipeline, but nothing with cluster-wide blast radius is created until an
+// approval flag is set AND the acknowledged digest matches the report digest.
 func teardownConsentGiven(td *operatorv1.HubTeardown) bool {
 	if td.Spec.DryRun {
 		return false
 	}
-	return td.Spec.ApprovedDestructiveActions || td.Spec.AcknowledgeCloudResourceRisk
+	return policy.ConsentState{
+		ApprovedDestructiveActions: td.Spec.ApprovedDestructiveActions,
+		CloudRiskAcknowledged:      td.Spec.AcknowledgeCloudResourceRisk,
+		AcknowledgedDigest:         td.Spec.AcknowledgedReportDigest,
+		ReportDigest:               td.Status.ReportDigest,
+	}.Valid()
 }
 
 func handoffLabels() map[string]string {

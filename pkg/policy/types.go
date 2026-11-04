@@ -46,16 +46,41 @@ type CloudRisk = operatorv1.CloudRisk
 type Blocker = operatorv1.Blocker
 
 // ConsentState is the administrator's approval, bound to the report they read.
+//
+// The two flags say *what* the approval covers; the digest says *which report*
+// it was given for. A digest is used instead of the report name because names
+// are reused after retention and because two reports with the same digest are
+// the same content - consenting to one is consenting to the other.
 type ConsentState struct {
+	// ApprovedDestructiveActions authorises Tier 2 (non-cloud) finalizer work.
+	ApprovedDestructiveActions bool
+
+	// CloudRiskAcknowledged authorises Tier 1 (cloud-protecting) finalizer work.
 	CloudRiskAcknowledged bool
-	AcknowledgedReport    string
-	ReportName            string
+
+	// AcknowledgedDigest is the digest of the report the administrator read.
+	AcknowledgedDigest string
+
+	// ReportDigest is the digest of the report that exists now.
+	ReportDigest string
 }
 
-// Valid reports whether consent covers the current report. If the inspection
-// regenerates the report, the name changes and consent lapses automatically.
+// Valid reports whether the administrator approved work against the report that
+// currently exists. An empty or stale digest means no consent, never implicit
+// consent: that is the G2 defect, where two booleans authorised any report.
 func (c ConsentState) Valid() bool {
-	return c.CloudRiskAcknowledged && c.AcknowledgedReport != "" && c.AcknowledgedReport == c.ReportName
+	return (c.ApprovedDestructiveActions || c.CloudRiskAcknowledged) && c.coversReport()
+}
+
+// CloudRiskValid is the narrower rule for acting on a cloud-protecting
+// finalizer: the risk has to be acknowledged specifically, not merely some
+// destructive work approved.
+func (c ConsentState) CloudRiskValid() bool {
+	return c.CloudRiskAcknowledged && c.coversReport()
+}
+
+func (c ConsentState) coversReport() bool {
+	return c.AcknowledgedDigest != "" && c.AcknowledgedDigest == c.ReportDigest
 }
 
 // Decision is the policy outcome for one Blocker.

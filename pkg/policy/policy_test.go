@@ -26,8 +26,8 @@ func definitiveBlocker() Blocker {
 }
 
 func TestEvaluate(t *testing.T) {
-	validConsent := ConsentState{CloudRiskAcknowledged: true, AcknowledgedReport: "report-1", ReportName: "report-1"}
-	staleConsent := ConsentState{CloudRiskAcknowledged: true, AcknowledgedReport: "report-1", ReportName: "report-2"}
+	validConsent := ConsentState{CloudRiskAcknowledged: true, AcknowledgedDigest: "digest-1", ReportDigest: "digest-1"}
+	staleConsent := ConsentState{CloudRiskAcknowledged: true, AcknowledgedDigest: "digest-1", ReportDigest: "digest-2"}
 
 	tests := []struct {
 		name            string
@@ -145,15 +145,36 @@ func TestConsentValid(t *testing.T) {
 		consent ConsentState
 		want    bool
 	}{
-		{name: "matching report", consent: ConsentState{CloudRiskAcknowledged: true, AcknowledgedReport: "r1", ReportName: "r1"}, want: true},
-		{name: "not acknowledged", consent: ConsentState{AcknowledgedReport: "r1", ReportName: "r1"}, want: false},
-		{name: "report changed", consent: ConsentState{CloudRiskAcknowledged: true, AcknowledgedReport: "r1", ReportName: "r2"}, want: false},
-		{name: "empty acknowledgement", consent: ConsentState{CloudRiskAcknowledged: true, ReportName: "r1"}, want: false},
+		{name: "matching digest", consent: ConsentState{CloudRiskAcknowledged: true, AcknowledgedDigest: "d1", ReportDigest: "d1"}, want: true},
+		{name: "destructive approval with matching digest", consent: ConsentState{ApprovedDestructiveActions: true, AcknowledgedDigest: "d1", ReportDigest: "d1"}, want: true},
+		{name: "not acknowledged", consent: ConsentState{AcknowledgedDigest: "d1", ReportDigest: "d1"}, want: false},
+		{name: "report changed", consent: ConsentState{CloudRiskAcknowledged: true, AcknowledgedDigest: "d1", ReportDigest: "d2"}, want: false},
+		{name: "empty acknowledgement", consent: ConsentState{CloudRiskAcknowledged: true, ReportDigest: "d1"}, want: false},
+		{name: "no report yet", consent: ConsentState{CloudRiskAcknowledged: true, AcknowledgedDigest: "d1"}, want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := tt.consent.Valid(); got != tt.want {
 				t.Fatalf("valid = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConsentCloudRiskValid(t *testing.T) {
+	tests := []struct {
+		name    string
+		consent ConsentState
+		want    bool
+	}{
+		{name: "cloud risk acknowledged", consent: ConsentState{CloudRiskAcknowledged: true, AcknowledgedDigest: "d1", ReportDigest: "d1"}, want: true},
+		{name: "only destructive actions approved", consent: ConsentState{ApprovedDestructiveActions: true, AcknowledgedDigest: "d1", ReportDigest: "d1"}, want: false},
+		{name: "stale digest", consent: ConsentState{CloudRiskAcknowledged: true, AcknowledgedDigest: "d1", ReportDigest: "d2"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.consent.CloudRiskValid(); got != tt.want {
+				t.Fatalf("cloudRiskValid = %v, want %v", got, tt.want)
 			}
 		})
 	}

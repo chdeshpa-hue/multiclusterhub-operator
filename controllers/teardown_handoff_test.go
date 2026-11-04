@@ -42,6 +42,10 @@ func handoffTestCR() *operatorv1.HubTeardown {
 		Spec: operatorv1.HubTeardownSpec{
 			DryRun:                     false,
 			ApprovedDestructiveActions: true,
+			AcknowledgedReportDigest:   "test-digest",
+		},
+		Status: operatorv1.HubTeardownStatus{
+			ReportDigest: "test-digest",
 		},
 	}
 }
@@ -64,19 +68,25 @@ func exists(t *testing.T, c client.Client, key types.NamespacedName, obj client.
 }
 
 func TestTeardownConsentGiven(t *testing.T) {
+	const digest = "sha256:abc"
 	cases := []struct {
 		name string
 		spec operatorv1.HubTeardownSpec
+		rd   string
 		want bool
 	}{
-		{"dry-run with approvals", operatorv1.HubTeardownSpec{DryRun: true, ApprovedDestructiveActions: true}, false},
-		{"active without approvals", operatorv1.HubTeardownSpec{DryRun: false}, false},
-		{"active with destructive approval", operatorv1.HubTeardownSpec{DryRun: false, ApprovedDestructiveActions: true}, true},
-		{"active with cloud acknowledgement", operatorv1.HubTeardownSpec{DryRun: false, AcknowledgeCloudResourceRisk: true}, true},
+		{"dry-run with approvals", operatorv1.HubTeardownSpec{DryRun: true, ApprovedDestructiveActions: true, AcknowledgedReportDigest: digest}, digest, false},
+		{"active without approvals", operatorv1.HubTeardownSpec{DryRun: false, AcknowledgedReportDigest: digest}, digest, false},
+		{"active with destructive approval and matching digest", operatorv1.HubTeardownSpec{DryRun: false, ApprovedDestructiveActions: true, AcknowledgedReportDigest: digest}, digest, true},
+		{"active with cloud acknowledgement and matching digest", operatorv1.HubTeardownSpec{DryRun: false, AcknowledgeCloudResourceRisk: true, AcknowledgedReportDigest: digest}, digest, true},
+		{"approval without a digest", operatorv1.HubTeardownSpec{DryRun: false, ApprovedDestructiveActions: true}, digest, false},
+		{"stale digest", operatorv1.HubTeardownSpec{DryRun: false, ApprovedDestructiveActions: true, AcknowledgedReportDigest: "sha256:old"}, digest, false},
+		{"digest without approval", operatorv1.HubTeardownSpec{DryRun: false, AcknowledgedReportDigest: digest}, digest, false},
+		{"no report yet", operatorv1.HubTeardownSpec{DryRun: false, ApprovedDestructiveActions: true, AcknowledgedReportDigest: digest}, "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			td := &operatorv1.HubTeardown{Spec: tc.spec}
+			td := &operatorv1.HubTeardown{Spec: tc.spec, Status: operatorv1.HubTeardownStatus{ReportDigest: tc.rd}}
 			if got := teardownConsentGiven(td); got != tc.want {
 				t.Errorf("teardownConsentGiven = %v, want %v", got, tc.want)
 			}

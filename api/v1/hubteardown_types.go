@@ -80,6 +80,14 @@ type HubTeardownSpec struct {
 	// require manual cleanup in the cloud provider console.
 	AcknowledgeCloudResourceRisk bool `json:"acknowledgeCloudResourceRisk,omitempty"`
 
+	// AcknowledgedReportDigest is the digest of the inspection report the
+	// administrator read before approving destructive work. Consent is bound to
+	// this digest: when the report changes, the digest changes and consent
+	// lapses. Required in practice for any destructive phase; an empty value
+	// keeps the teardown parked at ConsentRequired.
+	// +optional
+	AcknowledgedReportDigest string `json:"acknowledgedReportDigest,omitempty"`
+
 	// ForceFinalizerTimeout is the duration to wait for a controller to
 	// process its own finalizer before the teardown controller intervenes.
 	// Defaults to 5m.
@@ -135,6 +143,12 @@ type HubTeardownStatus struct {
 	// read as an observation rather than as a missing scan.
 	// +optional
 	LastInspection *metav1.Time `json:"lastInspection,omitempty"`
+
+	// ReportDigest is the digest of the report named by ReportRef, as recorded
+	// in the report's meta.json. It is what spec.acknowledgedReportDigest is
+	// compared against, so consent never depends on a name that could be reused.
+	// +optional
+	ReportDigest string `json:"reportDigest,omitempty"`
 
 	// ReportRef names the ConfigMap holding the complete inspection report.
 	// The report carries no ownerReferences, so it outlives the HubTeardown CR
