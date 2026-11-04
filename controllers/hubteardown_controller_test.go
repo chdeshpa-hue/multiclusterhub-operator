@@ -136,7 +136,7 @@ var _ = Describe("HubTeardown controller", func() {
 
 		fetched := &operatorv1.HubTeardown{}
 		Expect(k8sClient.Get(ctxTD, types.NamespacedName{Name: tdName, Namespace: tdNs}, fetched)).Should(Succeed())
-		Expect(fetched.Status.Phase).To(Equal(operatorv1.TeardownPhaseDryRun))
+		Expect(fetched.Status.Phase).To(Equal(operatorv1.TeardownPhaseReportReady))
 		Expect(fetched.Status.DryRunReport).NotTo(BeNil())
 	})
 
@@ -224,7 +224,7 @@ var _ = Describe("HubTeardown controller", func() {
 			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, fetched); err != nil {
 				return false
 			}
-			return fetched.Status.Phase == operatorv1.TeardownPhaseDryRun
+			return fetched.Status.Phase == operatorv1.TeardownPhaseReportReady
 		}, tdTimeout, tdInterval).Should(BeTrue())
 
 		// Switch to active
@@ -246,6 +246,6 @@ var _ = Describe("HubTeardown controller", func() {
 				return ""
 			}
 			return latest.Status.Phase
-		}, tdTimeout, tdInterval).Should(Equal(operatorv1.TeardownPhaseDryRun))
+		}, tdTimeout, tdInterval).Should(Equal(operatorv1.TeardownPhaseReportReady))
 	})
 })

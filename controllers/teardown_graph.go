@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // acmAPIGroupSuffixes are the API group suffixes that belong to the ACM/MCE ecosystem.
@@ -50,16 +51,30 @@ type DependencyGraph struct {
 
 	// MCE instance (if found).
 	MCE *DiscoveredResource
+
+	// Incomplete records every resource type whose instances could not be
+	// listed. A non-empty list invalidates absence claims for those types: the
+	// report may say what was seen, never that something does not exist.
+	Incomplete []ScanIncomplete
+}
+
+// ScanIncomplete is one reason the scan did not see everything.
+type ScanIncomplete struct {
+	Group    string `json:"group"`
+	Resource string `json:"resource"`
+	Reason   string `json:"reason"`
 }
 
 // DiscoveredResource represents a single resource instance found during scanning.
 type DiscoveredResource struct {
-	Ref        operatorv1.ResourceRef
-	Version    string
-	Finalizers []string
-	IsDeleting bool
-	Phase      string
-	Platform   string
+	Ref               operatorv1.ResourceRef
+	Version           string
+	UID               types.UID
+	Finalizers        []string
+	DeletionTimestamp *metav1.Time
+	IsDeleting        bool
+	Phase             string
+	Platform          string
 }
 
 // buildDependencyGraph scans the cluster for all ACM/MCE resources and classifies them.
@@ -78,6 +93,11 @@ func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, log lo
 		}
 		if err := r.scanCRDInstances(ctx, log, crd, graph); err != nil {
 			log.Error(err, "Failed to scan CRD instances", "crd", crd.Name)
+			graph.Incomplete = append(graph.Incomplete, ScanIncomplete{
+				Group:    crd.Spec.Group,
+				Resource: crd.Spec.Names.Plural,
+				Reason:   err.Error(),
+			})
 		}
 	}
 
@@ -130,9 +150,11 @@ func (r *HubTeardownReconciler) scanCRDInstances(ctx context.Context, log logr.L
 				Namespace: item.GetNamespace(),
 				Name:      item.GetName(),
 			},
-			Version:    version,
-			Finalizers: finalizers,
-			IsDeleting: item.GetDeletionTimestamp() != nil,
+			Version:           version,
+			UID:               item.GetUID(),
+			Finalizers:        finalizers,
+			DeletionTimestamp: item.GetDeletionTimestamp(),
+			IsDeleting:        item.GetDeletionTimestamp() != nil,
 		}
 
 		// Extract phase/status if available

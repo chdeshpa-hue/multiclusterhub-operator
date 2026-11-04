@@ -3,6 +3,7 @@
 package v1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -125,6 +126,18 @@ type HubTeardownStatus struct {
 	// BlockersTruncated is the number of blockers omitted from Blockers.
 	// +optional
 	BlockersTruncated int32 `json:"blockersTruncated,omitempty"`
+
+	// LastInspection is when the inspector last completed a full scan. It is
+	// set even when the scan found nothing, so an empty blocker list can be
+	// read as an observation rather than as a missing scan.
+	// +optional
+	LastInspection *metav1.Time `json:"lastInspection,omitempty"`
+
+	// ReportRef names the ConfigMap holding the complete inspection report.
+	// The report carries no ownerReferences, so it outlives the HubTeardown CR
+	// and remains available after the teardown finishes.
+	// +optional
+	ReportRef *corev1.LocalObjectReference `json:"reportRef,omitempty"`
 
 	// ActiveSince is the timestamp when the teardown transitioned from
 	// dry-run to active execution. Used to calculate overall stall timeout.

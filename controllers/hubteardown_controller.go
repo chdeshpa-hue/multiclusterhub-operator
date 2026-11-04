@@ -33,6 +33,8 @@ const (
 	conditionTypeTeardownStalled     = "Stalled"
 	conditionTypeDryRunReportStale   = "DryRunReportStale"
 	conditionTypeWaitingForApproval  = "WaitingForApproval"
+	conditionTypeInspectIncomplete   = "InspectIncomplete"
+	conditionTypeReportWriteFailed   = "ReportWriteFailed"
 
 	defaultMaxDuration = 2 * time.Hour
 
@@ -152,11 +154,20 @@ func (r *HubTeardownReconciler) reconcileDryRun(ctx context.Context, log logr.Lo
 		return ctrl.Result{RequeueAfter: teardownResyncDryRun}, nil
 	}
 
+	td.Status.Phase = operatorv1.TeardownPhaseInspecting
 	report := r.buildDryRunReport(graph)
-	td.Status.Phase = operatorv1.TeardownPhaseDryRun
 	td.Status.DryRunReport = report
 	td.Status.BlockingResources = graph.BlockingResources
 	td.Status.CloudResourceWarnings = r.buildCloudWarnings(ctx, log, graph)
+
+	if err := r.applyInspection(ctx, log, td, graph); err != nil {
+		log.Error(err, "Inspection report write failed; refusing to advance to ReportReady")
+		if statusErr := r.Client.Status().Update(ctx, td); statusErr != nil {
+			log.Error(statusErr, "Failed to update status after report write error")
+		}
+		return ctrl.Result{RequeueAfter: teardownResyncDryRun}, nil
+	}
+	td.Status.Phase = operatorv1.TeardownPhaseReportReady
 
 	r.setCondition(td, conditionTypeDryRunComplete, metav1.ConditionTrue, "ScanComplete",
 		fmt.Sprintf("Dry-run analysis complete. Found %d blocking resources, %d cloud-risk resources. Set spec.dryRun=false to begin teardown.",
@@ -216,6 +227,11 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 				}
 				td.Status.DryRunReport = freshReport
 				td.Status.CloudResourceWarnings = r.buildCloudWarnings(ctx, log, graph)
+				if inspectErr := r.applyInspection(ctx, log, td, graph); inspectErr != nil {
+					// The report is the consent anchor, but it must not block an
+					// active teardown whose previous report already exists.
+					log.Error(inspectErr, "Failed to refresh inspection report on activation")
+				}
 			}
 		}
 

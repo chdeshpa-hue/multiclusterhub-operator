@@ -450,6 +450,15 @@ func (in *HubTeardownStatus) DeepCopyInto(out *HubTeardownStatus) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.LastInspection != nil {
+		in, out := &in.LastInspection, &out.LastInspection
+		*out = (*in).DeepCopy()
+	}
+	if in.ReportRef != nil {
+		in, out := &in.ReportRef, &out.ReportRef
+		*out = new(corev1.LocalObjectReference)
+		**out = **in
+	}
 	if in.ActiveSince != nil {
 		in, out := &in.ActiveSince, &out.ActiveSince
 		*out = (*in).DeepCopy()
