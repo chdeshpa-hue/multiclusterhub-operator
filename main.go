@@ -67,6 +67,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/util/workqueue"
@@ -436,20 +437,8 @@ func runTeardownMode() {
 		os.Exit(1)
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme: scheme,
-		Metrics: metricsserver.Options{
-			BindAddress: "0",
-		},
-		HealthProbeBindAddress: "0",
-		LeaderElection:         false,
-	})
-	if err != nil {
-		setupLog.Error(err, "unable to start teardown manager")
-		os.Exit(1)
-	}
-
-	uncachedClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{
+	restConfig := ctrl.GetConfigOrDie()
+	uncachedClient, err := client.New(restConfig, client.Options{
 		Scheme: scheme,
 	})
 	if err != nil {
@@ -457,22 +446,18 @@ func runTeardownMode() {
 		os.Exit(1)
 	}
 
-	teardownReconciler := &controllers.HubTeardownReconciler{
-		Client:         mgr.GetClient(),
-		UncachedClient: uncachedClient,
-		Scheme:         mgr.GetScheme(),
-		Log:            ctrl.Log.WithName("Controller").WithName("HubTeardown"),
-	}
-	if err = teardownReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "HubTeardown")
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "unable to create discovery client for teardown mode")
 		os.Exit(1)
 	}
 
-	setupLog.Info("Starting teardown manager", "teardownName", tdName, "teardownNamespace", tdNamespace)
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running teardown manager")
+	setupLog.Info("Running prepare phases", "teardownName", tdName, "teardownNamespace", tdNamespace)
+	if err := controllers.RunPrepareJob(ctrl.SetupSignalHandler(), uncachedClient, discoveryClient, tdName, tdNamespace); err != nil {
+		setupLog.Error(err, "prepare Job failed")
 		os.Exit(1)
 	}
+	setupLog.Info("Prepare phases complete")
 }
 
 func addMultiClusterEngineWatch(ctx context.Context, mgr ctrl.Manager, uncachedClient client.Client) {

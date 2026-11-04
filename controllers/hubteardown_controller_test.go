@@ -4,6 +4,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"time"
@@ -171,13 +172,13 @@ var _ = Describe("HubTeardown controller", func() {
 		}, tdTimeout, tdInterval).Should(BeTrue(), "teardown finalizer should be added to the CR")
 	})
 
-	It("should progress through phases when dryRun is disabled", func() {
+	It("should hold at the approval boundary when dryRun is disabled without consent", func() {
 		os.Setenv("OPERATOR_IMAGE", "quay.io/test/operator:latest")
 		defer os.Unsetenv("OPERATOR_IMAGE")
 
 		td := &operatorv1.HubTeardown{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      tdName + "-active",
+				Name:      tdName + "-noapproval",
 				Namespace: tdNs,
 			},
 			Spec: operatorv1.HubTeardownSpec{
@@ -187,19 +188,95 @@ var _ = Describe("HubTeardown controller", func() {
 
 		Expect(k8sClient.Create(ctxTD, td)).Should(Succeed())
 
-		// With no blocking resources on a clean cluster, all phases should complete quickly
+		// Destructive phases moved into the Job (increment 8). Without an
+		// approval flag the operator must not start the Job and must not run
+		// the phases itself.
+		Eventually(func() string {
+			fetched := &operatorv1.HubTeardown{}
+			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, fetched); err != nil {
+				return ""
+			}
+			for _, c := range fetched.Status.Conditions {
+				if c.Type == conditionTypeTeardownProgressing && c.Reason == "WaitingForApproval" {
+					return c.Reason
+				}
+			}
+			return ""
+		}, tdTimeout, tdInterval).Should(Equal("WaitingForApproval"))
+
+		Consistently(func() bool {
+			job := &batchv1.Job{}
+			err := k8sClient.Get(ctxTD, types.NamespacedName{Name: teardownJobName, Namespace: tdNs}, job)
+			return err == nil
+		}, time.Second*2, tdInterval).Should(BeFalse(), "no Job may exist before consent")
+	})
+
+	It("should hand the destructive phases to the Job and finish once it reports progress", func() {
+		os.Setenv("OPERATOR_IMAGE", "quay.io/test/operator:latest")
+		defer os.Unsetenv("OPERATOR_IMAGE")
+
+		// The role ships with the bundle; envtest installs CRDs only.
+		Expect(k8sClient.Create(ctxTD, &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{Name: escalationRoleName},
+		})).Should(Succeed())
+
+		td := &operatorv1.HubTeardown{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      tdName + "-active",
+				Namespace: tdNs,
+			},
+			Spec: operatorv1.HubTeardownSpec{
+				DryRun:                     false,
+				ApprovedDestructiveActions: true,
+			},
+		}
+
+		Expect(k8sClient.Create(ctxTD, td)).Should(Succeed())
+
+		Eventually(func() string {
+			job := &batchv1.Job{}
+			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: teardownJobName, Namespace: tdNs}, job); err != nil {
+				return ""
+			}
+			return job.Spec.Template.Spec.ServiceAccountName
+		}, tdTimeout, tdInterval).Should(Equal(escalationSAName), "Job must run as the escalation identity")
+
+		Eventually(func() string {
+			fetched := &operatorv1.HubTeardown{}
+			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, fetched); err != nil {
+				return ""
+			}
+			for _, c := range fetched.Status.Conditions {
+				if c.Type == conditionTypeTeardownProgressing {
+					return c.Reason
+				}
+			}
+			return ""
+		}, tdTimeout, tdInterval).Should(Equal("PrepareJobRunning"))
+
+		// The Job pod cannot run in envtest, so record its progress the way the
+		// Job does. The operator must then continue with its own plan.
+		progress := &prepareProgress{}
+		for _, step := range (&HubTeardownReconciler{}).preparePhasePlan() {
+			recordPreparePhase(progress, step.phase, operatorv1.PhaseStateComplete, "seeded by envtest")
+		}
+		body, err := json.Marshal(progress)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Create(ctxTD, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: progressConfigMapName(td), Namespace: tdNs},
+			Data:       map[string]string{progressKeyPhases: string(body)},
+		})).Should(Succeed())
+
 		Eventually(func() operatorv1.TeardownPhase {
 			fetched := &operatorv1.HubTeardown{}
 			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, fetched); err != nil {
 				return ""
 			}
 			return fetched.Status.Phase
-		}, tdTimeout, tdInterval).Should(Equal(operatorv1.TeardownPhaseComplete), "teardown should reach Complete phase")
+		}, tdTimeout, tdInterval).Should(Equal(operatorv1.TeardownPhaseComplete), "teardown should reach Complete after the Job reports progress")
 
 		fetched := &operatorv1.HubTeardown{}
 		Expect(k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, fetched)).Should(Succeed())
-
-		// Verify the Complete condition is set
 		foundComplete := false
 		for _, c := range fetched.Status.Conditions {
 			if c.Type == conditionTypeTeardownComplete && c.Status == metav1.ConditionTrue {

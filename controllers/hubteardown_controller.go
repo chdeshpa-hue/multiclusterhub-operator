@@ -311,6 +311,32 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 			fmt.Sprintf("Escalation Job runs as ServiceAccount %s bound to ClusterRole %s.", escalationSAName, escalationRoleName))
 	}
 
+	// The destructive phases run in the Job. The operator holds at the boundary
+	// rather than duplicating them, and holds there entirely until the admin has
+	// authorised destructive work.
+	if !teardownConsentGiven(td) {
+		r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionTrue, "WaitingForApproval",
+			"Destructive prepare phases require spec.approvedDestructiveActions or spec.acknowledgeCloudResourceRisk.")
+		if err := r.Client.Status().Update(ctx, td); err != nil {
+			log.Error(err, "Failed to persist approval wait")
+		}
+		return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
+	}
+
+	prepareDone, progress, err := r.prepareProgressComplete(ctx, td)
+	if err != nil {
+		log.Error(err, "Failed to read prepare progress")
+	}
+	if !prepareDone {
+		r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionTrue, "PrepareJobRunning",
+			"The prepare Job is executing the destructive phases; the operator does not duplicate them.")
+		if statusErr := r.Client.Status().Update(ctx, td); statusErr != nil {
+			log.Error(statusErr, "Failed to persist prepare wait")
+		}
+		return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
+	}
+	r.mirrorPrepareProgress(td, progress)
+
 	// Clear WaitingForApproval if the user has now granted the required approvals.
 	if td.Spec.ApprovedDestructiveActions || td.Spec.AcknowledgeCloudResourceRisk {
 		r.clearWaitingForApproval(td)
@@ -351,10 +377,6 @@ type teardownPhaseStep struct {
 // Verify owns the terminal write.
 func (r *HubTeardownReconciler) teardownPhasePlan() []teardownPhaseStep {
 	return []teardownPhaseStep{
-		{operatorv1.TeardownPhaseRemoveBlockingCRs, r.phaseRemoveBlockingCRs},
-		{operatorv1.TeardownPhaseDisableAddons, r.phaseDisableAddons},
-		{operatorv1.TeardownPhaseDeleteInfrastructureCRs, r.phaseDeleteInfrastructureCRs},
-		{operatorv1.TeardownPhaseDetachManagedClusters, r.phaseDetachManagedClusters},
 		{operatorv1.TeardownPhaseDeleteMCH, r.phaseDeleteMCH},
 		{operatorv1.TeardownPhaseMonitorMCEChain, r.phaseMonitorMCEChain},
 		{operatorv1.TeardownPhaseDeleteACMCRDs, r.phaseDeleteACMCRDs},
