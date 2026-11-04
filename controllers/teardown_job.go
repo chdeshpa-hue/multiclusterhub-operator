@@ -26,6 +26,30 @@ const (
 	envPodNamespace      = "POD_NAMESPACE"
 )
 
+// teardownNamespace is the namespace every escalation object lives in. The CR
+// namespace wins; POD_NAMESPACE covers the case where the controller is asked
+// to act on a CR read from the cache before the namespace default is applied.
+func teardownNamespace(td *operatorv1.HubTeardown) string {
+	if td.Namespace != "" {
+		return td.Namespace
+	}
+	return os.Getenv(envPodNamespace)
+}
+
+// teardownJobDeadline bounds the Job by the same wall clock the controller
+// uses for stall detection, so a hung Job cannot outlive spec.maxDuration.
+func teardownJobDeadline(td *operatorv1.HubTeardown) *int64 {
+	maxDur := defaultMaxDuration
+	if td.Spec.MaxDuration != nil {
+		maxDur = td.Spec.MaxDuration.Duration
+	}
+	seconds := int64(maxDur.Seconds())
+	if seconds < 60 {
+		seconds = 60
+	}
+	return &seconds
+}
+
 // ensureTeardownJob creates or verifies the resilient cleanup Job that survives
 // operator pod deletion. The Job runs the same operator binary with a special
 // entrypoint flag to continue teardown independently.
@@ -54,12 +78,9 @@ func (r *HubTeardownReconciler) ensureTeardownJob(ctx context.Context, log logr.
 		return nil
 	}
 
-	ns := td.Namespace
-	if ns == "" {
-		ns = os.Getenv(envPodNamespace)
-	}
+	ns := teardownNamespace(td)
 
-	backoffLimit := int32(6)
+	backoffLimit := int32(2)
 	ttlSeconds := int32(3600)
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -72,6 +93,7 @@ func (r *HubTeardownReconciler) ensureTeardownJob(ctx context.Context, log logr.
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            &backoffLimit,
+			ActiveDeadlineSeconds:   teardownJobDeadline(td),
 			TTLSecondsAfterFinished: &ttlSeconds,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -81,8 +103,10 @@ func (r *HubTeardownReconciler) ensureTeardownJob(ctx context.Context, log logr.
 					},
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy:      corev1.RestartPolicyOnFailure,
-					ServiceAccountName: "multiclusterhub-operator",
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					// The Job runs as the escalation identity, never as the
+					// always-on operator ServiceAccount.
+					ServiceAccountName: escalationSAName,
 					Containers: []corev1.Container{
 						{
 							Name:    "teardown",
@@ -115,7 +139,7 @@ func (r *HubTeardownReconciler) ensureTeardownJob(ctx context.Context, log logr.
 func (r *HubTeardownReconciler) cleanupTeardownJob(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) error {
 	jobKey := types.NamespacedName{
 		Name:      teardownJobName,
-		Namespace: td.Namespace,
+		Namespace: teardownNamespace(td),
 	}
 
 	existing := &batchv1.Job{}
@@ -141,7 +165,7 @@ func (r *HubTeardownReconciler) cleanupTeardownJob(ctx context.Context, log logr
 func (r *HubTeardownReconciler) getTeardownJobStatus(ctx context.Context, td *operatorv1.HubTeardown) (*batchv1.JobConditionType, error) {
 	jobKey := types.NamespacedName{
 		Name:      teardownJobName,
-		Namespace: td.Namespace,
+		Namespace: teardownNamespace(td),
 	}
 
 	job := &batchv1.Job{}

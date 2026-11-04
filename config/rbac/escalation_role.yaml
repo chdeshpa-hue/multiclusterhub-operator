@@ -1,0 +1,29 @@
+# Copyright Contributors to the Open Cluster Management project
+
+# acm-uninstall-escalation is bound only to the short-lived escalation
+# ServiceAccount that a HubTeardown Job runs as. It is shipped with the bundle
+# and installed by OLM; the operator never creates or widens it.
+#
+# resources: ["*"] is deliberate: the escalation Job deletes leftovers whose
+# kinds are discovered at run time, so the resource set cannot be enumerated at
+# install time. The verbs are deliberately narrower than the operator's own
+# role — no create, no bind, no escalate, no impersonate.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: acm-uninstall-escalation
+  labels:
+    app: hubteardown
+rules:
+- apiGroups:
+  - "*"
+  resources:
+  - "*"
+  verbs:
+  - get
+  - list
+  - watch
+  - delete
+  - deletecollection
+  - patch
+  - update

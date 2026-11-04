@@ -114,8 +114,8 @@ func (r *HubTeardownReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Handle CR deletion: remove the finalizer so the CR can be garbage-collected.
 	if teardown.GetDeletionTimestamp() != nil {
 		if controllerutil.ContainsFinalizer(teardown, teardownJobFinalizer) {
-			if err := r.cleanupTeardownJob(ctx, log, teardown); err != nil {
-				log.Error(err, "Failed to cleanup teardown Job during CR deletion")
+			if err := r.cleanupEscalation(ctx, log, teardown); err != nil {
+				log.Error(err, "Failed to cleanup teardown escalation during CR deletion")
 			}
 			controllerutil.RemoveFinalizer(teardown, teardownJobFinalizer)
 			if err := r.Client.Update(ctx, teardown); err != nil {
@@ -301,8 +301,14 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 		r.Recorder.Event(td, corev1.EventTypeNormal, "StallCleared", "Teardown no longer stalled")
 	}
 
-	if err := r.ensureTeardownJob(ctx, log, td); err != nil {
-		log.Error(err, "Failed to ensure teardown Job (controller will continue without resilient Job)")
+	if err := r.ensureEscalation(ctx, log, td); err != nil {
+		// Visible, not fatal: teardown can still finish in-process, but the
+		// missing escalation identity must never be silent (J-6).
+		r.setCondition(td, conditionTypeEscalationReady, metav1.ConditionFalse, "EscalationUnavailable", err.Error())
+		log.Error(err, "Failed to ensure teardown escalation (controller will continue without resilient Job)")
+	} else if teardownConsentGiven(td) {
+		r.setCondition(td, conditionTypeEscalationReady, metav1.ConditionTrue, "EscalationReady",
+			fmt.Sprintf("Escalation Job runs as ServiceAccount %s bound to ClusterRole %s.", escalationSAName, escalationRoleName))
 	}
 
 	// Clear WaitingForApproval if the user has now granted the required approvals.
@@ -322,6 +328,14 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 			log.Error(statusErr, "Failed to persist phase failure status")
 		}
 		return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
+	}
+
+	// The Job is only observed after the phases run: its terminal state is the
+	// record of the handoff, and the identity is removed only once it is done.
+	if finishErr := r.finishEscalation(ctx, log, td); finishErr != nil {
+		log.Error(finishErr, "Failed to finish teardown escalation")
+	} else if err := r.Client.Status().Update(ctx, td); err != nil {
+		log.Error(err, "Failed to persist escalation condition")
 	}
 	return result, nil
 }
