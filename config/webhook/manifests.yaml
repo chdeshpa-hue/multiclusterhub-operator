@@ -11,6 +11,27 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-operator-open-cluster-management-io-v1-hubteardown
+  failurePolicy: Fail
+  name: hubteardown.validating-webhook.open-cluster-management.io
+  rules:
+  - apiGroups:
+    - operator.open-cluster-management.io
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - hubteardowns
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-operator-open-cluster-management-io-v1-multiclusterhub
   failurePolicy: Fail
   name: multiclusterhub.validating-webhook.open-cluster-management.io

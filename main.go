@@ -389,6 +389,11 @@ func main() {
 			setupLog.Error(err, "unable to create webhook", "webhook", "MultiClusterHub")
 			os.Exit(1)
 		}
+
+		if err = (&operatorv1.HubTeardown{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "HubTeardown")
+			os.Exit(1)
+		}
 	}
 	//+kubebuilder:scaffold:builder
 
@@ -569,27 +574,61 @@ func detectOLMVersion(ctx context.Context, cl client.Client) (string, error) {
 	}
 }
 
-func ensureWebhooks(k8sClient client.Client) error {
-	ctx := context.Background()
+// validatingWebhookSpec pairs a webhook configuration builder with the CRD
+// that owns it, so a configuration is garbage collected with the API it
+// validates rather than with an unrelated one.
+type validatingWebhookSpec struct {
+	description string
+	build       func(namespace string) *admissionregistration.ValidatingWebhookConfiguration
+	ownerCRD    string
+}
 
+func ensureWebhooks(k8sClient client.Client) error {
 	deploymentNamespace, ok := os.LookupEnv("POD_NAMESPACE")
 	if !ok {
 		setupLog.Info("Failing due to being unable to locate webhook service namespace")
 		os.Exit(1)
 	}
 
-	validatingWebhook := operatorv1.ValidatingWebhook(deploymentNamespace)
+	// The HubTeardown configuration is deliberately separate from the
+	// MultiClusterHub one: the latter is owned by the MCH CRD and disappears
+	// when that CRD is deleted during teardown.
+	specs := []validatingWebhookSpec{
+		{
+			description: "MultiClusterHub",
+			build:       operatorv1.ValidatingWebhook,
+			ownerCRD:    crdName,
+		},
+		{
+			description: "HubTeardown",
+			build:       operatorv1.HubTeardownValidatingWebhook,
+			ownerCRD:    operatorv1.HubTeardownCRDName,
+		},
+	}
+
+	for _, spec := range specs {
+		if err := ensureValidatingWebhook(k8sClient, deploymentNamespace, spec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureValidatingWebhook(k8sClient client.Client, deploymentNamespace string, spec validatingWebhookSpec) error {
+	ctx := context.Background()
+
+	validatingWebhook := spec.build(deploymentNamespace)
 
 	maxAttempts := 10
 	for i := 0; i < maxAttempts; i++ {
-		setupLog.Info("Applying ValidatingWebhookConfiguration")
+		setupLog.Info("Applying ValidatingWebhookConfiguration", "for", spec.description)
 
-		// Get reference to MCH CRD to set as owner of the webhook
+		// Get reference to the owning CRD to set as owner of the webhook
 		// This way if the CRD is deleted the webhook will be removed with it
-		crdKey := types.NamespacedName{Name: crdName}
+		crdKey := types.NamespacedName{Name: spec.ownerCRD}
 		owner := &apixv1.CustomResourceDefinition{}
 		if err := k8sClient.Get(context.TODO(), crdKey, owner); err != nil {
-			setupLog.Error(err, "Failed to get MCH CRD")
+			setupLog.Error(err, "Failed to get CRD owning the webhook", "crd", spec.ownerCRD, "for", spec.description)
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -613,29 +652,29 @@ func ensureWebhooks(k8sClient client.Client) error {
 				// Webhook not found. Create and return
 				err = k8sClient.Create(ctx, validatingWebhook)
 				if err != nil {
-					setupLog.Error(err, "Error creating validatingwebhookconfiguration")
+					setupLog.Error(err, "Error creating validatingwebhookconfiguration", "for", spec.description)
 					time.Sleep(5 * time.Second)
 					continue
 				}
 				return nil
 			}
 
-			setupLog.Error(err, "Error getting validatingwebhookconfiguration")
+			setupLog.Error(err, "Error getting validatingwebhookconfiguration", "for", spec.description)
 			time.Sleep(5 * time.Second)
 			continue
 
 		} else {
 			// Webhook already exists. Update and return
-			setupLog.Info("Updating existing validatingwebhookconfiguration")
+			setupLog.Info("Updating existing validatingwebhookconfiguration", "for", spec.description)
 			existingWebhook.Webhooks = validatingWebhook.Webhooks
 			err = k8sClient.Update(ctx, existingWebhook)
 			if err != nil {
-				setupLog.Error(err, "Error updating validatingwebhookconfiguration")
+				setupLog.Error(err, "Error updating validatingwebhookconfiguration", "for", spec.description)
 				time.Sleep(5 * time.Second)
 				continue
 			}
 			return nil
 		}
 	}
-	return fmt.Errorf("unable to ensure validatingwebhook exists in allotted time")
+	return fmt.Errorf("unable to ensure %s validatingwebhook exists in allotted time", spec.description)
 }

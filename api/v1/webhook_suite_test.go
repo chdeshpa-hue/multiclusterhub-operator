@@ -72,6 +72,7 @@ var _ = BeforeSuite(func() {
 		WebhookInstallOptions: envtest.WebhookInstallOptions{
 			ValidatingWebhooks: []*admissionregistration.ValidatingWebhookConfiguration{
 				ValidatingWebhook("system"),
+				HubTeardownValidatingWebhook("system"),
 			},
 		},
 	}
@@ -114,6 +115,9 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 
 	err = (&MultiClusterHub{}).SetupWebhookWithManager(mgr)
+	Expect(err).NotTo(HaveOccurred())
+
+	err = (&HubTeardown{}).SetupWebhookWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 
 	//+kubebuilder:scaffold:webhook

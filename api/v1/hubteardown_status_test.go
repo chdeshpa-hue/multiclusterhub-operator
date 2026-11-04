@@ -18,6 +18,12 @@ import (
 // They are the only place where "the field survived admission" can be proven;
 // a Go round-trip test cannot detect a schema that prunes.
 var _ = Describe("HubTeardown status schema", func() {
+	// The admission webhook admits one HubTeardown per cluster, so each spec
+	// has to leave the cluster as it found it.
+	AfterEach(func() {
+		deleteAllHubTeardowns()
+	})
+
 	newTeardown := func(name string) *HubTeardown {
 		return &HubTeardown{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
@@ -75,11 +81,23 @@ var _ = Describe("HubTeardown status schema", func() {
 	})
 
 	It("mirrors counts onto MultiClusterHub status (A-5)", func() {
-		mch := &MultiClusterHub{
-			ObjectMeta: metav1.ObjectMeta{Name: "schema-mch", Namespace: "default"},
-			Spec:       MultiClusterHubSpec{},
+		// The hub admits one MultiClusterHub at a time, and other specs in this
+		// suite create their own. Reuse whatever exists; create only if the
+		// suite is empty, and clean up only what this spec created.
+		list := &MultiClusterHubList{}
+		Expect(k8sClient.List(ctx, list)).To(Succeed())
+
+		var mch *MultiClusterHub
+		createdHere := false
+		if len(list.Items) > 0 {
+			mch = list.Items[0].DeepCopy()
+		} else {
+			mch = &MultiClusterHub{
+				ObjectMeta: metav1.ObjectMeta{Name: "schema-mch", Namespace: "default"},
+			}
+			Expect(k8sClient.Create(ctx, mch)).To(Succeed())
+			createdHere = true
 		}
-		Expect(k8sClient.Create(ctx, mch)).To(Succeed())
 
 		mch.Status.Uninstall = &UninstallMirror{
 			TeardownRef:    corev1.LocalObjectReference{Name: "schema-mch-teardown"},
@@ -95,12 +113,12 @@ var _ = Describe("HubTeardown status schema", func() {
 		Expect(got.Status.Uninstall.Phase).To(Equal(TeardownPhaseVerifying))
 		Expect(got.Status.Uninstall.Summary.Total).To(Equal(int32(3)))
 
-		// The hub admits one MultiClusterHub at a time; leaving this object
-		// behind would break every later spec in the shared suite.
-		Expect(k8sClient.Delete(ctx, mch)).To(Succeed())
-		Eventually(func() bool {
-			err := k8sClient.Get(ctx, types.NamespacedName{Name: mch.Name, Namespace: mch.Namespace}, &MultiClusterHub{})
-			return err != nil
-		}).Should(BeTrue(), "test MCH must be gone before the next spec")
+		if createdHere {
+			Expect(k8sClient.Delete(ctx, mch)).To(Succeed())
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: mch.Name, Namespace: mch.Namespace}, &MultiClusterHub{})
+				return err != nil
+			}).Should(BeTrue(), "test MCH must be gone before the next spec")
+		}
 	})
 })
