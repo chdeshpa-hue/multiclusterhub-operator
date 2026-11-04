@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"github.com/Masterminds/semver/v3"
 )
 
 func Test_Get(t *testing.T) {
@@ -107,6 +109,16 @@ func Test_ValidOCPVersion(t *testing.T) {
 }
 
 func Test_ValidMCEVersion(t *testing.T) {
+	// Derive the boundary versions from RequiredMCEVersion so the cases track the
+	// release the operator is built for instead of a hardcoded literal.
+	required, err := semver.NewVersion(RequiredMCEVersion)
+	if err != nil {
+		t.Fatalf("invalid RequiredMCEVersion %q: %v", RequiredMCEVersion, err)
+	}
+	higherPatch := fmt.Sprintf("%d.%d.%d", required.Major(), required.Minor(), required.Patch()+5)
+	higherMinor := fmt.Sprintf("%d.%d.0", required.Major(), required.Minor()+1)
+	higherMajor := fmt.Sprintf("%d.0.0", required.Major()+1)
+
 	tests := []struct {
 		name       string
 		mceVersion string
@@ -115,17 +127,17 @@ func Test_ValidMCEVersion(t *testing.T) {
 	}{
 		{
 			name:       "higher patch version",
-			mceVersion: "5.1.5",
+			mceVersion: higherPatch,
 			wantErr:    false,
 		},
 		{
 			name:       "higher minor version rejected",
-			mceVersion: "5.2.0",
+			mceVersion: higherMinor,
 			wantErr:    true,
 		},
 		{
 			name:       "higher major version rejected",
-			mceVersion: "6.0.0",
+			mceVersion: higherMajor,
 			wantErr:    true,
 		},
 		{

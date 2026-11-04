@@ -24,7 +24,7 @@ import (
 
 const (
 	// Production MCE variables
-	MCEProdChannel          = "stable-5.1"
+	MCEProdChannel          = "stable-5.0"
 	MCEProdPackageName      = "multicluster-engine"
 	MCEProdOperandNamespace = "multicluster-engine"
 
