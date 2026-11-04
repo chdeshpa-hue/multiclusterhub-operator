@@ -250,6 +250,30 @@ func (r *MultiClusterHubReconciler) syncHubStatus(ctx context.Context, m *operat
 // calculateStatus derives the full MultiClusterHubStatus (components, conditions, and phase) from
 // the current set of component deployments/custom resources and MultiClusterEngine version
 // compliance. It does not mutate the cluster; callers are responsible for persisting the result.
+// uninstallMirrorFor projects a HubTeardown onto the MCH status. It copies
+// values instead of aliasing the list item, and returns nil when no teardown
+// exists so the field is cleared rather than left stale.
+func uninstallMirrorFor(td *operatorsv1.HubTeardown) *operatorsv1.UninstallMirror {
+	if td == nil {
+		return nil
+	}
+	mirror := &operatorsv1.UninstallMirror{
+		TeardownRef: corev1.LocalObjectReference{Name: td.Name},
+		Phase:       td.Status.Phase,
+	}
+	if td.Status.Summary != nil {
+		mirror.Summary = *td.Status.Summary
+	}
+	if td.Status.LastInspection != nil {
+		mirror.LastInspection = *td.Status.LastInspection
+	}
+	if td.Status.ReportRef != nil {
+		ref := *td.Status.ReportRef
+		mirror.ReportRef = &ref
+	}
+	return mirror
+}
+
 func (r *MultiClusterHubReconciler) calculateStatus(ctx context.Context, hub *operatorsv1.MultiClusterHub, allDeps []*appsv1.Deployment,
 	allCRs map[string]*unstructured.Unstructured, ocpConsole, isSTSEnabled bool) operatorsv1.MultiClusterHubStatus {
 
@@ -283,6 +307,10 @@ func (r *MultiClusterHubReconciler) calculateStatus(ctx context.Context, hub *op
 	mceVersionCompliance := r.calculateMCEVersionCompliance(ctx)
 
 	status := operatorsv1.MultiClusterHubStatus{
+		// The mirror is written by this reconciler, not by the teardown
+		// controller, so the rebuild has to carry it or every status write
+		// would quietly drop it.
+		Uninstall:            hub.Status.Uninstall,
 		CurrentVersion:       hub.Status.CurrentVersion,
 		DesiredVersion:       version.Version,
 		Components:           components,

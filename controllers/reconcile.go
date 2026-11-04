@@ -329,6 +329,10 @@ func (r *MultiClusterHubReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				oldest = td
 			}
 		}
+		// G1: the mirror is written here because this reconciler owns the MCH
+		// status. A teardown-owned write would be dropped by calculateStatus,
+		// which rebuilds the status from scratch (status.go:285).
+		multiClusterHub.Status.Uninstall = uninstallMirrorFor(oldest)
 		if oldest != nil && !oldest.Spec.DryRun {
 			r.Log.Info("HubTeardown is active — skipping component reconciliation",
 				"teardown", oldest.Name, "phase", oldest.Status.Phase)
