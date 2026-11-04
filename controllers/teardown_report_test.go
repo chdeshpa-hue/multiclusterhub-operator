@@ -12,6 +12,7 @@ import (
 	"time"
 
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
+	"github.com/stolostron/multiclusterhub-operator/pkg/policy"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -62,7 +63,7 @@ func TestBlockersFromGraph(t *testing.T) {
 		},
 	}
 
-	blockers := blockersFromGraph(graph, testScanTime)
+	blockers := blockersFromGraph(graph, testScanTime, policy.ConsentState{})
 
 	if len(blockers) != 2 {
 		t.Fatalf("expected 2 blockers, got %d: %+v", len(blockers), blockers)
@@ -76,7 +77,9 @@ func TestBlockersFromGraph(t *testing.T) {
 	if !blockers[1].RequiresConsent || blockers[1].CloudRisk == nil {
 		t.Errorf("cloud blocker must require consent and carry cloud risk")
 	}
-	if blockers[0].SuggestedAction != operatorv1.ActionResolveFinalizer {
+	// Ownership is None in this graph, so the policy refuses to recommend
+	// anything beyond reporting; the cloud risk is still disclosed.
+	if blockers[0].SuggestedAction != operatorv1.ActionReportOnly {
 		t.Errorf("non-cloud blocker action = %s", blockers[0].SuggestedAction)
 	}
 	if blockers[1].APIVersion != "hypershift.openshift.io/v1beta1" {
@@ -93,7 +96,7 @@ func TestBlockersFromGraphIdentityIsUID(t *testing.T) {
 		},
 	}
 
-	blockers := blockersFromGraph(graph, testScanTime)
+	blockers := blockersFromGraph(graph, testScanTime, policy.ConsentState{})
 
 	if len(blockers) != 2 {
 		t.Fatalf("expected 2 blockers after UID dedupe, got %d", len(blockers))

@@ -11,10 +11,20 @@ import (
 // (external reconciler, recreate loop) is named before liveness, and liveness
 // is fail-closed.
 func Evaluate(b Blocker, consent ConsentState) Decision {
-	if b.Ownership.Confidence == ownership.ConfidenceWeak || b.Ownership.Confidence == ownership.ConfidenceNone {
+	// Only Definitive and Strong authorise anything beyond reporting. Anything
+	// else - Weak, None, or an unset zero value - is report-only. Treating the
+	// zero value as strong was a real defect: a blocker built without the
+	// classifier would have been recommended for deletion.
+	switch b.Ownership.Confidence {
+	case ownership.ConfidenceDefinitive, ownership.ConfidenceStrong:
+	default:
+		confidence := b.Ownership.Confidence
+		if confidence == "" {
+			confidence = ownership.ConfidenceNone
+		}
 		return Decision{
 			Action: ActionReportOnly,
-			Reason: fmt.Sprintf("ownership confidence is %s; report only", b.Ownership.Confidence),
+			Reason: fmt.Sprintf("ownership confidence is %s; report only", confidence),
 		}
 	}
 

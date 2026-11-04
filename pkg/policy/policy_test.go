@@ -77,6 +77,13 @@ func TestEvaluate(t *testing.T) {
 			wantAction: ActionReportOnly,
 		},
 		{
+			name: "P-3b unset ownership is report only",
+			mutate: func(b *Blocker) {
+				b.Ownership = ownership.OwnershipVerdict{}
+			},
+			wantAction: ActionReportOnly,
+		},
+		{
 			name: "P-4 unknown liveness waits",
 			mutate: func(b *Blocker) {
 				b.ControllerAlive = nil

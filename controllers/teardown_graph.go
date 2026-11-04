@@ -9,6 +9,8 @@ import (
 
 	"github.com/go-logr/logr"
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
+	"github.com/stolostron/multiclusterhub-operator/pkg/inventory"
+	"github.com/stolostron/multiclusterhub-operator/pkg/ownership"
 	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -56,6 +58,11 @@ type DependencyGraph struct {
 	// listed. A non-empty list invalidates absence claims for those types: the
 	// report may say what was seen, never that something does not exist.
 	Incomplete []ScanIncomplete
+
+	// CRDRefs is the ownership projection of the CRDs seen by the scan: group,
+	// kind and installer labels. The index needs it to answer "is the defining
+	// CRD part of this installation?" without a second API read.
+	CRDRefs []inventory.CRDRef
 }
 
 // ScanIncomplete is one reason the scan did not see everything.
@@ -75,6 +82,15 @@ type DiscoveredResource struct {
 	IsDeleting        bool
 	Phase             string
 	Platform          string
+	// Labels and OwnerReferences are the inputs to ownership classification.
+	// They are metadata only; no object body is retained.
+	Labels          map[string]string
+	OwnerReferences []metav1.OwnerReference
+
+	// Ownership is the evidence-based verdict for this object. It is filled by
+	// classifyOwnership after the whole scan has completed, because the owner
+	// chain needs every object in the index.
+	Ownership operatorv1.OwnershipVerdict
 }
 
 // buildDependencyGraph scans the cluster for all ACM/MCE resources and classifies them.
@@ -99,12 +115,18 @@ func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, log lo
 				Reason:   err.Error(),
 			})
 		}
+		graph.CRDRefs = append(graph.CRDRefs, inventory.CRDRef{
+			Group:  crd.Spec.Group,
+			Kind:   crd.Spec.Names.Kind,
+			Labels: crd.Labels,
+		})
 	}
 
 	r.classifyBlockingResources(graph)
 	r.classifyManagedClusters(graph)
 	r.classifyAddons(graph)
 	r.findMCHAndMCE(graph)
+	r.classifyOwnership(graph)
 
 	return graph, nil
 }
@@ -143,27 +165,7 @@ func (r *HubTeardownReconciler) scanCRDInstances(ctx context.Context, log logr.L
 		item := &list.Items[i]
 		finalizers := item.GetFinalizers()
 
-		dr := DiscoveredResource{
-			Ref: operatorv1.ResourceRef{
-				Group:     crd.Spec.Group,
-				Kind:      crd.Spec.Names.Kind,
-				Namespace: item.GetNamespace(),
-				Name:      item.GetName(),
-			},
-			Version:           version,
-			UID:               item.GetUID(),
-			Finalizers:        finalizers,
-			DeletionTimestamp: item.GetDeletionTimestamp(),
-			IsDeleting:        item.GetDeletionTimestamp() != nil,
-		}
-
-		// Extract phase/status if available
-		if phase, ok, _ := unstructured.NestedString(item.Object, "status", "phase"); ok {
-			dr.Phase = phase
-		}
-
-		// Extract platform for Hypershift HostedClusters and Hive ClusterDeployments
-		dr.Platform = detectPlatform(crd.Spec.Names.Kind, item)
+		dr := newDiscoveredResource(item, crd, version)
 
 		graph.DiscoveredResources = append(graph.DiscoveredResources, dr)
 
@@ -187,6 +189,79 @@ func (r *HubTeardownReconciler) scanCRDInstances(ctx context.Context, log logr.L
 	}
 
 	return nil
+}
+
+// newDiscoveredResource is the one place a scanned object becomes a graph
+// entry. Ownership inputs (labels, owner references) are captured here so the
+// later classification pass never has to re-read the object.
+func newDiscoveredResource(item *unstructured.Unstructured, crd *apixv1.CustomResourceDefinition, version string) DiscoveredResource {
+	dr := DiscoveredResource{
+		Ref: operatorv1.ResourceRef{
+			Group:     crd.Spec.Group,
+			Kind:      crd.Spec.Names.Kind,
+			Namespace: item.GetNamespace(),
+			Name:      item.GetName(),
+		},
+		Version:           version,
+		UID:               item.GetUID(),
+		Finalizers:        item.GetFinalizers(),
+		DeletionTimestamp: item.GetDeletionTimestamp(),
+		IsDeleting:        item.GetDeletionTimestamp() != nil,
+		Labels:            item.GetLabels(),
+		OwnerReferences:   item.GetOwnerReferences(),
+	}
+
+	// Extract phase/status if available
+	if phase, ok, _ := unstructured.NestedString(item.Object, "status", "phase"); ok {
+		dr.Phase = phase
+	}
+
+	// Extract platform for Hypershift HostedClusters and Hive ClusterDeployments
+	dr.Platform = detectPlatform(crd.Spec.Names.Kind, item)
+	return dr
+}
+
+// classifyOwnership answers "does this installation own this object?" from
+// evidence. It runs after the scan because the owner chain needs every object
+// in the index, and after findMCHAndMCE because installer labels are matched
+// against the MCH identity.
+func (r *HubTeardownReconciler) classifyOwnership(graph *DependencyGraph) {
+	objects := make([]metav1.PartialObjectMetadata, 0, len(graph.DiscoveredResources))
+	for i := range graph.DiscoveredResources {
+		objects = append(objects, partialMetadata(&graph.DiscoveredResources[i]))
+	}
+	idx := inventory.NewIndex(objects, graph.CRDRefs, nil)
+
+	mch := types.NamespacedName{}
+	if graph.MCH != nil {
+		mch = types.NamespacedName{
+			Name:      graph.MCH.Ref.Name,
+			Namespace: graph.MCH.Ref.Namespace,
+		}
+	}
+
+	for i := range graph.DiscoveredResources {
+		dr := &graph.DiscoveredResources[i]
+		dr.Ownership = ownership.Classify(partialMetadata(dr), idx, mch)
+	}
+}
+
+// partialMetadata is the ownership view of a discovered object: identity,
+// labels and owner references, nothing else.
+func partialMetadata(dr *DiscoveredResource) metav1.PartialObjectMetadata {
+	return metav1.PartialObjectMetadata{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: apiVersionFor(dr.Ref, dr.Version),
+			Kind:       dr.Ref.Kind,
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            dr.Ref.Name,
+			Namespace:       dr.Ref.Namespace,
+			UID:             dr.UID,
+			Labels:          dr.Labels,
+			OwnerReferences: dr.OwnerReferences,
+		},
+	}
 }
 
 // preferredVersion returns the served+storage version for a CRD, or the first served version.

@@ -14,6 +14,7 @@ import (
 	"github.com/go-logr/logr"
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
 	"github.com/stolostron/multiclusterhub-operator/pkg/inventory"
+	"github.com/stolostron/multiclusterhub-operator/pkg/policy"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,11 +46,10 @@ const (
 	// reportMaxNameLength keeps the generated name a valid DNS subdomain.
 	reportMaxNameLength = 240
 
-	// reportOwnershipDeferred is recorded in the report while ownership
-	// classification is not yet wired to the inventory walk. It is stated
-	// rather than implied so a reader cannot mistake an empty evidence list
-	// for a classification that ran and found nothing.
-	reportOwnershipDeferred = "deferred"
+	// reportOwnershipClassified records that every discovered object carries an
+	// evidence-based ownership verdict (increment 17). The verdict itself is on
+	// each blocker; this string only says the classification ran.
+	reportOwnershipClassified = "classified"
 )
 
 // inspectReport is the complete typed record written to the ConfigMap.
@@ -91,7 +91,7 @@ type reportMeta struct {
 // blockersFromGraph converts the scan into the single record type consumed by
 // the report, status and (later) verification. UID is the identity; two
 // objects with the same name are two blockers.
-func blockersFromGraph(graph *DependencyGraph, scanTime metav1.Time) []operatorv1.Blocker {
+func blockersFromGraph(graph *DependencyGraph, scanTime metav1.Time, consent policy.ConsentState) []operatorv1.Blocker {
 	if graph == nil {
 		return nil
 	}
@@ -133,12 +133,8 @@ func blockersFromGraph(graph *DependencyGraph, scanTime metav1.Time) []operatorv
 			Finalizers:      append([]string(nil), dr.Finalizers...),
 			BlockedSince:    scanTime,
 			ObservedInPhase: operatorv1.TeardownPhaseInspecting,
-			Ownership: operatorv1.OwnershipVerdict{
-				Owned:      false,
-				Confidence: operatorv1.ConfidenceNone,
-			},
+			Ownership:       dr.Ownership,
 			Classification:  operatorv1.ClassUnknown,
-			SuggestedAction: operatorv1.ActionResolveFinalizer,
 		}
 		if dr.DeletionTimestamp != nil {
 			blocker.DeletionTimestamp = dr.DeletionTimestamp.DeepCopy()
@@ -146,15 +142,20 @@ func blockersFromGraph(graph *DependencyGraph, scanTime metav1.Time) []operatorv
 		}
 		if cloud {
 			blocker.Classification = operatorv1.ClassCloudProtecting
-			blocker.SuggestedAction = operatorv1.ActionResolveFinalizerWithConsent
-			blocker.RequiresConsent = true
-			blocker.ConsentReason = "removing this finalizer may orphan cloud infrastructure outside the cluster"
 			blocker.CloudRisk = &operatorv1.CloudRisk{
 				Platform:     dr.Platform,
 				ResourceType: dr.Ref.Kind,
 				MayOrphan:    true,
 			}
+			// RequiresConsent is a property of acting on a cloud-protecting
+			// finalizer, not of the action chosen right now: waiting for the
+			// controller and resolving the finalizer both leave the requirement
+			// in place.
+			blocker.RequiresConsent = true
+			blocker.ConsentReason = "removing this finalizer may orphan cloud infrastructure outside the cluster"
 		}
+
+		blocker.SuggestedAction = policy.Evaluate(blocker, consent).Action
 		blockers = append(blockers, blocker)
 	}
 
@@ -210,9 +211,24 @@ func capBlockers(blockers []operatorv1.Blocker, limit int) ([]operatorv1.Blocker
 	return append([]operatorv1.Blocker(nil), blockers[:limit]...), int32(len(blockers) - limit)
 }
 
+// reportConsentState is the consent the report is rendered against. A dry run
+// previews what would be required, so it is rendered with no grant; an active
+// run shows the grant it actually holds.
+func reportConsentState(td *operatorv1.HubTeardown) policy.ConsentState {
+	if td.Spec.DryRun {
+		return policy.ConsentState{}
+	}
+	return policy.ConsentState{
+		ApprovedDestructiveActions: td.Spec.ApprovedDestructiveActions,
+		CloudRiskAcknowledged:      td.Spec.AcknowledgeCloudResourceRisk,
+		AcknowledgedDigest:         td.Spec.AcknowledgedReportDigest,
+		ReportDigest:               td.Status.ReportDigest,
+	}
+}
+
 // buildInspectReport renders the graph into the report and its meta.
 func buildInspectReport(td *operatorv1.HubTeardown, graph *DependencyGraph, scanTime metav1.Time, kubeVersion string) (inspectReport, reportMeta) {
-	blockers := blockersFromGraph(graph, scanTime)
+	blockers := blockersFromGraph(graph, scanTime, reportConsentState(td))
 	complete := len(graph.Incomplete) == 0
 
 	report := inspectReport{
@@ -224,7 +240,7 @@ func buildInspectReport(td *operatorv1.HubTeardown, graph *DependencyGraph, scan
 			InventoryComplete: complete,
 			Incomplete:        append([]ScanIncomplete(nil), graph.Incomplete...),
 			MCHPresent:        graph.MCH != nil,
-			Ownership:         reportOwnershipDeferred,
+			Ownership:         reportOwnershipClassified,
 		},
 		Summary:  summarizeBlockers(blockers),
 		Blockers: blockers,
@@ -236,7 +252,7 @@ func buildInspectReport(td *operatorv1.HubTeardown, graph *DependencyGraph, scan
 		KubeVersion:       kubeVersion,
 		DiscoveryPath:     report.Inventory.DiscoveryPath,
 		InventoryComplete: complete,
-		Ownership:         reportOwnershipDeferred,
+		Ownership:         reportOwnershipClassified,
 	}
 	return report, meta
 }
