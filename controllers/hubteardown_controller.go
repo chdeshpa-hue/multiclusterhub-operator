@@ -30,12 +30,17 @@ const (
 	conditionTypeDryRunComplete      = "DryRunComplete"
 	conditionTypeCloudResourcesRisk  = "CloudResourcesAtRisk"
 	conditionTypeTeardownProgressing = "Progressing"
-	conditionTypeTeardownComplete    = "Complete"
-	conditionTypeTeardownStalled     = "Stalled"
-	conditionTypeDryRunReportStale   = "DryRunReportStale"
-	conditionTypeWaitingForApproval  = "WaitingForApproval"
-	conditionTypeInspectIncomplete   = "InspectIncomplete"
-	conditionTypeReportWriteFailed   = "ReportWriteFailed"
+
+	// conditionTypeContractReady reports the cross-repo teardown-active signal
+	// (DF-1..DF-5). It is written by the operator from the prepare Job's
+	// progress record, never by the Job itself.
+	conditionTypeContractReady      = "ContractReady"
+	conditionTypeTeardownComplete   = "Complete"
+	conditionTypeTeardownStalled    = "Stalled"
+	conditionTypeDryRunReportStale  = "DryRunReportStale"
+	conditionTypeWaitingForApproval = "WaitingForApproval"
+	conditionTypeInspectIncomplete  = "InspectIncomplete"
+	conditionTypeReportWriteFailed  = "ReportWriteFailed"
 
 	defaultMaxDuration = 2 * time.Hour
 
@@ -115,6 +120,12 @@ func (r *HubTeardownReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Handle CR deletion: remove the finalizer so the CR can be garbage-collected.
 	if teardown.GetDeletionTimestamp() != nil {
 		if controllerutil.ContainsFinalizer(teardown, teardownJobFinalizer) {
+			// Deleting the CR is the only explicit cancel. Clear the contract
+			// first so a surviving MCH does not stay in teardown mode. Best
+			// effort: the finalizer must not be held by a failed patch.
+			if err := r.clearTeardownActiveAnnotation(ctx, log); err != nil {
+				log.Error(err, "Failed to clear teardown-active contract during CR deletion")
+			}
 			if err := r.cleanupHandoff(ctx, log, teardown); err != nil {
 				log.Error(err, "Failed to cleanup teardown handoff during CR deletion")
 			}

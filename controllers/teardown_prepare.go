@@ -42,6 +42,20 @@ type jobPhaseRecord struct {
 
 type jobProgress struct {
 	Phases []jobPhaseRecord `json:"phases"`
+
+	// Contract is what the prepare Job found on the hub after writing the
+	// teardown-active annotations. The operator mirrors it into a condition.
+	Contract *contractRecord `json:"contract,omitempty"`
+}
+
+// contractRecord is the observable state of the cross-repo teardown contract.
+// Signalled means every MCH carries both the value and the version.
+type contractRecord struct {
+	Version   string   `json:"version"`
+	Signalled bool     `json:"signalled"`
+	MCHs      []string `json:"mchs,omitempty"`
+	Reason    string   `json:"reason"`
+	Message   string   `json:"message"`
 }
 
 // preparePhasePlan is the work that runs in the Job. It is separate from the
@@ -239,6 +253,10 @@ func (r *HubTeardownReconciler) runJobLoop(ctx context.Context, log logr.Logger,
 				return fmt.Errorf("phase %s failed: %w", step.phase, execErr)
 			}
 
+			if step.phase == operatorv1.TeardownPhaseRemoveBlockingCRs {
+				progress.Contract = r.readContract(ctx, log)
+			}
+
 			if !done {
 				recordJobPhase(progress, step.phase, operatorv1.PhaseStateInProgress, "Waiting for phase to complete")
 				if err := r.saveJobProgress(ctx, td, progress); err != nil {
@@ -312,6 +330,14 @@ func (r *HubTeardownReconciler) handoffProgressComplete(ctx context.Context, td 
 func (r *HubTeardownReconciler) mirrorJobProgress(td *operatorv1.HubTeardown, progress *jobProgress, plan []teardownPhaseStep, by string) {
 	if progress == nil {
 		return
+	}
+	if progress.Contract != nil {
+		contractStatus := metav1.ConditionFalse
+		if progress.Contract.Signalled {
+			contractStatus = metav1.ConditionTrue
+		}
+		r.setCondition(td, conditionTypeContractReady, contractStatus,
+			progress.Contract.Reason, progress.Contract.Message)
 	}
 	for _, step := range plan {
 		for _, record := range progress.Phases {

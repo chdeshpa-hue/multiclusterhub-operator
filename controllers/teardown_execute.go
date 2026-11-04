@@ -34,6 +34,12 @@ const (
 	//   DF-4: import-controller force-cleans ManifestWork finalizers
 	// Alternative trigger: MCH.DeletionTimestamp != nil (covers plain oc delete mch).
 	annotationTeardownActive = "operator.open-cluster-management.io/teardown-active"
+
+	// annotationTeardownActiveVersion carries the contract version. It is a
+	// separate key so the confirmed DF-1..DF-5 check (value == "true") does not
+	// change; a consumer that does not know this key ignores it.
+	annotationTeardownActiveVersion = "operator.open-cluster-management.io/teardown-active-version"
+	teardownContractVersion         = "1"
 )
 
 // agentInstallWebhookNames lists admission webhook configurations created by
@@ -105,7 +111,8 @@ func (r *HubTeardownReconciler) setTeardownActiveAnnotation(ctx context.Context,
 	for i := range list.Items {
 		mch := &list.Items[i]
 		annotations := mch.GetAnnotations()
-		if annotations != nil && annotations[annotationTeardownActive] == "true" {
+		if annotations[annotationTeardownActive] == "true" &&
+			annotations[annotationTeardownActiveVersion] == teardownContractVersion {
 			continue
 		}
 		if annotations == nil {
@@ -113,6 +120,7 @@ func (r *HubTeardownReconciler) setTeardownActiveAnnotation(ctx context.Context,
 		}
 		patch := client.MergeFrom(mch.DeepCopy())
 		annotations[annotationTeardownActive] = "true"
+		annotations[annotationTeardownActiveVersion] = teardownContractVersion
 		mch.SetAnnotations(annotations)
 		if err := r.Client.Patch(ctx, mch, patch); err != nil {
 			if errors.IsNotFound(err) {
@@ -126,6 +134,98 @@ func (r *HubTeardownReconciler) setTeardownActiveAnnotation(ctx context.Context,
 	return nil
 }
 
+// readContract reports what the contract looks like on the hub. The prepare Job
+// calls it after RemoveBlockingCRs so the operator can surface the result; the
+// Job never writes status.
+func (r *HubTeardownReconciler) readContract(ctx context.Context, log logr.Logger) *contractRecord {
+	record := &contractRecord{Version: teardownContractVersion, Signalled: true}
+
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "operator.open-cluster-management.io",
+		Version: "v1",
+		Kind:    "MultiClusterHubList",
+	})
+	if err := r.Client.List(ctx, list); err != nil {
+		if isNoMatchError(err) {
+			record.Reason = "NoMCH"
+			record.Message = "MultiClusterHub API is not installed; nothing to signal."
+			return record
+		}
+		record.Signalled = false
+		record.Reason = "ContractUnreadable"
+		record.Message = err.Error()
+		return record
+	}
+
+	for i := range list.Items {
+		mch := &list.Items[i]
+		annotations := mch.GetAnnotations()
+		record.MCHs = append(record.MCHs, mch.GetName())
+		if annotations[annotationTeardownActive] != "true" ||
+			annotations[annotationTeardownActiveVersion] != teardownContractVersion {
+			record.Signalled = false
+		}
+	}
+
+	switch {
+	case len(record.MCHs) == 0:
+		record.Reason = "NoMCH"
+		record.Message = "No MultiClusterHub present; nothing to signal."
+	case record.Signalled:
+		record.Reason = "Signalled"
+		record.Message = fmt.Sprintf("Signalled %d MultiClusterHub(s) at contract version %s.",
+			len(record.MCHs), teardownContractVersion)
+	default:
+		record.Reason = "SignallingIncomplete"
+		record.Message = "One or more MultiClusterHub objects are missing the teardown-active contract."
+	}
+	log.V(1).Info("Read teardown-active contract", "signalled", record.Signalled, "reason", record.Reason)
+	return record
+}
+
+// clearTeardownActiveAnnotation removes the contract from every MCH. It is
+// called when the HubTeardown CR is deleted, which is the only explicit cancel.
+// Best effort by design: a stuck patch must not hold the CR finalizer on a hub
+// that may already be gone.
+func (r *HubTeardownReconciler) clearTeardownActiveAnnotation(ctx context.Context, log logr.Logger) error {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "operator.open-cluster-management.io",
+		Version: "v1",
+		Kind:    "MultiClusterHubList",
+	})
+	if err := r.Client.List(ctx, list); err != nil {
+		if isNoMatchError(err) {
+			return nil
+		}
+		return fmt.Errorf("listing MCH to clear teardown-active contract: %w", err)
+	}
+
+	for i := range list.Items {
+		mch := &list.Items[i]
+		annotations := mch.GetAnnotations()
+		if annotations == nil {
+			continue
+		}
+		if _, ok := annotations[annotationTeardownActive]; !ok {
+			if _, ok := annotations[annotationTeardownActiveVersion]; !ok {
+				continue
+			}
+		}
+
+		patch := client.MergeFrom(mch.DeepCopy())
+		delete(annotations, annotationTeardownActive)
+		delete(annotations, annotationTeardownActiveVersion)
+		mch.SetAnnotations(annotations)
+		if err := r.Client.Patch(ctx, mch, patch); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("clearing teardown-active contract on MCH %s: %w", mch.GetName(), err)
+		}
+		log.Info("Cleared teardown-active contract from MCH", "name", mch.GetName())
+	}
+	return nil
+}
+
 // phaseRemoveBlockingCRs deletes resources that block MCH webhook validation:
 // MultiClusterObservability, DiscoveryConfig, AgentServiceConfig.
 func (r *HubTeardownReconciler) phaseRemoveBlockingCRs(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error) {
@@ -133,8 +233,10 @@ func (r *HubTeardownReconciler) phaseRemoveBlockingCRs(ctx context.Context, log 
 
 	// Signal downstream operators that teardown is active. Must be set before
 	// deleting resources so DF-1/DF-3/DF-4 activate their teardown paths.
+	// A hub that cannot signal the contract must not go on to delete
+	// resources: the DF operators would recreate what this phase removes.
 	if err := r.setTeardownActiveAnnotation(ctx, log); err != nil {
-		log.Error(err, "Failed to set teardown-active annotation on MCH, continuing")
+		return false, fmt.Errorf("signalling teardown-active contract: %w", err)
 	}
 
 	blockingTypes := []struct {
