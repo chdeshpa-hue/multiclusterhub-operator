@@ -16,10 +16,10 @@ import (
 
 // ObjectRef is one cluster object, identified by group/kind/namespace/name.
 type ObjectRef struct {
-	Group     string
-	Kind      string
-	Namespace string
-	Name      string
+	Group     string `json:"group,omitempty"`
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name"`
 }
 
 // WebhookRef is an admission webhook and the namespace of its backing Service.
@@ -40,6 +40,15 @@ type Input struct {
 	// declared allowlist yet — but they are counted so a complete verdict is
 	// never silent about objects nobody looked at.
 	OperatorNamespaceObjects []ObjectRef
+
+	// OperatorNamespaceSnapshot is the same object set as captured before any
+	// destructive phase. It is what separates an object that was always there
+	// from one the teardown created.
+	OperatorNamespaceSnapshot []ObjectRef
+
+	// SnapshotPresent is false when no pre-teardown snapshot could be read. An
+	// absent snapshot is stated, never treated as an empty one.
+	SnapshotPresent bool
 
 	// CRDs are cluster-scoped definitions, regardless of group.
 	CRDs []ObjectRef
@@ -92,6 +101,10 @@ type Report struct {
 	// expectation. They do not affect Complete; they exist so the terminal
 	// message can state the count.
 	Unclassified []operatorv1.ResidueItem
+
+	// NewSinceInspect counts unclassified objects that were absent from the
+	// pre-teardown snapshot, so the teardown itself created them.
+	NewSinceInspect int
 	// RefusedReason is set when absence could not be proven.
 	RefusedReason string
 }
@@ -166,13 +179,29 @@ func Evaluate(in Input, p Policy) Report {
 		report.Residue = append(report.Residue, residueItem(obj, "ACM resource still present after teardown"))
 	}
 
+	snapshot := make(map[string]struct{}, len(in.OperatorNamespaceSnapshot))
+	for _, obj := range in.OperatorNamespaceSnapshot {
+		snapshot[objectKey(obj.Group, obj.Kind, obj.Namespace, obj.Name)] = struct{}{}
+	}
+
 	for _, obj := range in.OperatorNamespaceObjects {
 		if _, ok := keepObjects[objectKey(obj.Group, obj.Kind, obj.Namespace, obj.Name)]; ok {
 			report.Expected = append(report.Expected, residueItem(obj, "declared expected survivor"))
 			continue
 		}
+		if !in.SnapshotPresent {
+			report.Unclassified = append(report.Unclassified, residueItem(obj,
+				"no pre-teardown snapshot recorded; cannot tell when this object appeared"))
+			continue
+		}
+		if _, ok := snapshot[objectKey(obj.Group, obj.Kind, obj.Namespace, obj.Name)]; !ok {
+			report.NewSinceInspect++
+			report.Unclassified = append(report.Unclassified, residueItem(obj,
+				"appeared after the pre-teardown snapshot"))
+			continue
+		}
 		report.Unclassified = append(report.Unclassified, residueItem(obj,
-			"core-group object in the preserved namespace; no declared expectation"))
+			"present before teardown and still present; no declared expectation"))
 	}
 
 	for _, hook := range in.Webhooks {

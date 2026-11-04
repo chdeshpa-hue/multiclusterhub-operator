@@ -220,7 +220,10 @@ func TestApplyInspectionReusesUnchangedReport(t *testing.T) {
 	}
 
 	list := &corev1.ConfigMapList{}
-	if err := reconciler.Client.List(context.Background(), list, client.InNamespace(td.Namespace)); err != nil {
+	// Scoped to reports: the namespace also holds the pre-teardown snapshot,
+	// which is deliberately not a report.
+	if err := reconciler.Client.List(context.Background(), list,
+		client.InNamespace(td.Namespace), client.MatchingLabels{reportLabelTeardown: td.Name}); err != nil {
 		t.Fatalf("list: %v", err)
 	}
 	if len(list.Items) != 1 {

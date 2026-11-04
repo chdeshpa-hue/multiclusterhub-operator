@@ -311,6 +311,17 @@ func renderInspectReportText(report inspectReport, meta reportMeta) string {
 // the only writer of summary, blockers, lastInspection and reportRef.
 func (r *HubTeardownReconciler) applyInspection(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown, graph *DependencyGraph) error {
 	now := metav1.Now()
+
+	// Capture the pre-teardown object set before anything can delete one. The
+	// record is written once and never replaced, so re-inspection cannot
+	// re-baseline onto a half-destroyed namespace.
+	snapshotConfigMap, snapshotReused, snapshotErr := r.ensureOperatorNamespaceSnapshot(ctx, td)
+	if snapshotErr != nil {
+		log.Error(snapshotErr, "Could not record the pre-teardown object snapshot")
+	} else {
+		log.Info("Pre-teardown object snapshot recorded", "configMap", snapshotConfigMap.Name, "reused", snapshotReused)
+	}
+
 	kubeVersion := ""
 	if r.DiscoveryClient != nil {
 		if info, err := r.DiscoveryClient.ServerVersion(); err == nil && info != nil {
@@ -345,6 +356,12 @@ func (r *HubTeardownReconciler) applyInspection(ctx context.Context, log logr.Lo
 	} else {
 		r.setCondition(td, conditionTypeInspectIncomplete, metav1.ConditionTrue, "InventoryIncomplete",
 			fmt.Sprintf("%d resource types could not be listed; the report may not claim absence for them.", len(report.Inventory.Incomplete)))
+	}
+	if snapshotErr != nil {
+		// Verification can still run, but it will not be able to say when an
+		// operator-namespace object appeared. Say so now rather than at the end.
+		r.setCondition(td, conditionTypeInspectIncomplete, metav1.ConditionTrue, "SnapshotFailed",
+			fmt.Sprintf("The pre-teardown object snapshot could not be recorded: %v. Verification will report operator-namespace objects as unclassified without a baseline.", snapshotErr))
 	}
 
 	log.Info("Inspection report written", "configMap", ref.Name, "reused", reused,

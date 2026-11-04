@@ -47,6 +47,16 @@ var verifyKeepCRDs = []string{
 	"internalhubcomponents.operator.open-cluster-management.io",
 }
 
+// verifyOperatorNamespaceKeepObjects are the core objects the platform creates
+// in every namespace. They are exact names, not patterns: a name rule here
+// would repeat the DF-5 defect in the report path.
+func verifyOperatorNamespaceKeepObjects(namespace string) []verify.ObjectRef {
+	return []verify.ObjectRef{
+		{Kind: "ConfigMap", Namespace: namespace, Name: "kube-root-ca.crt"},
+		{Kind: "ConfigMap", Namespace: namespace, Name: "openshift-service-ca.crt"},
+	}
+}
+
 // verifyPolicy is the classification policy shared by Verify and the timeout
 // path, so a failed run reports residue the same way a completed one does.
 func verifyPolicy(td *operatorv1.HubTeardown) verify.Policy {
@@ -55,6 +65,7 @@ func verifyPolicy(td *operatorv1.HubTeardown) verify.Policy {
 		ACMGroupSuffixes:  acmAPIGroupSuffixes,
 		ACMNamespaces:     verifyACMNamespaces,
 		KeepCRDs:          verifyKeepCRDs,
+		KeepObjects:       verifyOperatorNamespaceKeepObjects(td.Namespace),
 		OperatorAPIGroup:  verifyOperatorAPIGroup,
 	}
 }
@@ -86,9 +97,15 @@ func (r *HubTeardownReconciler) phaseVerify(ctx context.Context, log logr.Logger
 	if report.Complete {
 		td.Status.Phase = operatorv1.TeardownPhaseComplete
 		message := fmt.Sprintf("Teardown verified: no residue outside %d expected survivors.", len(report.Expected))
-		if n := len(report.Unclassified); n > 0 {
+		switch n := len(report.Unclassified); {
+		case n > 0 && !input.SnapshotPresent:
 			message = fmt.Sprintf("Teardown verified: no residue outside %d expected survivors; "+
-				"%d core-group object(s) in the operator namespace were not classified.", len(report.Expected), n)
+				"%d core-group object(s) in the operator namespace were not classified "+
+				"(no pre-teardown snapshot was recorded).", len(report.Expected), n)
+		case n > 0:
+			message = fmt.Sprintf("Teardown verified: no residue outside %d expected survivors; "+
+				"%d core-group object(s) in the operator namespace were not classified "+
+				"(%d appeared after the pre-teardown snapshot).", len(report.Expected), n, report.NewSinceInspect)
 		}
 		r.setCondition(td, conditionTypeTeardownComplete, metav1.ConditionTrue, "Complete", message)
 		r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionFalse, "TeardownComplete",
@@ -176,30 +193,20 @@ func (r *HubTeardownReconciler) observeForVerification(ctx context.Context, log 
 		})
 	}
 
-	// Core-group objects in the preserved namespace are not residue under D-G,
-	// but until an allowlist exists the report must not stay silent about them.
-	cmList := &corev1.ConfigMapList{}
-	if err := r.Client.List(ctx, cmList, client.InNamespace(td.Namespace)); err != nil {
-		input.Incomplete = append(input.Incomplete, "configmaps: "+err.Error())
-	}
-	for i := range cmList.Items {
-		input.OperatorNamespaceObjects = append(input.OperatorNamespaceObjects, verify.ObjectRef{
-			Kind:      "ConfigMap",
-			Namespace: cmList.Items[i].Namespace,
-			Name:      cmList.Items[i].Name,
-		})
-	}
+	// Core-group objects in the preserved namespace are not residue under D-G.
+	// They are compared against the snapshot taken before any destructive
+	// phase, so "was always here" and "the teardown created it" are different
+	// observations instead of one undifferentiated count.
+	observed, incomplete := r.listOperatorNamespaceObjects(ctx, td)
+	input.OperatorNamespaceObjects = append(input.OperatorNamespaceObjects, observed...)
+	input.Incomplete = append(input.Incomplete, incomplete...)
 
-	secretList := &corev1.SecretList{}
-	if err := r.Client.List(ctx, secretList, client.InNamespace(td.Namespace)); err != nil {
-		input.Incomplete = append(input.Incomplete, "secrets: "+err.Error())
-	}
-	for i := range secretList.Items {
-		input.OperatorNamespaceObjects = append(input.OperatorNamespaceObjects, verify.ObjectRef{
-			Kind:      "Secret",
-			Namespace: secretList.Items[i].Namespace,
-			Name:      secretList.Items[i].Name,
-		})
+	snapshot, present, err := r.loadOperatorNamespaceSnapshot(ctx, td)
+	if err != nil {
+		input.Incomplete = append(input.Incomplete, "operator namespace snapshot: "+err.Error())
+	} else {
+		input.SnapshotPresent = present
+		input.OperatorNamespaceSnapshot = snapshot.Objects
 	}
 
 	nsList := &corev1.NamespaceList{}
