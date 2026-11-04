@@ -5,7 +5,6 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -1142,39 +1141,6 @@ func (r *HubTeardownReconciler) cleanupLocalCluster(ctx context.Context, log log
 	r.Recorder.Eventf(td, corev1.EventTypeNormal, "LocalClusterDetached",
 		"Deleted local-cluster ManagedCluster (post-MCH cleanup)")
 	return nil
-}
-
-// acmNamespaces are namespaces created or managed by the ACM/MCE install.
-// open-cluster-management is excluded here because it is cleaned in
-// phaseRemoveOLMOperator after the operator self-destructs.
-var acmNamespaces = map[string]bool{
-	"multicluster-engine":                   true,
-	"hive":                                  true,
-	"open-cluster-management-hub":           true,
-	"open-cluster-management-agent":         true,
-	"open-cluster-management-agent-addon":   true,
-	"open-cluster-management-observability": true,
-	"open-cluster-management-backup":        true,
-	"hypershift":                            true,
-}
-
-// isACMOwnedRBAC checks if a cluster-scoped RBAC resource was created by the
-// ACM installer using the standard installer.name label, or belongs to known
-// ACM/Submariner naming patterns.
-func isACMOwnedRBAC(obj *unstructured.Unstructured) bool {
-	labels := obj.GetLabels()
-	if labels != nil {
-		if labels["installer.name"] == "multiclusterhub" {
-			return true
-		}
-		if labels["installer.namespace"] == "open-cluster-management" {
-			return true
-		}
-	}
-	name := obj.GetName()
-	return strings.HasPrefix(name, "open-cluster-management:") ||
-		strings.HasPrefix(name, "multiclusterhub") ||
-		strings.Contains(name, "submariner")
 }
 
 // hubteardownCRDName is the fully-qualified CRD name for HubTeardown.
