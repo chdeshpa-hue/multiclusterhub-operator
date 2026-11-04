@@ -35,6 +35,12 @@ type Input struct {
 	// Objects are ACM-group custom resources seen by the scan.
 	Objects []ObjectRef
 
+	// OperatorNamespaceObjects are core-group objects observed in the
+	// preserved namespace. They are not classified as residue — there is no
+	// declared allowlist yet — but they are counted so a complete verdict is
+	// never silent about objects nobody looked at.
+	OperatorNamespaceObjects []ObjectRef
+
 	// CRDs are cluster-scoped definitions, regardless of group.
 	CRDs []ObjectRef
 
@@ -82,6 +88,10 @@ type Report struct {
 	Residue    []operatorv1.ResidueItem
 	Expected   []operatorv1.ResidueItem
 	Incomplete []string
+	// Unclassified are objects in the preserved namespace with no declared
+	// expectation. They do not affect Complete; they exist so the terminal
+	// message can state the count.
+	Unclassified []operatorv1.ResidueItem
 	// RefusedReason is set when absence could not be proven.
 	RefusedReason string
 }
@@ -156,6 +166,15 @@ func Evaluate(in Input, p Policy) Report {
 		report.Residue = append(report.Residue, residueItem(obj, "ACM resource still present after teardown"))
 	}
 
+	for _, obj := range in.OperatorNamespaceObjects {
+		if _, ok := keepObjects[objectKey(obj.Group, obj.Kind, obj.Namespace, obj.Name)]; ok {
+			report.Expected = append(report.Expected, residueItem(obj, "declared expected survivor"))
+			continue
+		}
+		report.Unclassified = append(report.Unclassified, residueItem(obj,
+			"core-group object in the preserved namespace; no declared expectation"))
+	}
+
 	for _, hook := range in.Webhooks {
 		if hook.ServiceNamespace == "" {
 			report.Residue = append(report.Residue, operatorv1.ResidueItem{
@@ -178,6 +197,7 @@ func Evaluate(in Input, p Policy) Report {
 
 	sortItems(report.Expected)
 	sortItems(report.Residue)
+	sortItems(report.Unclassified)
 
 	if len(in.Incomplete) > 0 {
 		report.RefusedReason = "inventory incomplete, absence cannot be proven: " + strings.Join(in.Incomplete, "; ")

@@ -85,8 +85,12 @@ func (r *HubTeardownReconciler) phaseVerify(ctx context.Context, log logr.Logger
 
 	if report.Complete {
 		td.Status.Phase = operatorv1.TeardownPhaseComplete
-		r.setCondition(td, conditionTypeTeardownComplete, metav1.ConditionTrue, "Complete",
-			fmt.Sprintf("Teardown verified: no residue outside %d expected survivors.", len(report.Expected)))
+		message := fmt.Sprintf("Teardown verified: no residue outside %d expected survivors.", len(report.Expected))
+		if n := len(report.Unclassified); n > 0 {
+			message = fmt.Sprintf("Teardown verified: no residue outside %d expected survivors; "+
+				"%d core-group object(s) in the operator namespace were not classified.", len(report.Expected), n)
+		}
+		r.setCondition(td, conditionTypeTeardownComplete, metav1.ConditionTrue, "Complete", message)
 		r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionFalse, "TeardownComplete",
 			"All teardown phases completed and verified.")
 		td.Status.BlockingResources = nil
@@ -169,6 +173,32 @@ func (r *HubTeardownReconciler) observeForVerification(ctx context.Context, log 
 			Kind:             "MutatingWebhookConfiguration",
 			Name:             mwcList.Items[i].Name,
 			ServiceNamespace: firstMutatingWebhookServiceNamespace(mwcList.Items[i].Webhooks),
+		})
+	}
+
+	// Core-group objects in the preserved namespace are not residue under D-G,
+	// but until an allowlist exists the report must not stay silent about them.
+	cmList := &corev1.ConfigMapList{}
+	if err := r.Client.List(ctx, cmList, client.InNamespace(td.Namespace)); err != nil {
+		input.Incomplete = append(input.Incomplete, "configmaps: "+err.Error())
+	}
+	for i := range cmList.Items {
+		input.OperatorNamespaceObjects = append(input.OperatorNamespaceObjects, verify.ObjectRef{
+			Kind:      "ConfigMap",
+			Namespace: cmList.Items[i].Namespace,
+			Name:      cmList.Items[i].Name,
+		})
+	}
+
+	secretList := &corev1.SecretList{}
+	if err := r.Client.List(ctx, secretList, client.InNamespace(td.Namespace)); err != nil {
+		input.Incomplete = append(input.Incomplete, "secrets: "+err.Error())
+	}
+	for i := range secretList.Items {
+		input.OperatorNamespaceObjects = append(input.OperatorNamespaceObjects, verify.ObjectRef{
+			Kind:      "Secret",
+			Namespace: secretList.Items[i].Namespace,
+			Name:      secretList.Items[i].Name,
 		})
 	}
 

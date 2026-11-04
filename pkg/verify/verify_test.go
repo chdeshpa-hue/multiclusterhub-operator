@@ -139,3 +139,67 @@ func TestReportSortsDeterministically(t *testing.T) {
 }
 
 var _ operatorv1.ResidueItem
+
+// P-1/E-2: core-group objects in the preserved namespace are counted, not
+// classified as residue, and they do not change the verdict.
+func TestEvaluateOperatorNamespaceObjectsAreUnclassified(t *testing.T) {
+	in := Input{
+		Namespaces: []string{"open-cluster-management", "kube-system"},
+		OperatorNamespaceObjects: []ObjectRef{
+			{Kind: "ConfigMap", Namespace: "open-cluster-management", Name: "leftover-config"},
+			{Kind: "Secret", Namespace: "open-cluster-management", Name: "leftover-secret"},
+		},
+	}
+
+	report := Evaluate(in, testPolicy)
+
+	if len(report.Unclassified) != 2 {
+		t.Fatalf("unclassified = %+v, want 2", report.Unclassified)
+	}
+	if len(report.Residue) != 0 {
+		t.Fatalf("core objects must not be residue: %+v", report.Residue)
+	}
+	if !report.Complete {
+		t.Fatalf("disclosure must not change the verdict: %+v", report)
+	}
+}
+
+// P-3: a declared keep-object is an expected survivor, not unclassified.
+func TestEvaluateDeclaredKeepObjectIsExpected(t *testing.T) {
+	policy := testPolicy
+	policy.KeepObjects = []ObjectRef{
+		{Group: "", Kind: "ConfigMap", Namespace: "open-cluster-management", Name: "kept"},
+	}
+	in := Input{
+		Namespaces: []string{"open-cluster-management"},
+		OperatorNamespaceObjects: []ObjectRef{
+			{Kind: "ConfigMap", Namespace: "open-cluster-management", Name: "kept"},
+		},
+	}
+
+	report := Evaluate(in, policy)
+
+	if len(report.Unclassified) != 0 {
+		t.Fatalf("declared object was classified unclassified: %+v", report.Unclassified)
+	}
+	found := false
+	for _, item := range report.Expected {
+		if item.Name == "kept" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("declared object missing from expected survivors: %+v", report.Expected)
+	}
+}
+
+// P-2: a namespace with nothing to disclose stays silent.
+func TestEvaluateNoOperatorNamespaceObjectsStaySilent(t *testing.T) {
+	in := Input{Namespaces: []string{"open-cluster-management"}}
+
+	report := Evaluate(in, testPolicy)
+
+	if len(report.Unclassified) != 0 {
+		t.Fatalf("unclassified = %+v, want none", report.Unclassified)
+	}
+}
