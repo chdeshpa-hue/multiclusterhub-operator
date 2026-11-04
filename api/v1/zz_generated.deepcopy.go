@@ -468,6 +468,10 @@ func (in *HubTeardownStatus) DeepCopyInto(out *HubTeardownStatus) {
 		in, out := &in.ActiveSince, &out.ActiveSince
 		*out = (*in).DeepCopy()
 	}
+	if in.PausedAt != nil {
+		in, out := &in.PausedAt, &out.PausedAt
+		*out = (*in).DeepCopy()
+	}
 	if in.Phases != nil {
 		in, out := &in.Phases, &out.Phases
 		*out = make([]TeardownPhaseStatus, len(*in))

@@ -144,6 +144,13 @@ func (r *HubTeardownReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 func (r *HubTeardownReconciler) reconcileDryRun(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (ctrl.Result, error) {
 	log.Info("Dry-run mode: scanning cluster state")
 
+	// Pausing an active teardown stops the deadline from accruing. The shift is
+	// applied on resume, so a long pause cannot fail a later run.
+	if td.Status.ActiveSince != nil && td.Status.PausedAt == nil {
+		now := metav1.Now()
+		td.Status.PausedAt = &now
+	}
+
 	graph, err := r.buildDependencyGraph(ctx, log)
 	if err != nil {
 		r.setCondition(td, conditionTypeDryRunComplete, metav1.ConditionFalse, "ScanFailed",
@@ -202,6 +209,12 @@ func (r *HubTeardownReconciler) reconcileDryRun(ctx context.Context, log logr.Lo
 func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (ctrl.Result, error) {
 	log.Info("Active teardown mode", "phase", td.Status.Phase)
 
+	// Failed is terminal. Editing the CR does not resume a failed run; a new
+	// HubTeardown is the retry mechanism.
+	if td.Status.Phase == operatorv1.TeardownPhaseFailed {
+		return ctrl.Result{}, nil
+	}
+
 	// Track when active teardown started for overall stall detection.
 	// On the first active reconcile, re-scan the cluster to detect
 	// changes since the dry-run report was generated.
@@ -257,44 +270,28 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 		}
 		return ctrl.Result{}, nil
 	}
+	// The deadline does not accrue while the CR is paused. Shift the start
+	// forward by the paused interval before evaluating it.
+	if td.Status.PausedAt != nil && td.Status.ActiveSince != nil {
+		shifted := td.Status.ActiveSince.Add(time.Since(td.Status.PausedAt.Time))
+		td.Status.ActiveSince = &metav1.Time{Time: shifted}
+		td.Status.PausedAt = nil
+		if err := r.Client.Status().Update(ctx, td); err != nil {
+			log.Error(err, "Failed to resume the teardown clock")
+		}
+	}
+
 	maxDur := defaultMaxDuration
 	if td.Spec.MaxDuration != nil {
 		maxDur = td.Spec.MaxDuration.Duration
 	}
 	elapsed := time.Since(td.Status.ActiveSince.Time)
-	wasStalled := r.isConditionTrue(td, conditionTypeTeardownStalled)
 	if elapsed > maxDur {
-		stalledMsg := fmt.Sprintf("Teardown has been running for %s (limit: %s), currently stuck at phase %s.",
-			elapsed.Round(time.Second), maxDur.Round(time.Second), td.Status.Phase)
-		for _, ps := range td.Status.Phases {
-			if ps.State == operatorv1.PhaseStateInProgress && ps.Message != "" {
-				stalledMsg += " " + ps.Message
-				break
-			}
-		}
-		if !td.Spec.ApprovedDestructiveActions {
-			switch td.Status.Phase {
-			case operatorv1.TeardownPhaseDisableAddons, operatorv1.TeardownPhaseDetachManagedClusters,
-				operatorv1.TeardownPhaseDeleteMCH:
-				stalledMsg += " Consider setting spec.approvedDestructiveActions=true to resolve stuck Tier 2 finalizers."
-			}
-		}
-		if !td.Spec.AcknowledgeCloudResourceRisk {
-			if td.Status.Phase == operatorv1.TeardownPhaseDeleteInfrastructureCRs {
-				stalledMsg += " Consider setting spec.acknowledgeCloudResourceRisk=true to resolve stuck Tier 1 (cloud) finalizers."
-			}
-		}
-		r.setCondition(td, conditionTypeTeardownStalled, metav1.ConditionTrue, "TeardownStalled", stalledMsg)
-		if err := r.Client.Status().Update(ctx, td); err != nil {
-			log.Error(err, "Failed to update Stalled condition")
-		}
-		if !wasStalled {
-			r.Recorder.Event(td, corev1.EventTypeWarning, "TeardownStalled", stalledMsg)
-		}
-		log.Info("Teardown stalled", "elapsed", elapsed.Round(time.Second), "limit", maxDur.Round(time.Second))
-	} else if wasStalled {
+		return r.failOnTimeout(ctx, log, td, elapsed, maxDur)
+	}
+	if r.isConditionTrue(td, conditionTypeTeardownStalled) {
 		r.setCondition(td, conditionTypeTeardownStalled, metav1.ConditionFalse, "NotStalled",
-			"Teardown no longer stalled after maxDuration was increased.")
+			"Teardown is running within spec.maxDuration.")
 		if err := r.Client.Status().Update(ctx, td); err != nil {
 			log.Error(err, "Failed to clear Stalled condition")
 		}

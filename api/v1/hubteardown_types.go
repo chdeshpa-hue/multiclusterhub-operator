@@ -147,6 +147,12 @@ type HubTeardownStatus struct {
 	// +optional
 	ActiveSince *metav1.Time `json:"activeSince,omitempty"`
 
+	// PausedAt records when the admin paused an active teardown by setting
+	// dryRun back to true. The deadline does not accrue while paused: on
+	// resume ActiveSince is shifted forward by the paused interval.
+	// +optional
+	PausedAt *metav1.Time `json:"pausedAt,omitempty"`
+
 	// Phases tracks the status of each teardown phase.
 	// +optional
 	Phases []TeardownPhaseStatus `json:"phases,omitempty"`

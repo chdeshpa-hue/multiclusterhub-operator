@@ -33,7 +33,10 @@ import (
 
 var _ = Describe("HubTeardown controller", func() {
 	const (
-		tdTimeout  = time.Second * 30
+		// The controller requeues active work every 15s, so a 30s window
+		// allowed only two attempts and failed intermittently when the suite
+		// was under load.
+		tdTimeout  = time.Second * 90
 		tdInterval = time.Millisecond * 250
 		tdName     = "teardown"
 		tdNs       = "open-cluster-management"

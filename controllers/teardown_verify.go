@@ -47,6 +47,18 @@ var verifyKeepCRDs = []string{
 	"internalhubcomponents.operator.open-cluster-management.io",
 }
 
+// verifyPolicy is the classification policy shared by Verify and the timeout
+// path, so a failed run reports residue the same way a completed one does.
+func verifyPolicy(td *operatorv1.HubTeardown) verify.Policy {
+	return verify.Policy{
+		OperatorNamespace: td.Namespace,
+		ACMGroupSuffixes:  acmAPIGroupSuffixes,
+		ACMNamespaces:     verifyACMNamespaces,
+		KeepCRDs:          verifyKeepCRDs,
+		OperatorAPIGroup:  verifyOperatorAPIGroup,
+	}
+}
+
 // phaseVerify is the postcondition phase. It observes, classifies and writes
 // the terminal state; it deletes nothing.
 func (r *HubTeardownReconciler) phaseVerify(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error) {
@@ -60,14 +72,7 @@ func (r *HubTeardownReconciler) phaseVerify(ctx context.Context, log logr.Logger
 		log.Info("Verification inventory is incomplete", "details", input.Incomplete)
 	}
 
-	policy := verify.Policy{
-		OperatorNamespace: td.Namespace,
-		ACMGroupSuffixes:  acmAPIGroupSuffixes,
-		ACMNamespaces:     verifyACMNamespaces,
-		KeepCRDs:          verifyKeepCRDs,
-		OperatorAPIGroup:  verifyOperatorAPIGroup,
-	}
-	report := verify.Evaluate(input, policy)
+	report := verify.Evaluate(input, verifyPolicy(td))
 
 	now := metav1.Now()
 	td.Status.Residue = &operatorv1.ResidueReport{

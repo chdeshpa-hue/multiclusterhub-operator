@@ -540,6 +540,13 @@ spec:
                   read as an observation rather than as a missing scan.
                 format: date-time
                 type: string
+              pausedAt:
+                description: |-
+                  PausedAt records when the admin paused an active teardown by setting
+                  dryRun back to true. The deadline does not accrue while paused: on
+                  resume ActiveSince is shifted forward by the paused interval.
+                format: date-time
+                type: string
               phase:
                 description: Phase is the current high-level phase of the teardown
                   process.
