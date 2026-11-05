@@ -208,3 +208,30 @@ func (r *HubTeardownReconciler) jobState(ctx context.Context, td *operatorv1.Hub
 	}
 	return true, nil, nil
 }
+
+// teardownJobFailure reports whether one teardown Job is terminally failed, and
+// with which condition reason. A Job whose pod has exhausted backoffLimit never
+// writes another line of progress, so callers must not infer "still running"
+// from an unchanged progress record.
+func (r *HubTeardownReconciler) teardownJobFailure(ctx context.Context, td *operatorv1.HubTeardown, jobName string) (bool, string, error) {
+	exists, terminal, err := r.jobState(ctx, td, jobName)
+	if err != nil || !exists || terminal == nil {
+		return false, "", err
+	}
+	if *terminal != batchv1.JobFailed {
+		return false, "", nil
+	}
+	reason := string(batchv1.JobFailed)
+	jobKey := types.NamespacedName{Name: jobName, Namespace: teardownNamespace(td)}
+	job := &batchv1.Job{}
+	if err := r.Client.Get(ctx, jobKey, job); err == nil {
+		for i := range job.Status.Conditions {
+			cond := job.Status.Conditions[i]
+			if cond.Type == batchv1.JobFailed && cond.Reason != "" {
+				reason = cond.Reason
+				break
+			}
+		}
+	}
+	return true, reason, nil
+}

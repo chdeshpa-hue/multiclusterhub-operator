@@ -24,6 +24,7 @@ import (
 var acmAPIGroupSuffixes = []string{
 	"open-cluster-management.io",
 	"hive.openshift.io",
+	"hiveinternal.openshift.io",
 	"agent-install.openshift.io",
 	"hypershift.openshift.io",
 	"multicluster.openshift.io",
@@ -37,6 +38,7 @@ var acmAPIGroupSuffixes = []string{
 var acmOwnedGroupSuffixes = []string{
 	"open-cluster-management.io",
 	"hive.openshift.io",
+	"hiveinternal.openshift.io",
 	"agent-install.openshift.io",
 	"hypershift.openshift.io",
 	"multicluster.openshift.io",

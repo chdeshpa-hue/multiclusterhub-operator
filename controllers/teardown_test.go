@@ -125,6 +125,7 @@ func TestIsACMAPIGroup(t *testing.T) {
 		{"cluster.open-cluster-management.io", true},
 		{"addon.open-cluster-management.io", true},
 		{"hive.openshift.io", true},
+		{"hiveinternal.openshift.io", true},
 		{"agent-install.openshift.io", true},
 		{"hypershift.openshift.io", true},
 		{"multicluster.openshift.io", true},

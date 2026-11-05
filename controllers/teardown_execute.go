@@ -1189,12 +1189,24 @@ func (r *HubTeardownReconciler) phaseDeleteACMCRDs(ctx context.Context, log logr
 		}
 		for j := range list.Items {
 			item := &list.Items[j]
-			if item.GetDeletionTimestamp() != nil && len(item.GetFinalizers()) > 0 {
-				log.Info("Stuck-terminating CR blocks CRD deletion — the handoff path must resolve this finalizer",
-					"crd", crd.Name, "cr", item.GetName(), "namespace", item.GetNamespace(),
-					"finalizers", item.GetFinalizers())
-				return false, nil
+			if item.GetDeletionTimestamp() == nil || len(item.GetFinalizers()) == 0 {
+				continue
 			}
+			// Deleting the CRD now would wedge it in Terminating behind a CR
+			// nobody is left to finalize. Resolve the finalizer here, using the
+			// same tiered gate every other phase uses, and only report the CR as
+			// blocking while it still carries one.
+			if r.shouldResolveStuckFinalizers(td, item) {
+				dr := drFromUnstructured(item, crd.Spec.Group, version, crd.Spec.Names.Kind)
+				if _, err := r.resolveStuckFinalizers(ctx, log, td, []DiscoveredResource{dr}); err != nil {
+					log.Error(err, "Error resolving finalizers on stuck-terminating CR",
+						"crd", crd.Name, "cr", item.GetName(), "namespace", item.GetNamespace())
+				}
+			}
+			log.Info("Stuck-terminating CR blocks CRD deletion",
+				"crd", crd.Name, "cr", item.GetName(), "namespace", item.GetNamespace(),
+				"finalizers", item.GetFinalizers())
+			return false, nil
 		}
 	}
 

@@ -158,6 +158,16 @@ func (r *HubTeardownReconciler) ensureHandoff(ctx context.Context, log logr.Logg
 	if err := r.ensureHandoffRBAC(ctx, log, td); err != nil {
 		return err
 	}
+	// Once every prepare phase is recorded complete the Job is finished and
+	// finishPrepareJob deletes it. Re-creating it here puts a second writer on
+	// the shared progress record while the handoff Job is running (D9b-2).
+	prepareDone, _, err := r.prepareProgressComplete(ctx, td)
+	if err != nil {
+		return err
+	}
+	if prepareDone {
+		return nil
+	}
 	if err := r.ensurePrepareJob(ctx, log, td); err != nil {
 		return err
 	}

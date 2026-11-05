@@ -325,11 +325,12 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 		r.Recorder.Event(td, corev1.EventTypeNormal, "StallCleared", "Teardown no longer stalled")
 	}
 
-	if err := r.ensureHandoff(ctx, log, td); err != nil {
+	handoffErr := r.ensureHandoff(ctx, log, td)
+	if handoffErr != nil {
 		// Visible, not fatal: teardown can still finish in-process, but the
 		// missing handoff identity must never be silent (J-6).
-		r.setCondition(td, conditionTypeHandoffReady, metav1.ConditionFalse, "HandoffUnavailable", err.Error())
-		log.Error(err, "Failed to ensure teardown handoff (controller will continue without resilient Job)")
+		r.setCondition(td, conditionTypeHandoffReady, metav1.ConditionFalse, "HandoffUnavailable", handoffErr.Error())
+		log.Error(handoffErr, "Failed to ensure teardown handoff (controller will continue without resilient Job)")
 	} else if teardownConsentGiven(td) {
 		r.setCondition(td, conditionTypeHandoffReady, metav1.ConditionTrue, "HandoffReady",
 			fmt.Sprintf("Handoff Job runs as ServiceAccount %s bound to ClusterRole %s.", handoffSAName, handoffRoleName))
@@ -367,11 +368,38 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 		return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
 	}
 
+	// A Job that cannot be created is not a running Job. The destructive work
+	// lives in the Job, so an unavailable handoff must be reported as the
+	// reason teardown is not progressing rather than hidden behind
+	// PrepareJobRunning.
+	if handoffErr != nil && teardownConsentGiven(td) {
+		r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionTrue, "HandoffUnavailable",
+			"The destructive Job cannot start: "+handoffErr.Error())
+		if statusErr := r.Client.Status().Update(ctx, td); statusErr != nil {
+			log.Error(statusErr, "Failed to persist handoff failure")
+		}
+		return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
+	}
+
 	prepareDone, progress, err := r.prepareProgressComplete(ctx, td)
 	if err != nil {
 		log.Error(err, "Failed to read prepare progress")
 	}
 	if !prepareDone {
+		// A failed Job never writes the progress record its phases would have
+		// completed, so reading progress alone reports a dead Job as running
+		// forever. Surface the terminal state and stop claiming progress.
+		if failed, reason, jobErr := r.teardownJobFailure(ctx, td, prepareJobName); jobErr != nil {
+			log.Error(jobErr, "Failed to read prepare Job state")
+		} else if failed {
+			r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionTrue, "PrepareJobFailed",
+				fmt.Sprintf("The prepare Job reached %s; delete Job %s/%s to retry, or inspect its logs for the cause.",
+					reason, teardownNamespace(td), prepareJobName))
+			if statusErr := r.Client.Status().Update(ctx, td); statusErr != nil {
+				log.Error(statusErr, "Failed to persist prepare failure")
+			}
+			return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
+		}
 		r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionTrue, "PrepareJobRunning",
 			"The prepare Job is executing the destructive phases; the operator does not duplicate them.")
 		if statusErr := r.Client.Status().Update(ctx, td); statusErr != nil {
