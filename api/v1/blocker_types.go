@@ -28,6 +28,10 @@ const (
 	// EvidenceControllerAbsent is evidence of STALENESS, not ownership.
 	// It must never participate in the confidence calculation.
 	EvidenceControllerAbsent EvidenceKind = "ControllerAbsent"
+	// EvidenceControllerLiveness records what the owner probe observed: a
+	// workload with ready replicas, a workload with none, or an unreadable
+	// workload. Like ControllerAbsent it bears on liveness, never ownership.
+	EvidenceControllerLiveness EvidenceKind = "ControllerLiveness"
 	// EvidenceNameMatch is report-only. It is never sufficient for a
 	// destructive action.
 	EvidenceNameMatch EvidenceKind = "NameMatch"

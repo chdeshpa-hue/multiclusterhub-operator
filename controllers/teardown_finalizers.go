@@ -26,11 +26,25 @@ const (
 	FinalizerTier2NonCloud               // Protects Kubernetes-level state only
 )
 
+// controllerWorkload names the operand expected to process a finalizer.
+// Resolution is by identity (kind/namespace/name), never by name prefix.
+type controllerWorkload struct {
+	Kind      string
+	Namespace string
+	Name      string
+}
+
 // finalizerEntry describes a known finalizer and its risk classification.
+//
+// Controller is set only where the finalizer's owning operand is known from
+// the live hub or the operand's own registration path. A nil Controller is
+// deliberate: it means the responsible workload is unknown, which makes the
+// blocker Unresolved and fail-closed (WaitForController) rather than guessed.
 type finalizerEntry struct {
 	Finalizer   string
 	Tier        FinalizerTier
 	Description string
+	Controller  *controllerWorkload
 }
 
 // cloudProtectingFinalizers is the Tier 1 allowlist: finalizers that protect cloud infrastructure.
@@ -39,11 +53,13 @@ var cloudProtectingFinalizers = []finalizerEntry{
 		Finalizer:   "hypershift.openshift.io/finalizer",
 		Tier:        FinalizerTier1Cloud,
 		Description: "Hypershift cluster/nodepool/HCP lifecycle: VMs, LBs, security groups, DNS, control-plane infra",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "hypershift", Name: "operator"},
 	},
 	{
 		Finalizer:   "hypershift.io/aws-oidc-discovery",
 		Tier:        FinalizerTier1Cloud,
 		Description: "AWS S3 OIDC discovery documents",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "hypershift", Name: "operator"},
 	},
 	{
 		Finalizer:   "hypershift.openshift.io/control-plane-operator-finalizer",
@@ -54,6 +70,7 @@ var cloudProtectingFinalizers = []finalizerEntry{
 		Finalizer:   "hive.openshift.io/deprovision",
 		Tier:        FinalizerTier1Cloud,
 		Description: "Full cluster infrastructure deprovisioning: VMs, networking, storage, DNS",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "multicluster-engine", Name: "hive-operator"},
 	},
 	{
 		Finalizer:   "agentserviceconfig.agent-install.openshift.io/ai-deprovision",
@@ -88,6 +105,7 @@ var nonCloudFinalizers = []finalizerEntry{
 		Finalizer:   "managedcluster-import-controller.open-cluster-management.io/cleanup",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "Import controller state cleanup",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "open-cluster-management", Name: "managedcluster-import-controller-v2"},
 	},
 	{
 		Finalizer:   "open-cluster-management/managedclusterrole",
@@ -98,26 +116,31 @@ var nonCloudFinalizers = []finalizerEntry{
 		Finalizer:   "cluster.open-cluster-management.io/api-resource-cleanup",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "ManagedCluster API resource cleanup",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "multicluster-engine", Name: "cluster-manager"},
 	},
 	{
 		Finalizer:   "addon.open-cluster-management.io/addon-pre-delete",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "Addon pre-delete hook execution",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "multicluster-engine", Name: "cluster-manager"},
 	},
 	{
 		Finalizer:   "work.open-cluster-management.io/manifest-work-cleanup",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "ManifestWork cleanup",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "multicluster-engine", Name: "cluster-manager"},
 	},
 	{
 		Finalizer:   "cluster.open-cluster-management.io/manifest-work-cleanup",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "ManagedCluster manifest-work cleanup (agent-side)",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "multicluster-engine", Name: "cluster-manager"},
 	},
 	{
 		Finalizer:   "agent.open-cluster-management.io/klusterletadmissioncontroller",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "Klusterlet admission controller cleanup (agent-side, requires running agent)",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "open-cluster-management", Name: "klusterlet-addon-controller-v2"},
 	},
 	{
 		Finalizer:   "cluster.open-cluster-management.io/managedclusterrole-cleanup",
@@ -128,6 +151,7 @@ var nonCloudFinalizers = []finalizerEntry{
 		Finalizer:   "registration.open-cluster-management.io/managedcluster-cleanup",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "Registration hub controller ManagedCluster cleanup",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "multicluster-engine", Name: "cluster-manager"},
 	},
 	{
 		Finalizer:   "operator.open-cluster-management.io/klusterlet-hosted-cleanup",
@@ -138,26 +162,31 @@ var nonCloudFinalizers = []finalizerEntry{
 		Finalizer:   "observability.open-cluster-management.io/res-cleanup",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "Observability custom resource cleanup",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "open-cluster-management", Name: "multicluster-observability-operator"},
 	},
 	{
 		Finalizer:   "observability.open-cluster-management.io/addon-cleanup",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "Observability addon cleanup",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "open-cluster-management", Name: "multicluster-observability-operator"},
 	},
 	{
 		Finalizer:   "search.open-cluster-management.io/finalizer",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "Search index and operator cleanup",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "open-cluster-management", Name: "search-v2-operator-controller-manager"},
 	},
 	{
 		Finalizer:   "submarineraddon.open-cluster-management.io/submariner-addon-cleanup",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "Submariner addon agent cleanup",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "open-cluster-management", Name: "submariner-addon"},
 	},
 	{
 		Finalizer:   "cluster.open-cluster-management.io/submariner-cleanup",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "Submariner cluster-level cleanup",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "open-cluster-management", Name: "submariner-addon"},
 	},
 	{
 		Finalizer:   "uninstall-helm-release",
@@ -168,6 +197,7 @@ var nonCloudFinalizers = []finalizerEntry{
 		Finalizer:   "clusterinstance.siteconfig.open-cluster-management.io/finalizer",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "SiteConfig ClusterInstance cleanup",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "open-cluster-management", Name: "siteconfig-controller-manager"},
 	},
 	{
 		Finalizer:   "restores.cluster.open-cluster-management.io/finalizer",
@@ -178,21 +208,25 @@ var nonCloudFinalizers = []finalizerEntry{
 		Finalizer:   "operator.open-cluster-management.io/cluster-manager-cleanup",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "ClusterManager CRD and resource cleanup",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "multicluster-engine", Name: "cluster-manager"},
 	},
 	{
 		Finalizer:   "hypershift.openshift.io/component-finalizer",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "CAPI provider deployments (no cloud infrastructure)",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "hypershift", Name: "operator"},
 	},
 	{
 		Finalizer:   "finalizer.operator.open-cluster-management.io",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "MCH operator hub finalizer",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "open-cluster-management", Name: "multiclusterhub-operator"},
 	},
 	{
 		Finalizer:   "finalizer.multicluster.openshift.io",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "MCE operator backplane finalizer",
+		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "multicluster-engine", Name: "backplane-operator"},
 	},
 }
 
@@ -232,6 +266,23 @@ func ClassifyFinalizer(finalizer string) (FinalizerTier, string) {
 		}
 	}
 	return FinalizerTierUnknown, "Unknown finalizer (not in allowlist)"
+}
+
+// finalizerController returns the operand expected to process a finalizer, or
+// nil when the allowlist has no evidence-backed owner. The lookup is by exact
+// finalizer identity, never by name prefix.
+func finalizerController(finalizer string) *controllerWorkload {
+	for _, entry := range cloudProtectingFinalizers {
+		if entry.Finalizer == finalizer {
+			return entry.Controller
+		}
+	}
+	for _, entry := range nonCloudFinalizers {
+		if entry.Finalizer == finalizer {
+			return entry.Controller
+		}
+	}
+	return nil
 }
 
 // patchFinalizerOffResource removes a specific finalizer from a resource, respecting tier gates.

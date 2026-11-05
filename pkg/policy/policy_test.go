@@ -120,6 +120,14 @@ func TestEvaluate(t *testing.T) {
 			wantAction: ActionSweepDanglingRegistration,
 		},
 		{
+			name: "P-9 unreachable spoke overrides a live hub controller",
+			mutate: func(b *Blocker) {
+				b.Classification = ClassUnreachableSpoke
+				b.ControllerAlive = boolPtr(true)
+			},
+			wantAction: ActionResolveFinalizer,
+		},
+		{
 			name: "no finalizers is report only even when the controller is dead",
 			mutate: func(b *Blocker) {
 				b.Finalizers = nil

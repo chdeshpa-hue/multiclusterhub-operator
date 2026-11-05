@@ -40,6 +40,22 @@ func Evaluate(b Blocker, consent ConsentState) Decision {
 			reason += "; related fix " + b.RelatedFix
 		}
 		return Decision{Action: ActionFixOperand, Reason: reason}
+	case ClassUnreachableSpoke:
+		// No agent on the spoke will ever process this finalizer. Waiting on
+		// hub-controller liveness would reproduce the historical recreate
+		// loop, so the hub-side cleanup is the only path that terminates.
+		if b.CloudRisk != nil && b.CloudRisk.MayOrphan && !consent.CloudRiskValid() {
+			return Decision{
+				Action:          ActionResolveFinalizerWithConsent,
+				RequiresConsent: true,
+				ConsentReason:   consentReason(b),
+				Reason:          "the spoke is unreachable and acting may orphan resources outside the cluster",
+			}
+		}
+		return Decision{
+			Action: ActionResolveFinalizer,
+			Reason: "the spoke is unreachable, so the hub must clear this finalizer",
+		}
 	}
 
 	if b.ControllerAlive == nil {

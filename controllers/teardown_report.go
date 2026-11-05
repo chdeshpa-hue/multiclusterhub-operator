@@ -124,24 +124,35 @@ func blockersFromGraph(graph *DependencyGraph, scanTime metav1.Time, consent pol
 			continue
 		}
 
+		classification := dr.Classification
+		if classification == "" {
+			if cloud {
+				classification = operatorv1.ClassCloudProtecting
+			} else {
+				classification = operatorv1.ClassUnknown
+			}
+		}
+
 		blocker := operatorv1.Blocker{
-			APIVersion:      apiVersionFor(dr.Ref, dr.Version),
-			Kind:            dr.Ref.Kind,
-			Name:            dr.Ref.Name,
-			Namespace:       dr.Ref.Namespace,
-			UID:             dr.UID,
-			Finalizers:      append([]string(nil), dr.Finalizers...),
-			BlockedSince:    scanTime,
-			ObservedInPhase: operatorv1.TeardownPhaseInspecting,
-			Ownership:       dr.Ownership,
-			Classification:  operatorv1.ClassUnknown,
+			APIVersion:         apiVersionFor(dr.Ref, dr.Version),
+			Kind:               dr.Ref.Kind,
+			Name:               dr.Ref.Name,
+			Namespace:          dr.Ref.Namespace,
+			UID:                dr.UID,
+			Finalizers:         append([]string(nil), dr.Finalizers...),
+			BlockedSince:       scanTime,
+			ObservedInPhase:    operatorv1.TeardownPhaseInspecting,
+			Ownership:          dr.Ownership,
+			Classification:     classification,
+			OwningController:   dr.OwningController,
+			ControllerAlive:    dr.ControllerAlive,
+			ControllerEvidence: append([]operatorv1.Evidence(nil), dr.ControllerEvidence...),
 		}
 		if dr.DeletionTimestamp != nil {
 			blocker.DeletionTimestamp = dr.DeletionTimestamp.DeepCopy()
 			blocker.BlockedSince = *dr.DeletionTimestamp
 		}
 		if cloud {
-			blocker.Classification = operatorv1.ClassCloudProtecting
 			blocker.CloudRisk = &operatorv1.CloudRisk{
 				Platform:     dr.Platform,
 				ResourceType: dr.Ref.Kind,

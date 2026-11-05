@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
@@ -108,10 +109,26 @@ type DiscoveredResource struct {
 	// classifyOwnership after the whole scan has completed, because the owner
 	// chain needs every object in the index.
 	Ownership operatorv1.OwnershipVerdict
+
+	// AvailableStatus and AvailableSince are the ManagedCluster Available
+	// condition, read once here because the scan is the only place that holds
+	// the object body. The unreachable-spoke rule needs the transition time to
+	// distinguish a spoke that is starting from one that is gone.
+	AvailableStatus string
+	AvailableSince  *metav1.Time
+
+	// Classification, OwningController, ControllerAlive and ControllerEvidence
+	// are the classification pass output consumed by pkg/policy. They live on
+	// the scan record so the report, status and verification all read the same
+	// verdict without re-probing the cluster.
+	Classification     operatorv1.Classification
+	OwningController   *operatorv1.ControllerRef
+	ControllerAlive    *bool
+	ControllerEvidence []operatorv1.Evidence
 }
 
 // buildDependencyGraph scans the cluster for all ACM/MCE resources and classifies them.
-func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, log logr.Logger) (*DependencyGraph, error) {
+func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, td *operatorv1.HubTeardown, log logr.Logger) (*DependencyGraph, error) {
 	graph := &DependencyGraph{ScanTime: metav1.Now()}
 
 	crdList := &apixv1.CustomResourceDefinitionList{}
@@ -145,6 +162,7 @@ func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, log lo
 	r.classifyAddons(graph)
 	r.findMCHAndMCE(graph)
 	r.classifyOwnership(graph)
+	r.classifyBlockerBehaviour(ctx, graph, r.previousBlockerUIDs(ctx, td, log))
 
 	return graph, nil
 }
@@ -246,7 +264,36 @@ func newDiscoveredResource(item *unstructured.Unstructured, crd *apixv1.CustomRe
 
 	// Extract platform for Hypershift HostedClusters and Hive ClusterDeployments
 	dr.Platform = detectPlatform(crd.Spec.Names.Kind, item)
+	if crd.Spec.Group == "cluster.open-cluster-management.io" && crd.Spec.Names.Kind == "ManagedCluster" {
+		dr.AvailableStatus, dr.AvailableSince = availableCondition(item)
+	}
 	return dr
+}
+
+// availableCondition extracts the ManagedCluster Available condition. A
+// missing condition is returned as empty, not Unknown: absence of evidence is
+// not evidence that the spoke is unreachable.
+func availableCondition(item *unstructured.Unstructured) (string, *metav1.Time) {
+	conditions, ok, _ := unstructured.NestedSlice(item.Object, "status", "conditions")
+	if !ok {
+		return "", nil
+	}
+	for _, raw := range conditions {
+		condition, ok := raw.(map[string]interface{})
+		if !ok || condition["type"] != "Available" {
+			continue
+		}
+		status, _ := condition["status"].(string)
+		var since *metav1.Time
+		if value, ok := condition["lastTransitionTime"].(string); ok {
+			if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+				observed := metav1.NewTime(parsed)
+				since = &observed
+			}
+		}
+		return status, since
+	}
+	return "", nil
 }
 
 // classifyOwnership answers "does this installation own this object?" from

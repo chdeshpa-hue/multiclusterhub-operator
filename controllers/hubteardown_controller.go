@@ -163,7 +163,7 @@ func (r *HubTeardownReconciler) reconcileDryRun(ctx context.Context, log logr.Lo
 		td.Status.PausedAt = &now
 	}
 
-	graph, err := r.buildDependencyGraph(ctx, log)
+	graph, err := r.buildDependencyGraph(ctx, td, log)
 	if err != nil {
 		r.setCondition(td, conditionTypeDryRunComplete, metav1.ConditionFalse, "ScanFailed",
 			fmt.Sprintf("Dependency graph scan failed: %v", err))
@@ -233,7 +233,7 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 	// has nothing to consent to until the scan has run. When a dry-run report
 	// already exists, the re-scan also records whether the cluster drifted.
 	if td.Status.ActiveSince == nil {
-		graph, err := r.buildDependencyGraph(ctx, log)
+		graph, err := r.buildDependencyGraph(ctx, td, log)
 		if err != nil {
 			log.Error(err, "Failed to scan on activation; proceeding without a fresh report")
 		} else {

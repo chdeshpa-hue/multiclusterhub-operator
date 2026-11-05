@@ -137,7 +137,7 @@ func (r *HubTeardownReconciler) phaseVerify(ctx context.Context, log logr.Logger
 // list is recorded as incomplete rather than aborting: the phase can still
 // report what it saw, it just cannot claim absence.
 func (r *HubTeardownReconciler) observeForVerification(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (verify.Input, error) {
-	graph, err := r.buildDependencyGraph(ctx, log)
+	graph, err := r.buildDependencyGraph(ctx, td, log)
 	if err != nil {
 		return verify.Input{}, fmt.Errorf("scanning for verification: %w", err)
 	}
