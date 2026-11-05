@@ -40,6 +40,18 @@ func Classify(obj metav1.PartialObjectMetadata, idx *inventory.Index, mch types.
 		})
 	}
 
+	if ev, ok := mchIdentityEvidence(obj, mch, observedAt); ok {
+		evidence = append(evidence, ev)
+	}
+	if ev, ok := acmGroupCRDEvidence(obj, idx, observedAt); ok {
+		evidence = append(evidence, ev)
+	}
+	if ev, ok := managedByEvidence(obj, observedAt); ok {
+		evidence = append(evidence, ev)
+	}
+	if ev, ok := olmOwnerEvidence(obj, observedAt); ok {
+		evidence = append(evidence, ev)
+	}
 	if ev, ok := definingCRDEvidence(obj, idx, mch, observedAt); ok {
 		evidence = append(evidence, ev)
 	}
@@ -77,9 +89,10 @@ func ConfidenceFromEvidence(evidence []Evidence) Confidence {
 	for _, ev := range evidence {
 		var candidate Confidence
 		switch ev.Kind {
-		case EvidenceInstallerLabel, EvidenceOwnerRefChain:
+		case EvidenceInstallerLabel, EvidenceOwnerRefChain, EvidenceMCHIdentity:
 			candidate = ConfidenceDefinitive
-		case EvidenceDefiningCRDLabelled, EvidenceAPIServiceBacking:
+		case EvidenceDefiningCRDLabelled, EvidenceAPIServiceBacking,
+			EvidenceACMGroupCRD, EvidenceManagedByLabel, EvidenceOLMOwner:
 			candidate = ConfidenceStrong
 		case EvidenceNameMatch:
 			candidate = ConfidenceWeak
@@ -155,6 +168,89 @@ func controllerOwner(owners []metav1.OwnerReference) (metav1.OwnerReference, boo
 		}
 	}
 	return owners[0], true
+}
+
+// mchIdentityEvidence recognises the MultiClusterHub itself. Identity is
+// stronger than any label: the hub is the owner, not a tenant.
+func mchIdentityEvidence(obj metav1.PartialObjectMetadata, mch types.NamespacedName, observedAt metav1.Time) (Evidence, bool) {
+	if mch.Name == "" || mch.Namespace == "" || obj.Kind != "MultiClusterHub" {
+		return Evidence{}, false
+	}
+	if obj.GetNamespace() != mch.Namespace || obj.GetName() != mch.Name {
+		return Evidence{}, false
+	}
+	return Evidence{
+		Kind:     EvidenceMCHIdentity,
+		Detail:   fmt.Sprintf("%s/%s is the MultiClusterHub", mch.Namespace, mch.Name),
+		Source:   "metadata.name",
+		Observed: observedAt,
+	}, true
+}
+
+// acmGroupCRDEvidence uses the defining CRD's declared ACM ownership. The
+// index only receives CRDs the scan classified as ACM-owned, so a hit here
+// means the object's kind is part of the ACM/MCE product surface.
+func acmGroupCRDEvidence(obj metav1.PartialObjectMetadata, idx *inventory.Index, observedAt metav1.Time) (Evidence, bool) {
+	group := apiGroup(obj.APIVersion)
+	crd, ok := idx.DefiningCRD(group, obj.Kind)
+	if !ok || !crd.ACMOwned {
+		return Evidence{}, false
+	}
+	return Evidence{
+		Kind:     EvidenceACMGroupCRD,
+		Detail:   fmt.Sprintf("%s/%s is defined by ACM API group %s", group, obj.Kind, crd.Group),
+		Source:   "CustomResourceDefinition.spec.group",
+		Observed: observedAt,
+	}, true
+}
+
+// managedByEvidence reads the marker the hub applies to the operands it
+// manages. It does not depend on installer.* labels, which 5.0 no longer sets
+// on the MCH, the MCE or the ACM namespaces.
+func managedByEvidence(obj metav1.PartialObjectMetadata, observedAt metav1.Time) (Evidence, bool) {
+	labels := obj.GetLabels()
+	if labels["multiclusterhubs.operator.open-cluster-management.io/managed-by"] == "true" {
+		return Evidence{
+			Kind:     EvidenceManagedByLabel,
+			Detail:   "multiclusterhubs.operator.open-cluster-management.io/managed-by=true",
+			Source:   "metadata.labels",
+			Observed: observedAt,
+		}, true
+	}
+	if value := labels["backplaneconfig.name"]; value != "" {
+		return Evidence{
+			Kind:     EvidenceManagedByLabel,
+			Detail:   fmt.Sprintf("backplaneconfig.name=%s", value),
+			Source:   "metadata.labels",
+			Observed: observedAt,
+		}, true
+	}
+	return Evidence{}, false
+}
+
+// olmOwnerEvidence reads the ClusterServiceVersion OLM recorded as the owner.
+func olmOwnerEvidence(obj metav1.PartialObjectMetadata, observedAt metav1.Time) (Evidence, bool) {
+	labels := obj.GetLabels()
+	if labels["olm.managed"] != "true" {
+		return Evidence{}, false
+	}
+	owner := labels["olm.owner"]
+	if !isACMSVName(owner) {
+		return Evidence{}, false
+	}
+	return Evidence{
+		Kind: EvidenceOLMOwner,
+		Detail: fmt.Sprintf("olm.owner=%s olm.owner.namespace=%s",
+			owner, labels["olm.owner.namespace"]),
+		Source:   "metadata.labels",
+		Observed: observedAt,
+	}, true
+}
+
+// isACMSVName reports whether an OLM owner is an ACM or MCE ClusterServiceVersion.
+func isACMSVName(name string) bool {
+	return strings.HasPrefix(name, "advanced-cluster-management.") ||
+		strings.HasPrefix(name, "multicluster-engine.")
 }
 
 func definingCRDEvidence(obj metav1.PartialObjectMetadata, idx *inventory.Index, mch types.NamespacedName, observedAt metav1.Time) (Evidence, bool) {

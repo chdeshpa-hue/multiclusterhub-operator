@@ -21,6 +21,10 @@ const (
 	EvidenceAPIServiceBacking   = operatorv1.EvidenceAPIServiceBacking
 	EvidenceControllerAbsent    = operatorv1.EvidenceControllerAbsent
 	EvidenceNameMatch           = operatorv1.EvidenceNameMatch
+	EvidenceMCHIdentity         = operatorv1.EvidenceMCHIdentity
+	EvidenceACMGroupCRD         = operatorv1.EvidenceACMGroupCRD
+	EvidenceManagedByLabel      = operatorv1.EvidenceManagedByLabel
+	EvidenceOLMOwner            = operatorv1.EvidenceOLMOwner
 )
 
 // Evidence is one observation, with where it was read from.

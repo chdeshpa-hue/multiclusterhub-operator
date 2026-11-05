@@ -28,6 +28,18 @@ var acmAPIGroupSuffixes = []string{
 	"metal3.io",
 }
 
+// acmOwnedGroupSuffixes are the scanned groups whose instances are actually
+// owned by ACM/MCE. metal3.io is scanned because ACM integrates with baremetal
+// provisioning, but the objects belong to the platform, so it is excluded from
+// ownership evidence.
+var acmOwnedGroupSuffixes = []string{
+	"open-cluster-management.io",
+	"hive.openshift.io",
+	"agent-install.openshift.io",
+	"hypershift.openshift.io",
+	"multicluster.openshift.io",
+}
+
 // DependencyGraph holds the scanned cluster state for teardown planning.
 type DependencyGraph struct {
 	// All discovered CRD instances that have finalizers or are blocking teardown.
@@ -121,9 +133,10 @@ func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, log lo
 			})
 		}
 		graph.CRDRefs = append(graph.CRDRefs, inventory.CRDRef{
-			Group:  crd.Spec.Group,
-			Kind:   crd.Spec.Names.Kind,
-			Labels: crd.Labels,
+			Group:    crd.Spec.Group,
+			Kind:     crd.Spec.Names.Kind,
+			Labels:   crd.Labels,
+			ACMOwned: ownsACMGroups(crd.Spec.Group),
 		})
 	}
 
@@ -139,6 +152,16 @@ func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, log lo
 // isACMAPIGroup checks if an API group belongs to the ACM/MCE ecosystem.
 func isACMAPIGroup(group string) bool {
 	for _, suffix := range acmAPIGroupSuffixes {
+		if strings.HasSuffix(group, suffix) || group == suffix {
+			return true
+		}
+	}
+	return false
+}
+
+// ownsACMGroups reports whether instances of a group are ACM/MCE-owned.
+func ownsACMGroups(group string) bool {
+	for _, suffix := range acmOwnedGroupSuffixes {
 		if strings.HasSuffix(group, suffix) || group == suffix {
 			return true
 		}

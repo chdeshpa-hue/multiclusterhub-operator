@@ -255,3 +255,91 @@ func TestBuildInspectReportMarksOwnershipClassified(t *testing.T) {
 		t.Errorf("meta ownership = %q", meta.Ownership)
 	}
 }
+
+// O-6: metal3 is scanned but is not an ACM product surface, so group
+// membership must not authorise ownership of its instances.
+func TestOwnsACMGroups(t *testing.T) {
+	tests := []struct {
+		group string
+		want  bool
+	}{
+		{"cluster.open-cluster-management.io", true},
+		{"operator.open-cluster-management.io", true},
+		{"hive.openshift.io", true},
+		{"agent-install.openshift.io", true},
+		{"hypershift.openshift.io", true},
+		{"multicluster.openshift.io", true},
+		{"metal3.io", false},
+		{"apps", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.group, func(t *testing.T) {
+			if got := ownsACMGroups(tt.group); got != tt.want {
+				t.Errorf("ownsACMGroups(%q) = %v, want %v", tt.group, got, tt.want)
+			}
+		})
+	}
+}
+
+// O-7: the 5.0 hub, where nothing carries installer.* labels. Every object a
+// teardown must remove has to still be recognised as owned.
+func TestClassifyOwnershipWithoutInstallerLabels(t *testing.T) {
+	mch := DiscoveredResource{
+		Ref: operatorv1.ResourceRef{
+			Group:     "operator.open-cluster-management.io",
+			Kind:      "MultiClusterHub",
+			Namespace: "open-cluster-management",
+			Name:      "multiclusterhub",
+		},
+		UID: "mch-uid",
+	}
+	graph := &DependencyGraph{
+		DiscoveredResources: []DiscoveredResource{
+			mch,
+			{
+				Ref:     operatorv1.ResourceRef{Group: "multicluster.openshift.io", Kind: "MultiClusterEngine", Namespace: "multicluster-engine", Name: "multiclusterengine"},
+				UID:     "mce-uid",
+				Version: "v1",
+				Labels: map[string]string{
+					"multiclusterhubs.operator.open-cluster-management.io/managed-by": "true",
+				},
+			},
+			{
+				Ref:     operatorv1.ResourceRef{Group: "operator.open-cluster-management.io", Kind: "ClusterManager", Name: "cluster-manager"},
+				UID:     "cm-uid",
+				Version: "v1",
+				Labels:  map[string]string{"backplaneconfig.name": "multiclusterengine"},
+			},
+			{
+				Ref:     operatorv1.ResourceRef{Group: "cluster.open-cluster-management.io", Kind: "ManagedCluster", Name: "unreachable-1"},
+				UID:     "mc-uid",
+				Version: "v1",
+			},
+			{
+				Ref:     operatorv1.ResourceRef{Group: "agent-install.openshift.io", Kind: "AgentServiceConfig", Name: "agent"},
+				UID:     "asc-uid",
+				Version: "v1",
+			},
+		},
+		CRDRefs: []inventory.CRDRef{
+			{Group: "operator.open-cluster-management.io", Kind: "MultiClusterHub", ACMOwned: true},
+			{Group: "multicluster.openshift.io", Kind: "MultiClusterEngine", ACMOwned: true},
+			{Group: "operator.open-cluster-management.io", Kind: "ClusterManager", ACMOwned: true},
+			{Group: "cluster.open-cluster-management.io", Kind: "ManagedCluster", ACMOwned: true},
+			{Group: "agent-install.openshift.io", Kind: "AgentServiceConfig", ACMOwned: true},
+		},
+	}
+	graph.MCH = &graph.DiscoveredResources[0]
+
+	classifyTestGraph(graph)
+
+	for _, dr := range graph.DiscoveredResources {
+		if !dr.Ownership.Owned {
+			t.Fatalf("%s/%s is not owned on a 5.0 hub: %+v", dr.Ref.Kind, dr.Ref.Name, dr.Ownership)
+		}
+	}
+	if got := graph.DiscoveredResources[0].Ownership.Confidence; got != operatorv1.ConfidenceDefinitive {
+		t.Fatalf("MCH confidence = %s, want Definitive", got)
+	}
+}

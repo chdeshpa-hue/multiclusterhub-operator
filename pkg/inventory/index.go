@@ -21,6 +21,12 @@ type CRDRef struct {
 	Group  string
 	Kind   string
 	Labels map[string]string
+	// ACMOwned records whether this CRD's group is part of the ACM/MCE
+	// product surface, as opposed to merely being scanned by the teardown.
+	// The two are not the same: metal3.io is scanned because ACM installs
+	// baremetal integrations, but its instances are not ACM-owned objects and
+	// must never be authorised for deletion on group membership alone.
+	ACMOwned bool
 }
 
 // Index is an in-memory snapshot of object identity and ownership inputs.

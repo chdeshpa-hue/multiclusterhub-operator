@@ -34,6 +34,14 @@ func metaObject(name, uid, apiVersion, kind string, labels map[string]string, ow
 	return obj
 }
 
+// nsObject is metaObject with a namespace, for namespaced objects such as the
+// MultiClusterHub.
+func nsObject(namespace, name, uid, apiVersion, kind string, labels map[string]string) metav1.PartialObjectMetadata {
+	obj := metaObject(name, uid, apiVersion, kind, labels)
+	obj.SetNamespace(namespace)
+	return obj
+}
+
 func classify(t *testing.T, obj metav1.PartialObjectMetadata, objects []metav1.PartialObjectMetadata, crds []inventory.CRDRef, apiSvc map[string]string) OwnershipVerdict {
 	t.Helper()
 	all := append([]metav1.PartialObjectMetadata{obj}, objects...)
@@ -125,6 +133,57 @@ func TestClassify(t *testing.T) {
 			wantConf:   ConfidenceNone,
 			wantOwned:  false,
 			wantNoKind: EvidenceInstallerLabel,
+		},
+		{
+			name:      "OC-14 the MultiClusterHub is owned by identity",
+			obj:       nsObject(testMCH.Namespace, testMCH.Name, "uid-14", "operator.open-cluster-management.io/v1", "MultiClusterHub", nil),
+			wantConf:  ConfidenceDefinitive,
+			wantOwned: true,
+			wantKind:  EvidenceMCHIdentity,
+		},
+		{
+			name:      "OC-15 instance of an ACM-owned CRD",
+			obj:       metaObject("prod", "uid-15", "cluster.open-cluster-management.io/v1", "ManagedCluster", nil),
+			crds:      []inventory.CRDRef{{Group: "cluster.open-cluster-management.io", Kind: "ManagedCluster", ACMOwned: true}},
+			wantConf:  ConfidenceStrong,
+			wantOwned: true,
+			wantKind:  EvidenceACMGroupCRD,
+		},
+		{
+			name:       "OC-16 scanned but not ACM-owned CRD is not ownership",
+			obj:        metaObject("prod", "uid-16", "metal3.io/v1alpha1", "BareMetalHost", nil),
+			crds:       []inventory.CRDRef{{Group: "metal3.io", Kind: "BareMetalHost", ACMOwned: false}},
+			wantConf:   ConfidenceNone,
+			wantOwned:  false,
+			wantNoKind: EvidenceACMGroupCRD,
+		},
+		{
+			name:      "OC-17 managed-by marker",
+			obj:       metaObject("multiclusterengine", "uid-17", "multicluster.openshift.io/v1", "MultiClusterEngine", map[string]string{"multiclusterhubs.operator.open-cluster-management.io/managed-by": "true"}),
+			wantConf:  ConfidenceStrong,
+			wantOwned: true,
+			wantKind:  EvidenceManagedByLabel,
+		},
+		{
+			name:      "OC-18 backplaneconfig marker",
+			obj:       metaObject("cluster-manager", "uid-18", "operator.open-cluster-management.io/v1", "ClusterManager", map[string]string{"backplaneconfig.name": "multiclusterengine"}),
+			wantConf:  ConfidenceStrong,
+			wantOwned: true,
+			wantKind:  EvidenceManagedByLabel,
+		},
+		{
+			name:      "OC-19 OLM owner is an ACM CSV",
+			obj:       metaObject("multiclusterhub-operator", "uid-19", "apps/v1", "Deployment", map[string]string{"olm.managed": "true", "olm.owner": "advanced-cluster-management.v5.0.0", "olm.owner.namespace": "open-cluster-management"}),
+			wantConf:  ConfidenceStrong,
+			wantOwned: true,
+			wantKind:  EvidenceOLMOwner,
+		},
+		{
+			name:       "OC-20 OLM owner from another product is not ownership",
+			obj:        metaObject("other-operator", "uid-20", "apps/v1", "Deployment", map[string]string{"olm.managed": "true", "olm.owner": "openshift-gitops-operator.v1.22.2", "olm.owner.namespace": "openshift-gitops-operator"}),
+			wantConf:   ConfidenceNone,
+			wantOwned:  false,
+			wantNoKind: EvidenceOLMOwner,
 		},
 		{
 			name:       "OC-13 unrelated webhook named archive-policy-validator",

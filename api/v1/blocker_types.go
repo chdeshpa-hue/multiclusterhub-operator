@@ -31,6 +31,22 @@ const (
 	// EvidenceNameMatch is report-only. It is never sufficient for a
 	// destructive action.
 	EvidenceNameMatch EvidenceKind = "NameMatch"
+	// EvidenceMCHIdentity means the object is the MultiClusterHub itself. The
+	// hub cannot be a tenant of anything on its own cluster, so this is
+	// Definitive without needing a label.
+	EvidenceMCHIdentity EvidenceKind = "MCHIdentity"
+	// EvidenceACMGroupCRD means the CRD defining this object's kind belongs to
+	// the ACM/MCE product surface. On 5.0 the installer.* labels are no longer
+	// applied to the MCH, MCE or the ACM namespaces, so group membership is the
+	// structural signal that survives.
+	EvidenceACMGroupCRD EvidenceKind = "ACMGroupCRD"
+	// EvidenceManagedByLabel is a hub-applied marker that names ACM or MCE as
+	// the managing operator ("multiclusterhubs.operator.../managed-by" or
+	// "backplaneconfig.name").
+	EvidenceManagedByLabel EvidenceKind = "ManagedByLabel"
+	// EvidenceOLMOwner means OLM recorded an ACM or MCE ClusterServiceVersion
+	// as the owner of this object.
+	EvidenceOLMOwner EvidenceKind = "OLMOwner"
 )
 
 // Evidence is one observation, with where it was read from.
