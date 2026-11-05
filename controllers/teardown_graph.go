@@ -5,6 +5,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -422,6 +423,27 @@ func (r *HubTeardownReconciler) classifyManagedClusters(graph *DependencyGraph) 
 			})
 		}
 	}
+
+	// Discovery order is not guaranteed. An order-only difference would make
+	// the status look changed on every resync and rewrite the CR for nothing.
+	sortBlockingResources(graph)
+}
+
+// sortBlockingResources puts the webhook-blocking list in a stable order.
+func sortBlockingResources(graph *DependencyGraph) {
+	sort.Slice(graph.BlockingResources, func(i, j int) bool {
+		a, b := graph.BlockingResources[i], graph.BlockingResources[j]
+		if a.Group != b.Group {
+			return a.Group < b.Group
+		}
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		if a.Namespace != b.Namespace {
+			return a.Namespace < b.Namespace
+		}
+		return a.Name < b.Name
+	})
 }
 
 // classifyAddons collects ManagedClusterAddOns for non-local clusters.

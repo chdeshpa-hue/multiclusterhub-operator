@@ -710,3 +710,24 @@ func TestStatusEquivalentIgnoresObservationTimes(t *testing.T) {
 		t.Fatalf("a phase change must count as a status change")
 	}
 }
+
+func TestBlockingResourcesAreOrdered(t *testing.T) {
+	graph := &DependencyGraph{DiscoveredResources: []DiscoveredResource{
+		testDiscovered("observability.open-cluster-management.io", "v1beta2", "MultiClusterObservability", "", "zzz-mco", "uid-1"),
+		testDiscovered("agent-install.openshift.io", "v1beta1", "AgentServiceConfig", "", "agent", "uid-2"),
+		testDiscovered("discovery.open-cluster-management.io", "v1", "DiscoveryConfig", "", "aaa-discovery", "uid-3"),
+	}}
+	reconciler := classifierReconciler()
+
+	reconciler.classifyBlockingResources(graph)
+	reconciler.classifyManagedClusters(graph)
+
+	got := make([]string, 0, len(graph.BlockingResources))
+	for _, br := range graph.BlockingResources {
+		got = append(got, br.Kind+"/"+br.Name)
+	}
+	want := []string{"AgentServiceConfig/agent", "DiscoveryConfig/aaa-discovery", "MultiClusterObservability/zzz-mco"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("blocking order = %v, want %v", got, want)
+	}
+}
