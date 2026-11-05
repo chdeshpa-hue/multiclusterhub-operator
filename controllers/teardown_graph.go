@@ -54,6 +54,11 @@ type DependencyGraph struct {
 	// MCE instance (if found).
 	MCE *DiscoveredResource
 
+	// ScanTime is when discovery started. Ownership evidence and blocker
+	// timestamps are stamped with it so every observation in one report shares
+	// a single, reportable time.
+	ScanTime metav1.Time
+
 	// Incomplete records every resource type whose instances could not be
 	// listed. A non-empty list invalidates absence claims for those types: the
 	// report may say what was seen, never that something does not exist.
@@ -95,7 +100,7 @@ type DiscoveredResource struct {
 
 // buildDependencyGraph scans the cluster for all ACM/MCE resources and classifies them.
 func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, log logr.Logger) (*DependencyGraph, error) {
-	graph := &DependencyGraph{}
+	graph := &DependencyGraph{ScanTime: metav1.Now()}
 
 	crdList := &apixv1.CustomResourceDefinitionList{}
 	if err := r.Client.List(ctx, crdList); err != nil {
@@ -242,7 +247,7 @@ func (r *HubTeardownReconciler) classifyOwnership(graph *DependencyGraph) {
 
 	for i := range graph.DiscoveredResources {
 		dr := &graph.DiscoveredResources[i]
-		dr.Ownership = ownership.Classify(partialMetadata(dr), idx, mch)
+		dr.Ownership = ownership.Classify(partialMetadata(dr), idx, mch, graph.ScanTime)
 	}
 }
 

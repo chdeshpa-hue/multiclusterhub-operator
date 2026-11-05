@@ -3,6 +3,7 @@ package ownership
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -11,6 +12,9 @@ import (
 )
 
 var testMCH = types.NamespacedName{Name: "multiclusterhub", Namespace: "open-cluster-management"}
+
+// testObservedAt is the scan time every evidence entry must carry.
+var testObservedAt = metav1.NewTime(time.Date(2026, 11, 5, 3, 20, 0, 0, time.UTC))
 
 func installerLabels() map[string]string {
 	return map[string]string{
@@ -33,7 +37,7 @@ func metaObject(name, uid, apiVersion, kind string, labels map[string]string, ow
 func classify(t *testing.T, obj metav1.PartialObjectMetadata, objects []metav1.PartialObjectMetadata, crds []inventory.CRDRef, apiSvc map[string]string) OwnershipVerdict {
 	t.Helper()
 	all := append([]metav1.PartialObjectMetadata{obj}, objects...)
-	return Classify(obj, inventory.NewIndex(all, crds, apiSvc), testMCH)
+	return Classify(obj, inventory.NewIndex(all, crds, apiSvc), testMCH, testObservedAt)
 }
 
 func TestClassify(t *testing.T) {
@@ -146,6 +150,11 @@ func TestClassify(t *testing.T) {
 			if tt.wantNoKind != "" && hasEvidence(got.Evidence, tt.wantNoKind) {
 				t.Fatalf("unexpected evidence kind %s in %+v", tt.wantNoKind, got.Evidence)
 			}
+			for _, ev := range got.Evidence {
+				if !ev.Observed.Equal(&testObservedAt) {
+					t.Fatalf("evidence %s observed = %v, want %v", ev.Kind, ev.Observed, testObservedAt)
+				}
+			}
 		})
 	}
 }
@@ -190,9 +199,9 @@ func TestClassifyDeterministic(t *testing.T) {
 	obj := metaObject("open-cluster-management-hub", "uid-14", "v1", "Service", nil)
 	idx := inventory.NewIndex([]metav1.PartialObjectMetadata{obj}, nil, nil)
 
-	first := Classify(obj, idx, testMCH)
+	first := Classify(obj, idx, testMCH, testObservedAt)
 	for i := 0; i < 100; i++ {
-		got := Classify(obj, idx, testMCH)
+		got := Classify(obj, idx, testMCH, testObservedAt)
 		if !reflect.DeepEqual(first, got) {
 			t.Fatalf("iteration %d produced different verdict: %+v vs %+v", i, first, got)
 		}

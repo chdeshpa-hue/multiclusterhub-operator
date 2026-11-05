@@ -12,6 +12,7 @@ import (
 	"time"
 
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
+	"github.com/stolostron/multiclusterhub-operator/pkg/ownership"
 	"github.com/stolostron/multiclusterhub-operator/pkg/policy"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -146,6 +147,53 @@ func TestBuildInspectReportDigestIgnoresScanTime(t *testing.T) {
 	}
 	if first.Summary.Total != third.Summary.Total {
 		t.Fatalf("restricting to allowlisted finalizers should keep the blocker count at 1, got %d", third.Summary.Total)
+	}
+}
+
+// graphWithEvidence builds a one-blocker graph whose ownership verdict carries
+// evidence observed at the supplied time.
+func graphWithEvidence(observed metav1.Time) *DependencyGraph {
+	dr := testDiscovered("g", "v1", "Kind", "ns", "name", "uid-1", testNonCloudFinalizer)
+	dr.Ownership = ownership.OwnershipVerdict{
+		Owned:      true,
+		Confidence: ownership.ConfidenceDefinitive,
+		Evidence: []ownership.Evidence{{
+			Kind:     ownership.EvidenceInstallerLabel,
+			Detail:   "installer.name=multiclusterhub installer.namespace=open-cluster-management",
+			Source:   "metadata.labels",
+			Observed: observed,
+		}},
+	}
+	return &DependencyGraph{DiscoveredResources: []DiscoveredResource{dr}}
+}
+
+func TestBuildInspectReportDigestIgnoresEvidenceObserved(t *testing.T) {
+	td := testTeardown()
+	later := metav1.NewTime(testScanTime.Add(60 * time.Second))
+
+	first, firstMeta := buildInspectReport(td, graphWithEvidence(testScanTime), testScanTime, "")
+	_, secondMeta := buildInspectReport(td, graphWithEvidence(later), later, "")
+
+	if firstMeta.Digest != secondMeta.Digest {
+		t.Fatalf("digest must ignore ownership evidence timestamps: %s != %s", firstMeta.Digest, secondMeta.Digest)
+	}
+	if got := first.Blockers[0].Ownership.Evidence[0].Observed; !got.Equal(&testScanTime) {
+		t.Fatalf("canonicalising the digest must not mutate the report: observed = %v, want %v", got, testScanTime)
+	}
+}
+
+func TestBlockerEvidenceSerialisesObserved(t *testing.T) {
+	report, _ := buildInspectReport(testTeardown(), graphWithEvidence(testScanTime), testScanTime, "")
+
+	body, err := json.Marshal(report.Blockers[0].Ownership)
+	if err != nil {
+		t.Fatalf("marshal ownership: %v", err)
+	}
+	if strings.Contains(string(body), `"observed":null`) {
+		t.Fatalf("evidence observed must never marshal as null (the CRD marks it required): %s", body)
+	}
+	if !strings.Contains(string(body), testScanTime.UTC().Format("2006-01-02T15:04:05Z")) {
+		t.Fatalf("evidence observed is missing from %s", body)
 	}
 }
 

@@ -268,6 +268,18 @@ func reportDigest(report inspectReport) string {
 	for i := range report.Blockers {
 		canonicalBlockers[i] = report.Blockers[i]
 		canonicalBlockers[i].BlockedSince = metav1.Time{}
+		// Ownership evidence carries the scan time it was observed at, for the
+		// same reason as BlockedSince: a resync must not change the digest and
+		// silently lapse consent. Copy the slice first so canonicalising the
+		// digest cannot mutate the report that is about to be written to status.
+		if evidence := report.Blockers[i].Ownership.Evidence; len(evidence) > 0 {
+			canonical := make([]operatorv1.Evidence, len(evidence))
+			copy(canonical, evidence)
+			for j := range canonical {
+				canonical[j].Observed = metav1.Time{}
+			}
+			canonicalBlockers[i].Ownership.Evidence = canonical
+		}
 	}
 	canonical := struct {
 		Summary    operatorv1.BlockerSummary `json:"summary"`
@@ -326,7 +338,12 @@ func renderInspectReportText(report inspectReport, meta reportMeta) string {
 // applyInspection projects the scan into status and writes the report. It is
 // the only writer of summary, blockers, lastInspection and reportRef.
 func (r *HubTeardownReconciler) applyInspection(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown, graph *DependencyGraph) error {
-	now := metav1.Now()
+	// One scan, one time: the report and the evidence it contains must agree on
+	// when the cluster was observed.
+	now := graph.ScanTime
+	if now.IsZero() {
+		now = metav1.Now()
+	}
 
 	// Capture the pre-teardown object set before anything can delete one. The
 	// record is written once and never replaced, so re-inspection cannot

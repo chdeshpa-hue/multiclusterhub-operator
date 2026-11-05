@@ -18,36 +18,40 @@ import (
 const maxOwnerDepth = 16
 
 // Classify returns an ownership verdict for obj. It performs no I/O and reads
-// no clock: every input comes from obj and idx. Evidence is sorted so repeated
-// calls produce byte-identical results.
-func Classify(obj metav1.PartialObjectMetadata, idx *inventory.Index, mch types.NamespacedName) OwnershipVerdict {
+// no clock: every input comes from obj, idx and observedAt, which the caller
+// supplies from the scan that produced them. Evidence is sorted so repeated
+// calls with the same observedAt produce byte-identical results.
+func Classify(obj metav1.PartialObjectMetadata, idx *inventory.Index, mch types.NamespacedName, observedAt metav1.Time) OwnershipVerdict {
 	evidence := make([]Evidence, 0, 4)
 
 	if hasInstallerLabels(obj.GetLabels(), mch) {
 		evidence = append(evidence, Evidence{
-			Kind:   EvidenceInstallerLabel,
-			Detail: installerDetail(obj.GetLabels()),
-			Source: "metadata.labels",
+			Kind:     EvidenceInstallerLabel,
+			Detail:   installerDetail(obj.GetLabels()),
+			Source:   "metadata.labels",
+			Observed: observedAt,
 		})
 	} else if detail, ok := ownerChainEvidence(obj, idx, mch); ok {
 		evidence = append(evidence, Evidence{
-			Kind:   EvidenceOwnerRefChain,
-			Detail: detail,
-			Source: "metadata.ownerReferences",
+			Kind:     EvidenceOwnerRefChain,
+			Detail:   detail,
+			Source:   "metadata.ownerReferences",
+			Observed: observedAt,
 		})
 	}
 
-	if ev, ok := definingCRDEvidence(obj, idx, mch); ok {
+	if ev, ok := definingCRDEvidence(obj, idx, mch, observedAt); ok {
 		evidence = append(evidence, ev)
 	}
-	if ev, ok := apiServiceEvidence(obj, idx, mch); ok {
+	if ev, ok := apiServiceEvidence(obj, idx, mch, observedAt); ok {
 		evidence = append(evidence, ev)
 	}
 	if nameMatchesACM(obj.GetName()) {
 		evidence = append(evidence, Evidence{
-			Kind:   EvidenceNameMatch,
-			Detail: fmt.Sprintf("name %q matches an ACM naming pattern", obj.GetName()),
-			Source: "metadata.name",
+			Kind:     EvidenceNameMatch,
+			Detail:   fmt.Sprintf("name %q matches an ACM naming pattern", obj.GetName()),
+			Source:   "metadata.name",
+			Observed: observedAt,
 		})
 	}
 
@@ -153,20 +157,21 @@ func controllerOwner(owners []metav1.OwnerReference) (metav1.OwnerReference, boo
 	return owners[0], true
 }
 
-func definingCRDEvidence(obj metav1.PartialObjectMetadata, idx *inventory.Index, mch types.NamespacedName) (Evidence, bool) {
+func definingCRDEvidence(obj metav1.PartialObjectMetadata, idx *inventory.Index, mch types.NamespacedName, observedAt metav1.Time) (Evidence, bool) {
 	group := apiGroup(obj.APIVersion)
 	crd, ok := idx.DefiningCRD(group, obj.Kind)
 	if !ok || !hasInstallerLabels(crd.Labels, mch) {
 		return Evidence{}, false
 	}
 	return Evidence{
-		Kind:   EvidenceDefiningCRDLabelled,
-		Detail: fmt.Sprintf("CRD %s/%s carries installer labels", crd.Group, crd.Kind),
-		Source: "CustomResourceDefinition.metadata.labels",
+		Kind:     EvidenceDefiningCRDLabelled,
+		Detail:   fmt.Sprintf("CRD %s/%s carries installer labels", crd.Group, crd.Kind),
+		Source:   "CustomResourceDefinition.metadata.labels",
+		Observed: observedAt,
 	}, true
 }
 
-func apiServiceEvidence(obj metav1.PartialObjectMetadata, idx *inventory.Index, mch types.NamespacedName) (Evidence, bool) {
+func apiServiceEvidence(obj metav1.PartialObjectMetadata, idx *inventory.Index, mch types.NamespacedName, observedAt metav1.Time) (Evidence, bool) {
 	group := apiGroup(obj.APIVersion)
 	namespace, ok := idx.APIServiceBackingNamespace(group)
 	if !ok || namespace == "" {
@@ -177,9 +182,10 @@ func apiServiceEvidence(obj metav1.PartialObjectMetadata, idx *inventory.Index, 
 		return Evidence{}, false
 	}
 	return Evidence{
-		Kind:   EvidenceAPIServiceBacking,
-		Detail: fmt.Sprintf("API group %s is served from owned namespace %s", group, namespace),
-		Source: "APIService.spec.service.namespace",
+		Kind:     EvidenceAPIServiceBacking,
+		Detail:   fmt.Sprintf("API group %s is served from owned namespace %s", group, namespace),
+		Source:   "APIService.spec.service.namespace",
+		Observed: observedAt,
 	}, true
 }
 
