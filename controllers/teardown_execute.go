@@ -565,13 +565,22 @@ func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context
 		return true, nil
 	}
 
-	// Gate: require explicit acknowledgment only when infra CRs actually exist.
-	if !td.Spec.AcknowledgeCloudResourceRisk {
+	// Gate: require explicit acknowledgment only when at least one infra CR
+	// can orphan cloud resources. A KubeVirt-only hub provisions VMs inside
+	// this cluster; its HostedCluster finalizers are Tier 1 by identity but
+	// carry no cloud risk.
+	cloudRiskItems := 0
+	for _, ii := range allItems {
+		if isKnownCloudPlatform(detectPlatform(ii.kind, ii.obj)) {
+			cloudRiskItems++
+		}
+	}
+	if cloudRiskItems > 0 && !td.Spec.AcknowledgeCloudResourceRisk {
 		log.Info("Waiting for spec.acknowledgeCloudResourceRisk=true before deleting infrastructure CRs",
-			"infraCRCount", len(allItems))
+			"infraCRCount", len(allItems), "cloudRiskItemCount", cloudRiskItems)
 		r.Recorder.Eventf(td, corev1.EventTypeWarning, "CloudRiskGate",
-			"%d infrastructure CRs (HostedClusters, ClusterDeployments, etc.) require spec.acknowledgeCloudResourceRisk=true to proceed",
-			len(allItems))
+			"%d of %d infrastructure CRs can orphan cloud resources and require spec.acknowledgeCloudResourceRisk=true to proceed",
+			cloudRiskItems, len(allItems))
 		return false, nil
 	}
 
@@ -580,17 +589,8 @@ func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context
 		item := ii.obj
 
 		if item.GetDeletionTimestamp() != nil {
-			if r.shouldResolveStuckFinalizers(td, item) && td.Spec.AcknowledgeCloudResourceRisk {
-				dr := DiscoveredResource{
-					Ref: operatorv1.ResourceRef{
-						Group:     ii.group,
-						Kind:      ii.kind,
-						Namespace: item.GetNamespace(),
-						Name:      item.GetName(),
-					},
-					Version:    ii.version,
-					Finalizers: item.GetFinalizers(),
-				}
+			if r.shouldResolveStuckFinalizers(td, item) {
+				dr := drFromUnstructured(item, ii.group, ii.version, ii.kind)
 				resolved, err := r.resolveStuckFinalizers(ctx, log, td, []DiscoveredResource{dr})
 				if err != nil {
 					log.Error(err, "Error resolving finalizers on infrastructure CR",
@@ -627,10 +627,11 @@ func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context
 				if !IsAllowlistedFinalizer(f) {
 					continue
 				}
-				if IsCloudProtectingFinalizer(f) && !td.Spec.AcknowledgeCloudResourceRisk {
+				cloudRisk := requiresCloudAcknowledgement(f, detectPlatform(ii.kind, item))
+				if cloudRisk && !td.Spec.AcknowledgeCloudResourceRisk {
 					msg += " Set spec.acknowledgeCloudResourceRisk=true to patch Tier 1 (cloud-protecting) finalizers."
 					needsApproval = true
-				} else if !IsCloudProtectingFinalizer(f) && !td.Spec.ApprovedDestructiveActions {
+				} else if !cloudRisk && !td.Spec.ApprovedDestructiveActions {
 					msg += " Set spec.approvedDestructiveActions=true to patch Tier 2 (non-cloud) finalizers."
 					needsApproval = true
 				}
@@ -1282,6 +1283,7 @@ func drFromUnstructured(item *unstructured.Unstructured, group, version, kind st
 		},
 		Version:    version,
 		Finalizers: item.GetFinalizers(),
+		Platform:   detectPlatform(kind, item),
 	}
 }
 

@@ -144,11 +144,18 @@ spec:
                           type: boolean
                         platform:
                           type: string
+                        platformKnown:
+                          description: |-
+                            PlatformKnown distinguishes a recognised platform (cloud or KubeVirt)
+                            from an absent or unfamiliar string. It is evidence quality, not a gate:
+                            only MayOrphan authorises a consent requirement.
+                          type: boolean
                         resourceType:
                           type: string
                       required:
                       - mayOrphan
                       - platform
+                      - platformKnown
                       - resourceType
                       type: object
                     consentReason:

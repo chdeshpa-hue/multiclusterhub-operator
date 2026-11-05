@@ -126,7 +126,7 @@ func blockersFromGraph(graph *DependencyGraph, scanTime metav1.Time, consent pol
 
 		classification := dr.Classification
 		if classification == "" {
-			if cloud {
+			if cloud && isKnownCloudPlatform(dr.Platform) {
 				classification = operatorv1.ClassCloudProtecting
 			} else {
 				classification = operatorv1.ClassUnknown
@@ -153,17 +153,21 @@ func blockersFromGraph(graph *DependencyGraph, scanTime metav1.Time, consent pol
 			blocker.BlockedSince = *dr.DeletionTimestamp
 		}
 		if cloud {
+			mayOrphan := isKnownCloudPlatform(dr.Platform)
 			blocker.CloudRisk = &operatorv1.CloudRisk{
-				Platform:     dr.Platform,
-				ResourceType: dr.Ref.Kind,
-				MayOrphan:    true,
+				Platform:      dr.Platform,
+				PlatformKnown: isKnownPlatform(dr.Platform),
+				ResourceType:  dr.Ref.Kind,
+				MayOrphan:     mayOrphan,
 			}
 			// RequiresConsent is a property of acting on a cloud-protecting
 			// finalizer, not of the action chosen right now: waiting for the
 			// controller and resolving the finalizer both leave the requirement
 			// in place.
-			blocker.RequiresConsent = true
-			blocker.ConsentReason = "removing this finalizer may orphan cloud infrastructure outside the cluster"
+			blocker.RequiresConsent = mayOrphan
+			if mayOrphan {
+				blocker.ConsentReason = "removing this finalizer may orphan cloud infrastructure outside the cluster"
+			}
 		}
 
 		blocker.SuggestedAction = policy.Evaluate(blocker, consent).Action
@@ -340,7 +344,8 @@ func renderInspectReportText(report inspectReport, meta reportMeta) string {
 		fmt.Fprintf(&b, "  ownership: owned=%t confidence=%s\n", blocker.Ownership.Owned, blocker.Ownership.Confidence)
 		fmt.Fprintf(&b, "  suggestedAction: %s\n", blocker.SuggestedAction)
 		if blocker.CloudRisk != nil {
-			fmt.Fprintf(&b, "  cloudRisk: platform=%s mayOrphan=%t\n", blocker.CloudRisk.Platform, blocker.CloudRisk.MayOrphan)
+			fmt.Fprintf(&b, "  cloudRisk: platform=%s platformKnown=%t mayOrphan=%t\n",
+				blocker.CloudRisk.Platform, blocker.CloudRisk.PlatformKnown, blocker.CloudRisk.MayOrphan)
 		}
 	}
 	return b.String()

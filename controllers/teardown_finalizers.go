@@ -294,11 +294,31 @@ func (r *HubTeardownReconciler) patchFinalizerOffResource(
 	ref operatorv1.ResourceRef,
 	finalizer string,
 	gvk schema.GroupVersionKind,
+	platform string,
 ) (bool, error) {
 	tier, description := ClassifyFinalizer(finalizer)
 
 	switch tier {
 	case FinalizerTier1Cloud:
+		if !isKnownCloudPlatform(platform) {
+			// The finalizer is Tier 1 by identity, but on this platform it
+			// protects nothing outside the cluster. Removing it is still
+			// destructive, so it moves behind the destructive approval rather
+			// than the cloud acknowledgement.
+			if !td.Spec.ApprovedDestructiveActions {
+				log.Info("Skipping Tier 1 finalizer on a non-cloud platform: approvedDestructiveActions not set",
+					"resource", fmt.Sprintf("%s/%s/%s", ref.Kind, ref.Namespace, ref.Name),
+					"finalizer", finalizer, "platform", platform)
+				r.setWaitingForApproval(td, "Tier2FinalizersBlocked",
+					fmt.Sprintf("Finalizer %q on %s/%s protects no cloud resource on platform %q, but removing it is destructive. Set spec.approvedDestructiveActions=true to proceed.",
+						finalizer, ref.Kind, ref.Name, platform))
+				return false, nil
+			}
+			log.Info("Removing Tier 1 finalizer on a non-cloud platform",
+				"resource", fmt.Sprintf("%s/%s/%s", ref.Kind, ref.Namespace, ref.Name),
+				"finalizer", finalizer, "platform", platform)
+			break
+		}
 		if !td.Spec.AcknowledgeCloudResourceRisk {
 			log.Info("Skipping Tier 1 finalizer (cloud-protecting): acknowledgeCloudResourceRisk not set",
 				"resource", fmt.Sprintf("%s/%s/%s", ref.Kind, ref.Namespace, ref.Name),
@@ -407,7 +427,7 @@ func (r *HubTeardownReconciler) resolveStuckFinalizers(
 				Kind:    dr.Ref.Kind,
 			}
 
-			removed, err := r.patchFinalizerOffResource(ctx, log, td, dr.Ref, finalizer, gvk)
+			removed, err := r.patchFinalizerOffResource(ctx, log, td, dr.Ref, finalizer, gvk, dr.Platform)
 			if err != nil {
 				return false, err
 			}

@@ -101,9 +101,13 @@ type ControllerRef struct {
 
 // CloudRisk records the consequence of acting outside the cluster.
 type CloudRisk struct {
-	Platform     string `json:"platform"`
-	ResourceType string `json:"resourceType"`
-	MayOrphan    bool   `json:"mayOrphan"`
+	Platform string `json:"platform"`
+	// PlatformKnown distinguishes a recognised platform (cloud or KubeVirt)
+	// from an absent or unfamiliar string. It is evidence quality, not a gate:
+	// only MayOrphan authorises a consent requirement.
+	PlatformKnown bool   `json:"platformKnown"`
+	ResourceType  string `json:"resourceType"`
+	MayOrphan     bool   `json:"mayOrphan"`
 }
 
 // Classification names the failure mode a Blocker represents.

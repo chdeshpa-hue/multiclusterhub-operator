@@ -50,7 +50,7 @@ func (r *HubTeardownReconciler) buildCloudWarnings(ctx context.Context, log logr
 
 	for _, dr := range graph.CloudRiskResources {
 		for _, finalizer := range dr.Finalizers {
-			if !IsCloudProtectingFinalizer(finalizer) {
+			if !requiresCloudAcknowledgement(finalizer, dr.Platform) {
 				continue
 			}
 

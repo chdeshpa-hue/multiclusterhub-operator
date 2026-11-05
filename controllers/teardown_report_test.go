@@ -63,6 +63,9 @@ func TestBlockersFromGraph(t *testing.T) {
 			testDiscovered("v1", "", "ConfigMap", "ns", "nofin", "uid-cm"),
 		},
 	}
+	// A HostedCluster always carries a platform; the cloud classification
+	// needs it as evidence.
+	graph.DiscoveredResources[0].Platform = "AWS"
 
 	blockers := blockersFromGraph(graph, testScanTime, policy.ConsentState{})
 

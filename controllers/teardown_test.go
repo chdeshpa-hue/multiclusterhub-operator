@@ -203,6 +203,20 @@ func TestDetectPlatform(t *testing.T) {
 			wantPlat: "GCP",
 		},
 		{
+			name: "ClusterPool AWS",
+			kind: "ClusterPool",
+			obj: map[string]interface{}{
+				"spec": map[string]interface{}{
+					"platform": map[string]interface{}{
+						"aws": map[string]interface{}{
+							"region": "us-east-1",
+						},
+					},
+				},
+			},
+			wantPlat: "AWS",
+		},
+		{
 			name:     "Unknown kind",
 			kind:     "ConfigMap",
 			obj:      map[string]interface{}{},

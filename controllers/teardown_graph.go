@@ -216,7 +216,7 @@ func (r *HubTeardownReconciler) scanCRDInstances(ctx context.Context, log logr.L
 		graph.DiscoveredResources = append(graph.DiscoveredResources, dr)
 
 		for _, f := range finalizers {
-			if IsCloudProtectingFinalizer(f) {
+			if requiresCloudAcknowledgement(f, dr.Platform) {
 				graph.CloudRiskResources = append(graph.CloudRiskResources, dr)
 				break
 			}
@@ -361,7 +361,7 @@ func detectPlatform(kind string, item *unstructured.Unstructured) string {
 		if p, ok, _ := unstructured.NestedString(item.Object, "spec", "platform", "type"); ok {
 			return strings.ToUpper(p)
 		}
-	case "ClusterDeployment":
+	case "ClusterDeployment", "ClusterPool":
 		spec, ok, _ := unstructured.NestedMap(item.Object, "spec", "platform")
 		if ok {
 			for platform := range spec {

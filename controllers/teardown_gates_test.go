@@ -63,6 +63,14 @@ func newUnstructured(gvk schema.GroupVersionKind, namespace, name string, finali
 	return u
 }
 
+// withPlatform gives a HostedCluster/NodePool the spec.platform.type every
+// real object carries. The cloud gate now keys on platform evidence, so a
+// synthetic object without one is not a cloud-provisioned object.
+func withPlatform(u *unstructured.Unstructured, platform string) *unstructured.Unstructured {
+	_ = unstructured.SetNestedField(u.Object, platform, "spec", "platform", "type")
+	return u
+}
+
 func conditionReason(td *operatorv1.HubTeardown, condType string) string {
 	for _, c := range td.Status.Conditions {
 		if c.Type == condType {
@@ -103,7 +111,7 @@ func newTeardownCR() *operatorv1.HubTeardown {
 // The phase must not delete anything and must surface why it is blocked.
 func TestPhaseDeleteInfrastructureCRs_CloudRiskGateBlocks(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	hcp := newUnstructured(hostedClusterGVK, "clusters", "hcp1")
+	hcp := withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1"), "AWS")
 	r := newGateTestReconciler(t, hcp)
 	td := newTeardownCR()
 
@@ -130,7 +138,7 @@ func TestPhaseDeleteInfrastructureCRs_CloudRiskGateBlocks(t *testing.T) {
 // Positive counterpart: the same phase must proceed once acknowledgment is set.
 func TestPhaseDeleteInfrastructureCRs_CloudRiskAckAllowsDeletion(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	hcp := newUnstructured(hostedClusterGVK, "clusters", "hcp1")
+	hcp := withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1"), "AWS")
 	r := newGateTestReconciler(t, hcp)
 	td := newTeardownCR()
 	td.Spec.AcknowledgeCloudResourceRisk = true
@@ -166,7 +174,7 @@ func TestPatchFinalizer_Tier1BlockedWithoutAck(t *testing.T) {
 
 	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
 		operatorv1.ResourceRef{Group: hostedClusterGVK.Group, Kind: hostedClusterGVK.Kind, Namespace: "clusters", Name: "hcp1"},
-		finalizer, hostedClusterGVK)
+		finalizer, hostedClusterGVK, "AWS")
 	if err != nil {
 		t.Fatalf("patchFinalizerOffResource error: %v", err)
 	}
@@ -197,7 +205,7 @@ func TestPatchFinalizer_Tier1AllowedWithAck(t *testing.T) {
 
 	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
 		operatorv1.ResourceRef{Group: hostedClusterGVK.Group, Kind: hostedClusterGVK.Kind, Namespace: "clusters", Name: "hcp1"},
-		finalizer, hostedClusterGVK)
+		finalizer, hostedClusterGVK, "AWS")
 	if err != nil {
 		t.Fatalf("patchFinalizerOffResource error: %v", err)
 	}
@@ -220,6 +228,61 @@ func TestPatchFinalizer_Tier1AllowedWithAck(t *testing.T) {
 	}
 }
 
+// 22-E4: a KubeVirt HostedCluster finalizer protects VMs inside the hub, not
+// a cloud account. Destructive approval is enough; cloud acknowledgment is not.
+func TestPatchFinalizer_KubeVirtNeedsNoCloudAck(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	const finalizer = "hypershift.openshift.io/finalizer"
+	hcp := withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1", finalizer), "KUBEVIRT")
+	r := newGateTestReconciler(t, hcp)
+	td := newTeardownCR()
+	td.Spec.ApprovedDestructiveActions = true
+
+	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
+		operatorv1.ResourceRef{Group: hostedClusterGVK.Group, Kind: hostedClusterGVK.Kind, Namespace: "clusters", Name: "hcp1"},
+		finalizer, hostedClusterGVK, "KUBEVIRT")
+	if err != nil {
+		t.Fatalf("patchFinalizerOffResource error: %v", err)
+	}
+	if !removed {
+		t.Fatal("KubeVirt HCP finalizer must be removable with destructive approval alone")
+	}
+
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(hostedClusterGVK)
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: "clusters", Name: "hcp1"}, got); err != nil {
+		t.Fatalf("get hosted cluster: %v", err)
+	}
+	if hasFinalizer(got, finalizer) {
+		t.Fatal("KubeVirt HCP finalizer still present")
+	}
+	if events := strings.Join(drainEvents(r), "\n"); strings.Contains(events, "FinalizerRemovalWarning") {
+		t.Fatalf("KubeVirt removal must not claim cloud orphan risk:\n%s", events)
+	}
+}
+
+// 22-E5: dropping the cloud gate does not drop the destructive gate.
+func TestPatchFinalizer_KubeVirtRequiresDestructiveApproval(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	const finalizer = "hypershift.openshift.io/finalizer"
+	hcp := withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1", finalizer), "KUBEVIRT")
+	r := newGateTestReconciler(t, hcp)
+	td := newTeardownCR()
+
+	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
+		operatorv1.ResourceRef{Group: hostedClusterGVK.Group, Kind: hostedClusterGVK.Kind, Namespace: "clusters", Name: "hcp1"},
+		finalizer, hostedClusterGVK, "KUBEVIRT")
+	if err != nil {
+		t.Fatalf("patchFinalizerOffResource error: %v", err)
+	}
+	if removed {
+		t.Fatal("KubeVirt HCP finalizer must not be removed without any approval")
+	}
+	if reason := conditionReason(td, conditionTypeWaitingForApproval); reason != "Tier2FinalizersBlocked" {
+		t.Fatalf("expected Tier2FinalizersBlocked condition, got %q", reason)
+	}
+}
+
 // Tier 2 finalizers protect Kubernetes state and require approvedDestructiveActions.
 func TestPatchFinalizer_Tier2BlockedWithoutApproval(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
@@ -230,7 +293,7 @@ func TestPatchFinalizer_Tier2BlockedWithoutApproval(t *testing.T) {
 
 	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
 		operatorv1.ResourceRef{Group: managedClusterGVK.Group, Kind: managedClusterGVK.Kind, Namespace: "clusters", Name: "mc1"},
-		finalizer, managedClusterGVK)
+		finalizer, managedClusterGVK, "")
 	if err != nil {
 		t.Fatalf("patchFinalizerOffResource error: %v", err)
 	}
@@ -261,7 +324,7 @@ func TestPatchFinalizer_Tier2AllowedWithApproval(t *testing.T) {
 
 	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
 		operatorv1.ResourceRef{Group: managedClusterGVK.Group, Kind: managedClusterGVK.Kind, Namespace: "clusters", Name: "mc1"},
-		finalizer, managedClusterGVK)
+		finalizer, managedClusterGVK, "")
 	if err != nil {
 		t.Fatalf("patchFinalizerOffResource error: %v", err)
 	}
@@ -282,7 +345,7 @@ func TestPatchFinalizer_UnknownNotRemoved(t *testing.T) {
 
 	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
 		operatorv1.ResourceRef{Group: managedClusterGVK.Group, Kind: managedClusterGVK.Kind, Namespace: "clusters", Name: "mc1"},
-		finalizer, managedClusterGVK)
+		finalizer, managedClusterGVK, "")
 	if err != nil {
 		t.Fatalf("patchFinalizerOffResource error: %v", err)
 	}

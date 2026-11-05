@@ -206,7 +206,7 @@ func classifyDiscoveredResource(dr *DiscoveredResource, now metav1.Time, byUID m
 		return operatorv1.ClassDeadController
 	}
 	for _, finalizer := range dr.Finalizers {
-		if IsCloudProtectingFinalizer(finalizer) {
+		if requiresCloudAcknowledgement(finalizer, dr.Platform) {
 			return operatorv1.ClassCloudProtecting
 		}
 	}
