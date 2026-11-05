@@ -16,6 +16,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // unreachableGrace is how long a ManagedCluster may report Available=Unknown
@@ -129,6 +130,7 @@ func (r *HubTeardownReconciler) resolveFinalizerController(ctx context.Context, 
 func (r *HubTeardownReconciler) probeControllerWorkload(ctx context.Context, workload *controllerWorkload, observed metav1.Time) (*bool, operatorv1.Evidence) {
 	key := types.NamespacedName{Namespace: workload.Namespace, Name: workload.Name}
 	ready := int32(0)
+	resolvedName := workload.Name
 
 	switch workload.Kind {
 	case "StatefulSet":
@@ -137,12 +139,14 @@ func (r *HubTeardownReconciler) probeControllerWorkload(ctx context.Context, wor
 			return controllerReadFailure(workload, err, observed)
 		}
 		ready = obj.Status.ReadyReplicas
+		resolvedName = obj.Name
 	case "Deployment":
 		obj := &appsv1.Deployment{}
-		if err := r.Client.Get(ctx, key, obj); err != nil {
+		if err := r.getWorkloadObject(ctx, workload, obj); err != nil {
 			return controllerReadFailure(workload, err, observed)
 		}
 		ready = obj.Status.ReadyReplicas
+		resolvedName = obj.Name
 	default:
 		return nil, operatorv1.Evidence{
 			Kind:     operatorv1.EvidenceControllerLiveness,
@@ -152,8 +156,30 @@ func (r *HubTeardownReconciler) probeControllerWorkload(ctx context.Context, wor
 		}
 	}
 
+	resolved := *workload
+	resolved.Name = resolvedName
 	alive := ready > 0
-	return &alive, workloadEvidence(workload, &alive, observed)
+	return &alive, workloadEvidence(&resolved, &alive, observed)
+}
+
+// getWorkloadObject reads the operand under its canonical name, falling back
+// to the names it shipped under in other releases. NotFound is returned only
+// when every candidate is missing, so a rename is never mistaken for a
+// controller that has gone away.
+func (r *HubTeardownReconciler) getWorkloadObject(ctx context.Context, workload *controllerWorkload, obj client.Object) error {
+	names := append([]string{workload.Name}, workload.Aliases...)
+	var lastErr error
+	for _, name := range names {
+		err := r.Client.Get(ctx, types.NamespacedName{Namespace: workload.Namespace, Name: name}, obj)
+		if err == nil {
+			return nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		lastErr = err
+	}
+	return lastErr
 }
 
 func controllerReadFailure(workload *controllerWorkload, err error, observed metav1.Time) (*bool, operatorv1.Evidence) {

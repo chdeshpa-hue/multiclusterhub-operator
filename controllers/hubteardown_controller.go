@@ -155,6 +155,7 @@ func (r *HubTeardownReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // reconcileDryRun performs a read-only scan and populates the dry-run report.
 func (r *HubTeardownReconciler) reconcileDryRun(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (ctrl.Result, error) {
 	log.Info("Dry-run mode: scanning cluster state")
+	originalStatus := td.Status.DeepCopy()
 
 	// Pausing an active teardown stops the deadline from accruing. The shift is
 	// applied on resume, so a long pause cannot fail a later run.
@@ -188,9 +189,15 @@ func (r *HubTeardownReconciler) reconcileDryRun(ctx context.Context, log logr.Lo
 	}
 	td.Status.Phase = operatorv1.TeardownPhaseReportReady
 
+	blockingTotal := int(report.TotalBlockingResources)
+	blockingDetail := ""
+	if td.Status.Summary != nil && int(td.Status.Summary.Total) != blockingTotal {
+		blockingTotal = int(td.Status.Summary.Total)
+		blockingDetail = fmt.Sprintf(" (%d webhook-blocking)", report.TotalBlockingResources)
+	}
 	r.setCondition(td, conditionTypeDryRunComplete, metav1.ConditionTrue, "ScanComplete",
-		fmt.Sprintf("Dry-run analysis complete. Found %d blocking resources, %d cloud-risk resources. Set spec.dryRun=false to begin teardown.",
-			report.TotalBlockingResources, report.TotalCloudRiskResources))
+		fmt.Sprintf("Dry-run analysis complete. Found %d blocking resources%s, %d cloud-risk resources. Set spec.dryRun=false to begin teardown.",
+			blockingTotal, blockingDetail, report.TotalCloudRiskResources))
 
 	if len(td.Status.CloudResourceWarnings) > 0 {
 		r.setCondition(td, conditionTypeCloudResourcesRisk, metav1.ConditionTrue, "UnacknowledgedWarnings",
@@ -201,6 +208,12 @@ func (r *HubTeardownReconciler) reconcileDryRun(ctx context.Context, log logr.Lo
 			"No resources with cloud-protecting finalizers found.")
 	}
 
+	// Only persist a status that actually changed. The controller watches its
+	// own CR, so an unconditional write re-triggers this reconcile and turns a
+	// read-only dry run into a continuous scan loop.
+	if statusEquivalent(originalStatus, &td.Status) {
+		return ctrl.Result{RequeueAfter: teardownResyncDryRun}, nil
+	}
 	if err := r.Client.Status().Update(ctx, td); err != nil {
 		log.Error(err, "Failed to update dry-run status")
 		return ctrl.Result{}, err

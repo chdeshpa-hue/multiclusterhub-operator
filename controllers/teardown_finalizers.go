@@ -32,6 +32,9 @@ type controllerWorkload struct {
 	Kind      string
 	Namespace string
 	Name      string
+	// Aliases are the other names this operand's workload has shipped under.
+	// A rename between releases must not read as "controller is gone".
+	Aliases []string
 }
 
 // finalizerEntry describes a known finalizer and its risk classification.
@@ -226,7 +229,12 @@ var nonCloudFinalizers = []finalizerEntry{
 		Finalizer:   "finalizer.multicluster.openshift.io",
 		Tier:        FinalizerTier2NonCloud,
 		Description: "MCE operator backplane finalizer",
-		Controller:  &controllerWorkload{Kind: "Deployment", Namespace: "multicluster-engine", Name: "backplane-operator"},
+		Controller: &controllerWorkload{
+			Kind:      "Deployment",
+			Namespace: "multicluster-engine",
+			Name:      "multicluster-engine-operator",
+			Aliases:   []string{"backplane-operator"},
+		},
 	},
 }
 

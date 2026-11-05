@@ -128,7 +128,15 @@ type DiscoveredResource struct {
 }
 
 // buildDependencyGraph scans the cluster for all ACM/MCE resources and classifies them.
+// teardownScanTimeout bounds one discovery pass. Without it a degraded API
+// server turns a single scan into a multi-minute reconcile that blocks the
+// controller's queue, including the CR delete path.
+var teardownScanTimeout = 90 * time.Second
+
 func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, td *operatorv1.HubTeardown, log logr.Logger) (*DependencyGraph, error) {
+	ctx, cancel := context.WithTimeout(ctx, teardownScanTimeout)
+	defer cancel()
+
 	graph := &DependencyGraph{ScanTime: metav1.Now()}
 
 	crdList := &apixv1.CustomResourceDefinitionList{}

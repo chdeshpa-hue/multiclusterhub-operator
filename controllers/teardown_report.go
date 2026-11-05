@@ -8,8 +8,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
@@ -215,7 +217,9 @@ func summarizeBlockers(blockers []operatorv1.Blocker) operatorv1.BlockerSummary 
 	return summary
 }
 
-// capBlockers returns the status view and the number of omitted entries.
+// capBlockers returns the status view and the number of omitted entries. The
+// view is ordered so a truncation can never hide a resource that needs a
+// consent decision; entries of equal priority keep the report's order.
 func capBlockers(blockers []operatorv1.Blocker, limit int) ([]operatorv1.Blocker, int32) {
 	if limit < 0 {
 		limit = 0
@@ -223,7 +227,26 @@ func capBlockers(blockers []operatorv1.Blocker, limit int) ([]operatorv1.Blocker
 	if len(blockers) <= limit {
 		return append([]operatorv1.Blocker(nil), blockers...), 0
 	}
-	return append([]operatorv1.Blocker(nil), blockers[:limit]...), int32(len(blockers) - limit)
+	ordered := append([]operatorv1.Blocker(nil), blockers...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return blockerStatusPriority(ordered[i]) > blockerStatusPriority(ordered[j])
+	})
+	return ordered[:limit], int32(len(ordered) - limit)
+}
+
+// blockerStatusPriority ranks the status view. Consent-gated and cloud-risk
+// entries must survive the cap even when they sort last by name.
+func blockerStatusPriority(blocker operatorv1.Blocker) int {
+	switch {
+	case blocker.RequiresConsent:
+		return 3
+	case blocker.CloudRisk != nil && blocker.CloudRisk.MayOrphan:
+		return 2
+	case blocker.Classification == operatorv1.ClassCloudProtecting, blocker.Classification == operatorv1.ClassDeadController:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // reportConsentState is the consent the report is rendered against. A dry run
@@ -273,28 +296,21 @@ func buildInspectReport(td *operatorv1.HubTeardown, graph *DependencyGraph, scan
 }
 
 // reportDigest is computed over observed content only. scanTime is excluded
-// deliberately: a 60s dry-run resync over unchanged state must not create a
-// new report, because the report name is also the consent key.
+// deliberately: a dry-run resync over unchanged state must not create a new
+// report, because the report name is also the consent key.
+//
+// Every time-typed field is cleared by type rather than by name. Naming the
+// fields individually is how ownership evidence was covered while controller
+// evidence was missed, which made the digest change on every scan and let an
+// acknowledged digest lapse before it could be used.
 func reportDigest(report inspectReport) string {
-	// BlockedSince is an observation timestamp derived from scanTime for
-	// objects that are not deleting. Including it would make every resync
-	// produce a new report and silently lapse consent.
-	canonicalBlockers := make([]operatorv1.Blocker, len(report.Blockers))
+	canonicalBlockers := make([]operatorv1.Blocker, 0, len(report.Blockers))
 	for i := range report.Blockers {
-		canonicalBlockers[i] = report.Blockers[i]
-		canonicalBlockers[i].BlockedSince = metav1.Time{}
-		// Ownership evidence carries the scan time it was observed at, for the
-		// same reason as BlockedSince: a resync must not change the digest and
-		// silently lapse consent. Copy the slice first so canonicalising the
-		// digest cannot mutate the report that is about to be written to status.
-		if evidence := report.Blockers[i].Ownership.Evidence; len(evidence) > 0 {
-			canonical := make([]operatorv1.Evidence, len(evidence))
-			copy(canonical, evidence)
-			for j := range canonical {
-				canonical[j].Observed = metav1.Time{}
-			}
-			canonicalBlockers[i].Ownership.Evidence = canonical
-		}
+		// Deep copy first: canonicalising the digest must not mutate the report
+		// that is about to be written to status.
+		blocker := report.Blockers[i].DeepCopy()
+		zeroObservationTimes(reflect.ValueOf(blocker).Elem())
+		canonicalBlockers = append(canonicalBlockers, *blocker)
 	}
 	canonical := struct {
 		Summary    operatorv1.BlockerSummary `json:"summary"`
@@ -313,6 +329,70 @@ func reportDigest(report inspectReport) string {
 	}
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
+}
+
+var (
+	metav1TimeType = reflect.TypeOf(metav1.Time{})
+	stdTimeType    = reflect.TypeOf(time.Time{})
+)
+
+// zeroObservationTimes clears every time-typed value reachable from v. A new
+// observation timestamp added to the API is excluded from the digest without
+// having to be named here.
+func zeroObservationTimes(v reflect.Value) {
+	if !v.IsValid() {
+		return
+	}
+	switch v.Kind() {
+	case reflect.Ptr:
+		if v.IsNil() {
+			return
+		}
+		elem := v.Elem()
+		if isTimeType(elem.Type()) {
+			if elem.CanSet() {
+				elem.Set(reflect.Zero(elem.Type()))
+			}
+			return
+		}
+		zeroObservationTimes(elem)
+	case reflect.Interface:
+		if !v.IsNil() {
+			zeroObservationTimes(v.Elem())
+		}
+	case reflect.Struct:
+		if isTimeType(v.Type()) {
+			if v.CanSet() {
+				v.Set(reflect.Zero(v.Type()))
+			}
+			return
+		}
+		for i := 0; i < v.NumField(); i++ {
+			if !v.Type().Field(i).IsExported() {
+				continue
+			}
+			zeroObservationTimes(v.Field(i))
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			zeroObservationTimes(v.Index(i))
+		}
+	}
+}
+
+func isTimeType(t reflect.Type) bool {
+	return t == metav1TimeType || t == stdTimeType
+}
+
+// statusEquivalent reports whether two statuses differ only in observation
+// timestamps. Writing an identical status re-triggers this controller's own
+// watch, so the dry-run path must stay silent when nothing changed.
+func statusEquivalent(before, after *operatorv1.HubTeardownStatus) bool {
+	a := before.DeepCopy()
+	b := after.DeepCopy()
+	zeroObservationTimes(reflect.ValueOf(a).Elem())
+	zeroObservationTimes(reflect.ValueOf(b).Elem())
+	return reflect.DeepEqual(a, b)
 }
 
 // renderInspectReportText is what a support engineer reads.

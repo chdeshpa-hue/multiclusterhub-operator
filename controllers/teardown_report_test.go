@@ -608,3 +608,105 @@ func TestHubTeardownCRDStatusBlockerMaxItems(t *testing.T) {
 func init() {
 	ctrllog.SetLogger(zap.New(zap.WriteTo(os.Stderr), zap.UseDevMode(true)))
 }
+
+func boolPointer(value bool) *bool { return &value }
+
+// A controller-liveness timestamp is an observation, not content. Leaving it
+// in the digest made every dry-run scan produce a new report and lapse the
+// digest an administrator had just acknowledged.
+func TestReportDigestIgnoresControllerEvidenceObserved(t *testing.T) {
+	build := func(observed metav1.Time) inspectReport {
+		return inspectReport{
+			Blockers: []operatorv1.Blocker{{
+				Kind:            "MultiClusterEngine",
+				Name:            "multiclusterengine",
+				UID:             "uid-mce",
+				BlockedSince:    observed,
+				ControllerAlive: boolPointer(false),
+				ControllerEvidence: []operatorv1.Evidence{{
+					Kind:     operatorv1.EvidenceControllerLiveness,
+					Detail:   "Deployment multicluster-engine/multicluster-engine-operator absent or readyReplicas=0",
+					Source:   "classifier",
+					Observed: observed,
+				}},
+			}},
+		}
+	}
+
+	later := metav1.NewTime(testScanTime.Add(60 * time.Second))
+	first := build(testScanTime)
+	second := build(later)
+	if reportDigest(first) != reportDigest(second) {
+		t.Fatalf("digest must ignore controller evidence timestamps")
+	}
+	if got := first.Blockers[0].ControllerEvidence[0].Observed; !got.Equal(&testScanTime) {
+		t.Fatalf("canonicalising the digest must not mutate the report: observed = %v", got)
+	}
+
+	third := build(testScanTime)
+	third.Blockers[0].ControllerEvidence[0].Detail = "Deployment multicluster-engine/multicluster-engine-operator readyReplicas>0"
+	if reportDigest(third) == reportDigest(first) {
+		t.Fatalf("digest must change when controller evidence changes")
+	}
+}
+
+// The status view is capped, so the cap has to keep the entry an operator must
+// make a consent decision about even when it sorts last by name.
+func TestCapBlockersKeepsConsentEntry(t *testing.T) {
+	blockers := make([]operatorv1.Blocker, 0, 40)
+	for i := 0; i < 39; i++ {
+		blockers = append(blockers, operatorv1.Blocker{
+			UID:  types.UID(fmt.Sprintf("uid-%02d", i)),
+			Name: fmt.Sprintf("a-%02d", i),
+		})
+	}
+	blockers = append(blockers, operatorv1.Blocker{
+		UID:             "uid-consent",
+		Name:            "zzz-cloud",
+		RequiresConsent: true,
+		CloudRisk:       &operatorv1.CloudRisk{Platform: "AWS", PlatformKnown: true, MayOrphan: true},
+		Classification:  operatorv1.ClassCloudProtecting,
+	})
+
+	capped, truncated := capBlockers(blockers, reportStatusBlockerCap)
+	if len(capped) != 32 || truncated != 8 {
+		t.Fatalf("cap = %d/%d, want 32/8", len(capped), truncated)
+	}
+	if capped[0].UID != "uid-consent" {
+		t.Fatalf("consent blocker must survive the cap, first entry = %q", capped[0].UID)
+	}
+	for i := 1; i < len(capped)-1; i++ {
+		if capped[i].Name > capped[i+1].Name {
+			t.Fatalf("entries of equal priority must keep their order: %q before %q", capped[i].Name, capped[i+1].Name)
+		}
+	}
+}
+
+func TestStatusEquivalentIgnoresObservationTimes(t *testing.T) {
+	now := metav1.Now()
+	later := metav1.NewTime(now.Add(time.Minute))
+	before := &operatorv1.HubTeardownStatus{
+		Phase:          operatorv1.TeardownPhaseReportReady,
+		LastInspection: &now,
+		Blockers: []operatorv1.Blocker{{
+			Name:         "blocker",
+			BlockedSince: now,
+			ControllerEvidence: []operatorv1.Evidence{{
+				Observed: now,
+			}},
+		}},
+	}
+
+	after := before.DeepCopy()
+	after.LastInspection = &later
+	after.Blockers[0].BlockedSince = later
+	after.Blockers[0].ControllerEvidence[0].Observed = later
+	if !statusEquivalent(before, after) {
+		t.Fatalf("observation timestamps alone must not count as a status change")
+	}
+
+	after.Phase = operatorv1.TeardownPhaseFailed
+	if statusEquivalent(before, after) {
+		t.Fatalf("a phase change must count as a status change")
+	}
+}

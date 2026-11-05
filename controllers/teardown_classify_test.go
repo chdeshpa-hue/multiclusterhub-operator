@@ -251,3 +251,39 @@ func TestPreviousBlockerUIDs(t *testing.T) {
 		t.Fatalf("baseline UID = %q, want old-uid", got)
 	}
 }
+
+// The MCE operator shipped as backplane-operator before 5.0. A rename must not
+// read as "the controller is gone", which would authorise finalizer removal
+// while the operand is alive.
+func TestProbeControllerWorkloadResolvesMCEAlias(t *testing.T) {
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "multicluster-engine-operator", Namespace: "multicluster-engine"},
+		Status:     appsv1.DeploymentStatus{ReadyReplicas: 2},
+	}
+	reconciler := classifierReconciler(deployment)
+	workload := finalizerController("finalizer.multicluster.openshift.io")
+	if workload == nil {
+		t.Fatalf("finalizer must resolve to a controller")
+	}
+
+	alive, evidence := reconciler.probeControllerWorkload(context.Background(), workload, testScanTime)
+	if alive == nil || !*alive {
+		t.Fatalf("controllerAlive = %v, want true", alive)
+	}
+	if want := "Deployment multicluster-engine/multicluster-engine-operator readyReplicas>0"; evidence.Detail != want {
+		t.Fatalf("evidence = %q, want %q", evidence.Detail, want)
+	}
+}
+
+func TestProbeControllerWorkloadDeadWhenEveryNameIsAbsent(t *testing.T) {
+	reconciler := classifierReconciler()
+	workload := finalizerController("finalizer.multicluster.openshift.io")
+	if workload == nil {
+		t.Fatalf("finalizer must resolve to a controller")
+	}
+
+	alive, _ := reconciler.probeControllerWorkload(context.Background(), workload, testScanTime)
+	if alive == nil || *alive {
+		t.Fatalf("controllerAlive = %v, want false when every candidate name is absent", alive)
+	}
+}
