@@ -100,6 +100,38 @@ func TestEvaluateWebhooks(t *testing.T) {
 	}
 }
 
+func TestEvaluateACMWebhookInOperatorNamespaceIsResidue(t *testing.T) {
+	report := Evaluate(Input{Webhooks: []WebhookRef{
+		{
+			Kind:             "ValidatingWebhookConfiguration",
+			Name:             "acm-validator",
+			ServiceNamespace: testPolicy.OperatorNamespace,
+			ACMOwned:         true,
+		},
+	}}, testPolicy)
+
+	if report.Complete {
+		t.Fatal("an ACM-owned webhook still present after teardown is residue")
+	}
+	if len(report.Residue) != 1 {
+		t.Fatalf("residue = %+v", report.Residue)
+	}
+}
+
+func TestEvaluateUnlabelledWebhookInOperatorNamespaceIsNotResidue(t *testing.T) {
+	report := Evaluate(Input{Webhooks: []WebhookRef{
+		{
+			Kind:             "ValidatingWebhookConfiguration",
+			Name:             "platform-validator",
+			ServiceNamespace: testPolicy.OperatorNamespace,
+		},
+	}}, testPolicy)
+
+	if !report.Complete {
+		t.Fatalf("an unlabelled webhook in the preserved namespace must not be residue: %+v", report.Residue)
+	}
+}
+
 func TestEvaluateRBAC(t *testing.T) {
 	report := Evaluate(Input{RBAC: []ObjectRef{
 		{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "acm-role"},

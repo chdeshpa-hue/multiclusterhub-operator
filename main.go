@@ -64,6 +64,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimachinerymeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -318,8 +319,16 @@ func main() {
 		mchList := &operatorv1.MultiClusterHubList{}
 		err = uncachedClient.List(context.TODO(), mchList)
 		if err != nil {
-			setupLog.Error(err, "Could not set List multiclusterhubs")
-			os.Exit(1)
+			// After a teardown the MCH CRD is gone by design. That is "no MCH",
+			// not a fatal setup error: the controller must still be able to
+			// start so it can report the terminal teardown status.
+			if apimachinerymeta.IsNoMatchError(err) || errors.IsNotFound(err) {
+				setupLog.Info("MCH CRD is not installed; treating as no MultiClusterHub", "reason", err.Error())
+				mchList = &operatorv1.MultiClusterHubList{}
+			} else {
+				setupLog.Error(err, "Could not set List multiclusterhubs")
+				os.Exit(1)
+			}
 		}
 
 		if len(mchList.Items) == 0 {

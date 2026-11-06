@@ -37,6 +37,11 @@ type WebhookRef struct {
 	Kind             string // ValidatingWebhookConfiguration or MutatingWebhookConfiguration
 	Name             string
 	ServiceNamespace string
+	// ACMOwned is true when the configuration carries ACM's installer labels.
+	// A webhook backed by a Service in the preserved operator namespace is
+	// invisible to the removed-namespace rule, so ownership has to travel with
+	// the observation rather than be inferred from where the Service lives.
+	ACMOwned bool
 }
 
 // Input is everything Verify observed.
@@ -226,6 +231,13 @@ func Evaluate(in Input, p Policy) Report {
 	}
 
 	for _, hook := range in.Webhooks {
+		if hook.ACMOwned {
+			report.Residue = append(report.Residue, operatorv1.ResidueItem{
+				Kind: hook.Kind, Name: hook.Name, Namespace: hook.ServiceNamespace,
+				Reason: "ACM admission webhook still present after teardown",
+			})
+			continue
+		}
 		if hook.ServiceNamespace == "" {
 			report.Residue = append(report.Residue, operatorv1.ResidueItem{
 				Kind: hook.Kind, Name: hook.Name,

@@ -178,6 +178,7 @@ func (r *HubTeardownReconciler) observeForVerification(ctx context.Context, log 
 			Kind:             "ValidatingWebhookConfiguration",
 			Name:             vwcList.Items[i].Name,
 			ServiceNamespace: firstValidatingWebhookServiceNamespace(vwcList.Items[i].Webhooks),
+			ACMOwned:         hasInstallerLabels(vwcList.Items[i].Labels, td.Namespace),
 		})
 	}
 
@@ -190,6 +191,7 @@ func (r *HubTeardownReconciler) observeForVerification(ctx context.Context, log 
 			Kind:             "MutatingWebhookConfiguration",
 			Name:             mwcList.Items[i].Name,
 			ServiceNamespace: firstMutatingWebhookServiceNamespace(mwcList.Items[i].Webhooks),
+			ACMOwned:         hasInstallerLabels(mwcList.Items[i].Labels, td.Namespace),
 		})
 	}
 
@@ -242,6 +244,19 @@ func (r *HubTeardownReconciler) observeForVerification(ctx context.Context, log 
 	}
 
 	return input, nil
+}
+
+// hasInstallerLabels reports whether an object carries the labels ACM stamps on
+// what it installs. installer.namespace is the same selector the RBAC inventory
+// uses; installer.name catches objects installed before that label was added.
+func hasInstallerLabels(objLabels map[string]string, namespace string) bool {
+	if objLabels == nil {
+		return false
+	}
+	if objLabels["installer.namespace"] == namespace {
+		return true
+	}
+	return objLabels["installer.name"] == "multiclusterhub"
 }
 
 func firstValidatingWebhookServiceNamespace(hooks []admissionregistrationv1.ValidatingWebhook) string {
