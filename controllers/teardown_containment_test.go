@@ -37,6 +37,12 @@ func TestPhaseDeleteACMCRDsRetainsMetal3CRD(t *testing.T) {
 	acmCRD := containmentCRD("managedclusters.cluster.open-cluster-management.io",
 		"cluster.open-cluster-management.io", "ManagedCluster", "managedclusters")
 	bmoCRD := containmentCRD("baremetalhosts.metal3.io", "metal3.io", "BareMetalHost", "baremetalhosts")
+	// Even a platform CRD that somehow carries the installer labels is not
+	// eligible: group ownership is a hard boundary, not a confidence input.
+	bmoCRD.Labels = map[string]string{
+		"installer.name":      testHubRef().Name,
+		"installer.namespace": testHubRef().Namespace,
+	}
 	r := &HubTeardownReconciler{
 		Client:   fake.NewClientBuilder().WithScheme(s).WithObjects(acmCRD, bmoCRD).Build(),
 		Scheme:   s,

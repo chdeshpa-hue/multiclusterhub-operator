@@ -1,31 +1,37 @@
 # HubTeardown: Orchestrated RHACM Uninstallation
 
-HubTeardown provides a phased, observable, and safe alternative to the classic `kubectl delete mch` uninstall workflow. It scans the cluster for dependencies before making any changes, executes teardown in ordered phases with per-phase status tracking, and handles stuck finalizers with explicit admin approval gates.
+HubTeardown is a phased, observable, evidence-gated alternative to
+`oc delete multiclusterhub`. It inspects the hub first, reports every blocker
+and cloud risk, and only then runs teardown in a short-lived Job with its own
+ServiceAccount. The always-on operator performs the dry-run inspection, deletes
+the target MCH, and verifies the postcondition; it does not execute the
+destructive prepare or handoff phases.
 
-## When to Use HubTeardown vs Classic Delete
+## When to use it
 
-| Scenario | Recommended Method |
+| Scenario | Recommended method |
 |---|---|
-| Simple hub with no managed clusters | Classic `kubectl delete mch` |
-| Multi-cluster environment with managed clusters | HubTeardown |
-| Hypershift / Hosted Control Plane clusters present | HubTeardown |
-| Hive-provisioned clusters (ClusterDeployments) present | HubTeardown |
+| Simple hub with no managed clusters | `oc delete multiclusterhub` |
+| Managed clusters, hosted clusters, or Hive clusters present | HubTeardown |
+| Need a preview of blockers and cloud risk before deleting anything | HubTeardown |
+| Need explicit, report-bound consent for destructive work | HubTeardown |
 | History of stuck finalizers during uninstall | HubTeardown |
-| Need to preview what will happen before committing | HubTeardown |
-| Need to pause mid-teardown and resume later | HubTeardown |
-| Automated pipeline with simple pass/fail | Classic delete |
 
-HubTeardown's phase 6 (`DeleteMCH`) ultimately triggers the classic MCH finalizer path internally, so the two methods compose rather than compete.
+Creating a HubTeardown with the default spec only inspects. A plain
+`oc delete multiclusterhub` with no HubTeardown keeps its existing behaviour.
 
 ## Prerequisites
 
-- MultiClusterHub operator is installed and running.
-- The `HubTeardown` CRD is present on the cluster (`hubteardowns.operator.open-cluster-management.io`).
-- The user has RBAC permissions to create, patch, and delete `HubTeardown` resources in the hub namespace.
+- The MultiClusterHub operator is installed and running.
+- The `hubteardowns.operator.open-cluster-management.io` CRD is present.
+- The report ConfigMap and the `HubTeardown` CR live in the operator namespace,
+  which is preserved by design (the operator, CSV, Subscription and
+  OperatorGroup survive a teardown).
+- The user can create and patch `HubTeardown` resources.
 
 ## Workflow
 
-### Step 1: Create the HubTeardown CR in dry-run mode
+### 1. Inspect
 
 ```bash
 cat <<EOF | oc apply -f -
@@ -35,380 +41,177 @@ metadata:
   name: teardown
   namespace: open-cluster-management
 spec:
+  hubRef:
+    apiVersion: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: multiclusterhub
+    namespace: open-cluster-management
   dryRun: true
 EOF
 ```
 
-The controller will scan the cluster and populate the status with a full teardown preview. No resources are modified in dry-run mode.
+`spec.hubRef` is required. The controller targets exactly that MCH and never
+infers a target from whichever MCH happens to exist. Only one HubTeardown may
+exist in the cluster; the validating webhook rejects a second CR, regardless of
+namespace or `hubRef`.
 
-### Step 2: Review the dry-run report
-
-Check the overall summary:
+### 2. Read the report
 
 ```bash
 oc get hubteardown teardown -n open-cluster-management
+oc get hubteardown teardown -n open-cluster-management -o yaml
+oc get configmap -n open-cluster-management \
+  -l open-cluster-management.io/uninstall-report=true
 ```
 
-Review the detailed dry-run report:
+The report ConfigMap carries `report.json` (complete typed inventory, blocker
+and cloud-risk records), `report.txt` (human-readable), and `meta.json`
+(generation, timestamps, discovery mode, exclusions). Status carries only the
+first 32 blockers; the ConfigMap is the complete record. `status.summary` and
+`status.cloudRisk` are never truncated.
+
+### 3. Consent to the exact report
+
+Consent is bound to the report digest, not its name:
 
 ```bash
-oc get hubteardown teardown -n open-cluster-management -o jsonpath='{.status.dryRunReport.summary}'
+DIGEST=$(oc get hubteardown teardown -n open-cluster-management \
+  -o jsonpath='{.status.reportDigest}')
+oc patch hubteardown teardown -n open-cluster-management --type=merge \
+  -p "{\"spec\":{\"dryRun\":false,\"acknowledgedReportDigest\":\"${DIGEST}\"}}"
 ```
 
-Check for cloud resource warnings:
+If the inspection regenerates the report, the digest changes and consent
+lapses. An empty `status.reportDigest` means there is nothing to consent to yet.
+
+If an action may orphan resources outside the cluster, read the cloud-risk
+section and then acknowledge it explicitly:
 
 ```bash
-oc get hubteardown teardown -n open-cluster-management \
-  -o jsonpath='{range .status.cloudResourceWarnings[*]}{.resource.kind}/{.resource.namespace}/{.resource.name}: {.riskSummary}{"\n"}{end}'
+oc patch hubteardown teardown -n open-cluster-management --type=merge \
+  -p '{"spec":{"acknowledgeCloudResourceRisk":true}}'
 ```
 
-Review blocking resources:
+This is the only consent flag. It is required for every cloud-risk action in
+every escalation mode, including `Automatic`.
 
-```bash
-oc get hubteardown teardown -n open-cluster-management \
-  -o jsonpath='{range .status.blockingResources[*]}{.kind}/{.name}: {.reason}{"\n"}{end}'
-```
-
-### Step 3: Begin teardown
-
-Once you have reviewed the dry-run report, disable dry-run to start the teardown:
-
-```bash
-oc patch hubteardown teardown -n open-cluster-management \
-  --type=merge -p '{"spec":{"dryRun":false}}'
-```
-
-On activation, the controller re-scans the cluster and compares with the dry-run report. If blocking or cloud-risk resource counts have changed since the scan, a `DryRunReportStale` warning condition is set and the updated report is written to status.
-
-During active teardown, the MCH reconciler automatically suspends component deployment to prevent conflicts with teardown phases.
-
-### Step 4: Monitor progress
-
-Watch phase progression:
+### 4. Monitor
 
 ```bash
 oc get hubteardown teardown -n open-cluster-management -w
-```
-
-View per-phase detail:
-
-```bash
 oc get hubteardown teardown -n open-cluster-management \
   -o jsonpath='{range .status.phases[*]}{.phase}: {.state} - {.message}{"\n"}{end}'
-```
-
-Check events emitted by the controller:
-
-```bash
 oc get events -n open-cluster-management \
   --field-selector reason!=LeaderElection --sort-by='.lastTimestamp' | grep -i teardown
 ```
 
-Check operator logs:
+### 5. Pause
 
-```bash
-oc logs -n open-cluster-management deployment/multiclusterhub-operator \
-  --tail=200 | grep -i hubteardown
-```
+Setting `dryRun: true` pauses execution and re-scans. Completed phases are not
+re-run when teardown resumes.
 
-### Step 5: Escalate flags if stuck
+### 6. Verify the postcondition
 
-If teardown is stuck, the phase status message will tell you exactly which approval flag is needed. For example:
+Verify runs after the MCH is gone and writes `Complete` only when the declared
+survivors are the only objects left. Anything else produces
+`CompleteWithResidue` with a `status.residue` record. `Failed` is terminal and
+carries the residue observed at the deadline.
 
-```
-Waiting for 3 addons to terminate. Set spec.approvedDestructiveActions=true to patch Tier 2 (non-cloud) finalizers.
-```
-
-To approve Tier 2 (non-cloud) finalizer removal:
-
-```bash
-oc patch hubteardown teardown -n open-cluster-management \
-  --type=merge -p '{"spec":{"approvedDestructiveActions":true}}'
-```
-
-To approve Tier 1 (cloud-protecting) finalizer removal — **this will orphan cloud infrastructure that requires manual cleanup**:
-
-```bash
-oc patch hubteardown teardown -n open-cluster-management \
-  --type=merge -p '{"spec":{"acknowledgeCloudResourceRisk":true}}'
-```
-
-**Consent is bound to the report.** Approval flags alone do not start
-destructive work: the controller also requires `spec.acknowledgedReportDigest`
-to equal `status.reportDigest`, the digest of the report it wrote and you read.
-When the report changes the digest changes and consent lapses; the condition
-reports `ConsentLapsed` until the new digest is acknowledged.
-
-```bash
-oc get hubteardown teardown -n open-cluster-management \
-  -o jsonpath='{.status.reportDigest}{"\n"}'
-oc patch hubteardown teardown -n open-cluster-management --type=merge \
-  -p '{"spec":{"acknowledgedReportDigest":"<digest from status>"}}'
-```
-
-A CR created directly with `dryRun: false` gets its report written on the first
-reconcile; acknowledge that digest to proceed. An empty `status.reportDigest`
-means there is nothing to consent to yet.
-
-If teardown exceeds `maxDuration` (default 2 hours), a `Stalled` condition is set with guidance on what is blocking and which approval flags to consider.
-
-### Step 6: Pause at any time
-
-You can pause teardown and re-scan at any point by toggling dry-run back on:
-
-```bash
-oc patch hubteardown teardown -n open-cluster-management \
-  --type=merge -p '{"spec":{"dryRun":true}}'
-```
-
-Completed phases are not re-executed on resume.
-
-### Step 7: Post-teardown verification
-
-After teardown completes, check the final status:
-
-```bash
-oc get hubteardown teardown -n open-cluster-management -o yaml
-```
-
-If cloud resources were orphaned (Tier 1 finalizers were patched), check the events for a summary of what needs manual cleanup:
-
-```bash
-oc get events -n open-cluster-management \
-  --field-selector reason=CloudResourcesOrphaned
-```
-
-Verify cloud resources in the relevant provider console (AWS, Azure, GCP) using the resource details from the events.
-
-## Spec Reference
+## Spec reference
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `dryRun` | `bool` | `true` | When true, the controller scans and reports without mutating any resources. Set to false to begin teardown. Can be toggled back to true at any time to pause. |
-| `approvedDestructiveActions` | `bool` | `false` | Enables Tier 2 (non-cloud) finalizer patching for stuck resources. Only evaluated when `dryRun` is false. |
-| `acknowledgeCloudResourceRisk` | `bool` | `false` | Enables Tier 1 (cloud-protecting) finalizer patching. Setting this means you accept that cloud infrastructure (VMs, LBs, storage, DNS) may be orphaned and require manual cleanup. |
-| `acknowledgedReportDigest` | `string` | `""` | Digest of the inspection report the administrator read. Must equal `status.reportDigest` before any destructive phase runs; when the report changes the digest changes and consent lapses. |
-| `forceFinalizerTimeout` | `duration` | `5m` | How long to wait for a controller to process its own finalizer before the teardown controller intervenes. |
-| `maxDuration` | `duration` | `2h` | Maximum wall-clock time for the entire teardown. If exceeded, a `Stalled` condition is set with guidance on what is blocking. |
+| `hubRef` | `ObjectReference` | required | Exact MultiClusterHub to tear down. |
+| `dryRun` | `bool` | `true` | Inspect only. Set to `false` to execute. |
+| `mce` | `Default` \| `Preserve` | `Default` | `Default` removes an MCE created by this MCH and preserves a pre-existing one. `Preserve` never touches MCE. Removing a pre-existing MCE is not offered. |
+| `acknowledgeCloudResourceRisk` | `bool` | `false` | Accepts that an authorized action may orphan cloud resources. Required whenever `cloudRisk.mayOrphan` is true. |
+| `acknowledgedReportDigest` | `string` | `""` | Digest of the report the administrator read. Must equal `status.reportDigest`. |
+| `escalation.stallTimeout` | `duration` | `15m` | No-progress bound, measured over the blocker model. |
+| `escalation.maxDuration` | `duration` | `2h` | Terminal bound; expiry writes `Failed` with the residue. |
+| `escalation.mode` | `Manual` \| `Automatic` | `Manual` | `Automatic` may escalate a stalled non-cloud action without further consent; cloud-risk actions always require consent. |
+| `forceFinalizerTimeout` | `duration` | deprecated | Fallback for `escalation.stallTimeout`. |
+| `maxDuration` | `duration` | deprecated | Fallback for `escalation.maxDuration`. |
 
-## Phase Reference
+## Status reference
 
-HubTeardown executes 10 phases in order. Each phase reports its status (Pending, InProgress, Complete, Failed, Skipped) with start and completion timestamps.
-
-### 1. GateOLMSubscription
-
-Adds a finalizer (`operator.open-cluster-management.io/teardown-gate`) to the ACM OLM Subscription. This prevents the operator from being removed by OLM before teardown completes. The finalizer is re-added on every reconcile if manually removed. Skipped if no ACM Subscription is found.
-
-### 2. RemoveBlockingCRs
-
-Deletes resources that block the MCH validating webhook:
-- `MultiClusterObservability`
-- `DiscoveryConfig`
-- `AgentServiceConfig`
-- `SearchCustomization`
-- Orphaned admission webhooks whose backing services are gone
-
-Waits for each to be fully removed before proceeding.
-
-### 3. DisableAddons
-
-Clears addon placements from `ClusterManagementAddOn` resources, scales down addon controllers, and deletes `ManagedClusterAddOn` resources for all non-local ManagedClusters. Resolves stuck addon finalizers based on approval flags. Local-cluster addons are skipped (handled in phase 6). If stuck, the status message indicates which approval flag is needed.
-
-### 4. DeleteInfrastructureCRs
-
-Deletes infrastructure provisioning CRs while their controllers are still running:
-- `HostedCluster` and `NodePool` (HyperShift)
-- `ClusterDeployment` and `ClusterPool` (Hive)
-- `InfraEnv` (assisted-installer)
-- `ClusterInstance` (siteconfig)
-
-**Cloud risk gate:** This phase requires `acknowledgeCloudResourceRisk: true` when infrastructure CRs exist. For Hive-provisioned clusters, the delete triggers Hive's deprovision pod which cleans up cloud resources (VMs, VPCs, DNS, security groups). For HyperShift, the delete triggers the HyperShift operator's cleanup. The phase waits for all infrastructure CRs to fully terminate before proceeding.
-
-If infrastructure CRs are stuck finalizing, the status message indicates which approval flag is needed.
-
-### 5. DetachManagedClusters
-
-Deletes all non-local `ManagedCluster` resources. If a ManagedCluster has been stuck deleting longer than `forceFinalizerTimeout`, the controller resolves stuck finalizers (subject to approval flags). Unreachable clusters have their addon finalizers force-stripped after timeout. `local-cluster` is always preserved.
-
-### 6. DeleteMCH
-
-Deletes the `MultiClusterHub` CR. This triggers the classic MCH finalizer path internally (`finalizeHub`), which handles app subscriptions, HelmRelease cleanup, namespace teardown, ClusterRole/Binding cleanup, and MCE removal. Resolves blocking MCH finalizers (including submariner and ClusterManagementAddOn finalizers) after timeout.
-
-### 7. MonitorMCEChain
-
-Monitors the downstream deletion chain: waits for `MultiClusterHub` and `MultiClusterEngine` to be fully removed. Resolves orphaned `ClusterManager` finalizer if the MCE operator deployment is already gone. This covers the MCE -> ClusterManager -> Hypershift operator cleanup cascade.
-
-### 8. CleanOrphans
-
-Re-scans the cluster for any stuck-terminating ACM/MCE resources left after the MCE chain completes. Resolves stuck finalizers based on tier and approval flags. Releases the OLM Subscription gate finalizer. Emits a summary event listing any orphaned cloud resources.
-
-### 9. DeleteACMCRDs
-
-Removes all ACM/MCE CRDs from the cluster.
-
-### 10. RemoveOLMOperator
-
-Persists `Complete` status, then deletes the OLM Subscription and ClusterServiceVersion. This is the point of no return — deleting the CSV terminates the operator pod. The teardown cleanup Job (if running) handles any remaining work.
-
-## Safety Features
-
-### MCH Reconciler Awareness
-
-During active teardown, the MCH reconciler detects the HubTeardown CR and suspends all component deployment (`ensureComponent()` calls are skipped). This prevents the MCH reconciler from fighting teardown by re-creating addon deployments that teardown phase 3 just scaled down. A `TeardownInProgress` condition is set on the MCH so `oc get mch` shows the suspended state.
-
-### Singleton Guard
-
-Only one HubTeardown CR can be active at a time. If a second CR is created, it is immediately rejected with a `DuplicateRejected` condition.
-
-### Dry-Run Report Freshness
-
-When transitioning from `dryRun: true` to `dryRun: false`, the controller re-scans the cluster and compares the current state with the dry-run report. If blocking or cloud-risk resource counts have changed, a `DryRunReportStale` warning condition and event are emitted, and the dry-run report in status is updated to reflect current state.
-
-### Overall Stall Detection
-
-If teardown exceeds `maxDuration` (default 2h), a `Stalled` condition is set. The stall message includes:
-- How long teardown has been running
-- Which phase is stuck and why
-- Which approval flag to set to unblock (phase-specific guidance)
-
-### OLM Gate Persistence
-
-The OLM Subscription gate finalizer is re-verified on every active reconcile. If an admin or OLM catalog update removes it, the controller re-adds it to prevent the operator from being deleted mid-teardown.
-
-## Finalizer Tiers
-
-The teardown controller classifies known finalizers into two tiers to control the risk of automatic removal.
-
-### Tier 1: Cloud-Protecting
-
-These finalizers guard cloud infrastructure. Removing them orphans resources (VMs, load balancers, DNS records, storage) that require manual cleanup in the cloud provider console.
-
-| Finalizer | Description |
+| Field | Meaning |
 |---|---|
-| `hypershift.openshift.io/finalizer` | Hypershift cluster lifecycle: VMs, LBs, security groups, DNS |
-| `hypershift.io/aws-oidc-discovery` | AWS S3 OIDC discovery documents |
-| `hypershift.openshift.io/control-plane-operator-finalizer` | AWS PrivateLink / GCP Private Service Connect |
-| `hive.openshift.io/deprovision` | Full cluster infrastructure deprovisioning |
-| `agentserviceconfig.agent-install.openshift.io/ai-deprovision` | Assisted-installer provisioned infrastructure |
+| `phase` | Current high-level phase. |
+| `observedGeneration` | Generation reflected by the status. |
+| `summary` | Never-truncated blocker and consent counts. |
+| `blockers` / `blockersTruncated` | First 32 blockers, ordered by consent, confidence, age and name; the rest are counted. |
+| `cloudRisk` | Aggregated by platform and resource type; never truncated. |
+| `reportRef` / `reportDigest` | Current report and the digest consent must match. |
+| `residue` | Postcondition record written by Verify or a terminal failure. |
+| `phases` | Per-phase state and message. |
+| `conditions` | Inspection, consent, stall, handoff and verification state. |
 
-**Requires:** `spec.acknowledgeCloudResourceRisk: true`
+## Phases and jobs
 
-### Tier 2: Non-Cloud
+The operator and the two Jobs interleave in this order:
 
-These finalizers protect Kubernetes-level state only. Removing them skips graceful cleanup of in-cluster resources but does not orphan cloud infrastructure.
+| Order | Executor | Phase | Work |
+|---:|---|---|---|
+| 1 | prepare Job (`hubteardown-cleanup`, `--teardown-plan=prepare`) | `DisableAddons` | Clears addon placements, scales down addon controllers, and deletes `ManagedClusterAddOn` resources for non-local clusters. |
+| 2 | prepare Job | `DeleteInfrastructureCRs` | Deletes HyperShift, Hive, assisted-installer and siteconfig infrastructure CRs while their controllers are alive. |
+| 3 | prepare Job | `DetachManagedClusters` | Deletes non-local `ManagedCluster` resources. `local-cluster` is retained until MCH deletion and reported as an explicit disposition, not silently skipped. |
+| 4 | handoff Job (`hubteardown-handoff`, `--teardown-plan=handoff`) | `RemoveBlockingCRs` | Deletes MCH-webhook blockers and sweeps dangling `ValidatingWebhookConfiguration`, `MutatingWebhookConfiguration` and `APIService` registrations whose backing Service is gone. |
+| 5 | operator | `DeleteMCH` | Deletes exactly `spec.hubRef`; it never patches the MCH or a blocker finalizer. |
+| 6 | handoff Job | `MonitorMCEChain` | Resolves finalizers blocking `finalizeHub`, then waits for the MCH and MCE chain to settle. `spec.mce` decides whether a pre-existing MCE is retained. |
+| 7 | handoff Job | `DeleteACMCRDs` | Deletes only evidence-backed ACM-owned CRDs, disabling conversion webhooks first. `metal3.io` CRDs and instances are report-only. |
+| 8 | operator | `Verifying` | Runs the postcondition and writes the terminal state. |
 
-| Finalizer | Description |
-|---|---|
-| `managedcluster-import-controller.open-cluster-management.io/cleanup` | Import controller state cleanup |
-| `addon.open-cluster-management.io/addon-pre-delete` | Addon pre-delete hook execution |
-| `work.open-cluster-management.io/manifest-work-cleanup` | ManifestWork cleanup |
-| `search.open-cluster-management.io/finalizer` | Search index cleanup |
-| `uninstall-helm-release` | HelmRelease state cleanup |
-| `operator.open-cluster-management.io/cluster-manager-cleanup` | ClusterManager CRD cleanup |
-| `finalizer.operator.open-cluster-management.io` | MCH operator hub finalizer |
-| `finalizer.multicluster.openshift.io` | MCE operator backplane finalizer |
+The operator waits for each handoff-Job phase to record completion before moving
+to the next operator-owned step. `MonitorMCEChain` begins after
+`RemoveBlockingCRs` completes and may start resolving finalizers before the
+operator deletes the MCH; it does not report completion until the MCH and MCE
+chain have settled.
 
-**Requires:** `spec.approvedDestructiveActions: true`
+Both Jobs run as ServiceAccount `hubteardown-handoff`, bound to the static
+`acm-uninstall-handoff` ClusterRole shipped in the bundle. They use
+`backoffLimit: 2` and a one-hour TTL after completion. The operator creates the
+identity and the Jobs; the destructive phase verbs are carried by the Job's
+static role. This feature does not add those destructive grants to the
+operator's role. The operator's pre-existing broad permissions remain separate,
+tracked conformance debt.
 
-### Unknown Finalizers
+## Authorization model
 
-Finalizers not in either allowlist are never automatically removed. They require manual intervention.
+Every destructive action goes through one authorizer:
 
-## Resilient Teardown Job
+- Ownership must be `Definitive` or `Strong`, backed by evidence such as the
+  installer labels, an owner-reference chain, a labelled defining CRD, or a
+  backing Service in an owned namespace. A name or API-group match is
+  report-only.
+- Removing a finalizer additionally requires `controllerAlive == false`.
+  `nil` means unknown and is treated as alive.
+- Cloud-risk actions additionally require valid digest-bound consent.
+- Unknown or unowned dangling registrations are retained and reported.
 
-When the teardown enters active mode, the controller creates a Kubernetes Job (`hubteardown-cleanup`) that runs the operator binary with `--teardown-mode`. This Job:
-
-- Survives operator pod deletion (e.g., if OLM removes the operator deployment).
-- Runs a minimal manager with only the HubTeardown controller (no webhooks, no leader election).
-- Uses the same operator image and service account.
-- Is automatically cleaned up when teardown completes.
-- Has a backoff limit of 6 retries and a TTL of 1 hour after completion.
-
-The Job is a safety net. The primary controller path works independently. If `OPERATOR_IMAGE` is not set in the operator environment, the Job is skipped and teardown relies on the controller only.
+There is no force-strip path and no Tier-based authorization. The Tier-1 table
+survives only as the cloud-risk classification input.
 
 ## Troubleshooting
 
-### Teardown stuck in a phase
+| Symptom | Check |
+|---|---|
+| Phase does not advance | `status.phases[*].message`, events, and the report's blocker rows. |
+| Stuck in `ConsentRequired` | Compare `spec.acknowledgedReportDigest` with `status.reportDigest`; re-read a regenerated report. |
+| Cloud action refused | `status.cloudRisk`, then set `acknowledgeCloudResourceRisk` after review. |
+| MCH deleting but not gone | The handoff Job resolves evidence-backed operand finalizers before waiting; `controllerAlive: true` or unknown means wait. Check operator logs. |
+| Prepare Job failed | Inspect `oc logs job/hubteardown-cleanup -n open-cluster-management`; delete the Job to retry. |
+| Handoff Job failed | Inspect `oc logs job/hubteardown-handoff -n open-cluster-management`; the teardown ends `Failed` rather than waiting out the deadline. |
 
-Check which phase is stuck and what it needs:
-
-```bash
-oc get hubteardown teardown -n open-cluster-management \
-  -o jsonpath='{range .status.phases[*]}{.phase}: {.state} - {.message}{"\n"}{end}'
-```
-
-The phase status message will indicate exactly which approval flag is needed. Common causes:
-
-- **RemoveBlockingCRs**: A blocking CR has its own finalizer that is not completing. Check the resource directly.
-- **DisableAddons**: Addon finalizers are stuck. The message will say whether to set `approvedDestructiveActions` or `acknowledgeCloudResourceRisk`.
-- **DeleteInfrastructureCRs**: Hive deprovision pods or HyperShift cleanup is still running (can take 15-45 minutes per cluster). If stuck, the message will indicate which approval flag is needed.
-- **DetachManagedClusters**: ManagedClusters have finalizers that the responsible controller is not processing. Consider setting `approvedDestructiveActions: true` after verifying the resources.
-- **DeleteMCH**: The classic MCH finalizer path is stuck. Check the operator logs for `Finalizing:` messages.
-- **MonitorMCEChain**: MCE has a finalizer that is not being processed. Check the MCE operator logs.
-- **CleanOrphans**: Stuck resources need approval flags. The phase status message will indicate which flags to set.
-
-### Stalled condition
-
-If the `Stalled` condition appears, teardown has exceeded `maxDuration`. The condition message includes which phase is stuck and which approval flag to set. You can increase `maxDuration` to allow more time:
-
-```bash
-oc patch hubteardown teardown -n open-cluster-management \
-  --type=merge -p '{"spec":{"maxDuration":"4h"}}'
-```
-
-### Dry-run report changed on activation
-
-If a `DryRunReportStale` condition appears when you set `dryRun: false`, the cluster state changed since the dry-run scan. Review the updated report in `status.dryRunReport` and the condition message for what changed (e.g., "blocking resources 2→3, cloud-risk resources 0→1").
-
-### Cloud resource warnings
-
-If `status.cloudResourceWarnings` is populated, review each warning carefully before setting `acknowledgeCloudResourceRisk: true`. The warnings include:
-- The specific cloud resources at risk (by platform: AWS, Azure, GCP).
-- The current state of the resource (phase, whether it is already terminating).
-- Instructions for manual verification in the cloud provider console.
-
-### Resuming after a pause
-
-If you paused teardown by setting `dryRun: true`, phases that already completed will not re-run. Setting `dryRun: false` resumes from the next incomplete phase.
-
-### The teardown Job
-
-If the operator pod is removed and the teardown Job takes over, you can monitor it:
-
-```bash
-oc get job hubteardown-cleanup -n open-cluster-management
-oc logs job/hubteardown-cleanup -n open-cluster-management
-```
-
-The Job runs the same controller logic and updates the same `HubTeardown` CR status.
-
-## Architecture
-
-```
-HubTeardown CR (dryRun: true)  -> scan -> dryRunReport
-HubTeardown CR (dryRun: false) -> re-scan (staleness check)
-                               -> GateOLMSubscription
-                               -> RemoveBlockingCRs
-                               -> DisableAddons
-                               -> DeleteInfrastructureCRs (cloud risk gate)
-                               -> DetachManagedClusters
-                               -> DeleteMCH (triggers finalizeHub)
-                               -> MonitorMCEChain
-                               -> CleanOrphans + release OLM gate
-                               -> DeleteACMCRDs
-                               -> RemoveOLMOperator (self-destruct)
-                               -> Complete
-```
-
-### Key files
+## Key files
 
 | File | Purpose |
 |---|---|
-| `api/v1/hubteardown_types.go` | CRD types, spec, status, phase enums |
-| `controllers/hubteardown_controller.go` | Main reconciler, dry-run scan, stall detection, phase dispatch |
-| `controllers/teardown_execute.go` | Phase implementations (10 phases) |
-| `controllers/teardown_finalizers.go` | Tier 1/2 finalizer classification and resolution |
-| `controllers/teardown_graph.go` | Dependency graph builder for dry-run report |
-| `controllers/teardown_job.go` | Resilient cleanup Job lifecycle |
-| `controllers/teardown_warnings.go` | Cloud resource warning builder |
-| `controllers/teardown_test.go` | Unit tests (20 tests) |
+| `api/v1/hubteardown_types.go` | Spec, status, phases and escalation types |
+| `controllers/hubteardown_controller.go` | Operator plan, inspection, stall and handoff lifecycle |
+| `controllers/teardown_authorization.go` | Single authorizer for every destructive action |
+| `controllers/teardown_execute.go` | Phase implementations |
+| `controllers/teardown_finalizers.go` | Finalizer classification and policy-bound removal |
+| `controllers/teardown_graph.go` | Layer-1 inventory walk and dependency graph |
+| `controllers/teardown_job.go` | Prepare and handoff Job lifecycle |
+| `controllers/teardown_verify.go` | Postcondition and terminal state |
+| `config/rbac/handoff_role.yaml` | Static destructive identity used only by the Jobs |

@@ -29,6 +29,11 @@ const (
 	reportLabelUninstall = "open-cluster-management.io/uninstall-report"
 	// reportLabelTeardown scopes the retention sweep to one HubTeardown.
 	reportLabelTeardown = "open-cluster-management.io/teardown"
+	// reportInstallerName is the product identity must-gather and ownership
+	// tooling expect on every artifact produced by this installation.
+	reportInstallerName    = "installer.name"
+	reportInstallNamespace = "installer.namespace"
+	reportInstallerProduct = "multiclusterhub"
 
 	reportKeyJSON = "report.json"
 	reportKeyText = "report.txt"
@@ -68,12 +73,13 @@ type inspectReport struct {
 // inventorySection states what the scan covered. It exists so a reader can
 // tell "nothing found" from "not looked at".
 type inventorySection struct {
-	ObjectsSeen       int              `json:"objectsSeen"`
-	DiscoveryPath     string           `json:"discoveryPath"`
-	InventoryComplete bool             `json:"inventoryComplete"`
-	Incomplete        []ScanIncomplete `json:"incomplete,omitempty"`
-	MCHPresent        bool             `json:"mchPresent"`
-	Ownership         string           `json:"ownershipClassification"`
+	ObjectsSeen             int              `json:"objectsSeen"`
+	DiscoveryPath           string           `json:"discoveryPath"`
+	InventoryComplete       bool             `json:"inventoryComplete"`
+	Incomplete              []ScanIncomplete `json:"incomplete,omitempty"`
+	MCHPresent              bool             `json:"mchPresent"`
+	Ownership               string           `json:"ownershipClassification"`
+	LocalClusterDisposition string           `json:"localClusterDisposition,omitempty"`
 }
 
 // reportMeta is the index a reader (and the controller) uses before parsing
@@ -111,24 +117,20 @@ func blockersFromGraph(graph *DependencyGraph, scanTime metav1.Time, consent pol
 			seen[dr.UID] = struct{}{}
 		}
 
-		cloud := false
-		allowlisted := false
+		cloudProtecting := false
+		mayOrphan := false
 		for _, finalizer := range dr.Finalizers {
 			if IsCloudProtectingFinalizer(finalizer) {
-				cloud = true
-				continue
+				cloudProtecting = true
+				if mayOrphanOnPlatform(dr.Platform) {
+					mayOrphan = true
+				}
 			}
-			if IsAllowlistedFinalizer(finalizer) {
-				allowlisted = true
-			}
-		}
-		if !cloud && !allowlisted {
-			continue
 		}
 
 		classification := dr.Classification
 		if classification == "" {
-			if cloud && isKnownCloudPlatform(dr.Platform) {
+			if mayOrphan {
 				classification = operatorv1.ClassCloudProtecting
 			} else {
 				classification = operatorv1.ClassUnknown
@@ -154,10 +156,13 @@ func blockersFromGraph(graph *DependencyGraph, scanTime metav1.Time, consent pol
 			blocker.DeletionTimestamp = dr.DeletionTimestamp.DeepCopy()
 			blocker.BlockedSince = *dr.DeletionTimestamp
 		}
-		if cloud {
-			mayOrphan := isKnownCloudPlatform(dr.Platform)
+		if cloudProtecting {
+			platform := dr.Platform
+			if platform == "" {
+				platform = "Unknown"
+			}
 			blocker.CloudRisk = &operatorv1.CloudRisk{
-				Platform:      dr.Platform,
+				Platform:      platform,
 				PlatformKnown: isKnownPlatform(dr.Platform),
 				ResourceType:  dr.Ref.Kind,
 				MayOrphan:     mayOrphan,
@@ -217,6 +222,68 @@ func summarizeBlockers(blockers []operatorv1.Blocker) operatorv1.BlockerSummary 
 	return summary
 }
 
+// aggregateCloudRisk is the status projection of every blocker that may orphan
+// resources outside the cluster. It is aggregated by platform and resource
+// type and is never truncated: consent has to be informed by the whole list,
+// not the first 32 rows.
+func aggregateCloudRisk(blockers []operatorv1.Blocker) []operatorv1.CloudRiskSummary {
+	type key struct {
+		platform string
+		resource string
+	}
+	counts := map[key]int32{}
+	namespaces := map[key]map[string]struct{}{}
+	hints := map[key]string{}
+
+	for i := range blockers {
+		blocker := &blockers[i]
+		if blocker.CloudRisk == nil || !blocker.CloudRisk.MayOrphan {
+			continue
+		}
+		platform := blocker.CloudRisk.Platform
+		if platform == "" {
+			platform = "Unknown"
+		}
+		resource := blocker.CloudRisk.ResourceType
+		if resource == "" {
+			resource = "cloud"
+		}
+		k := key{platform: platform, resource: resource}
+		counts[k]++
+		if namespaces[k] == nil {
+			namespaces[k] = map[string]struct{}{}
+		}
+		if blocker.Namespace != "" {
+			namespaces[k][blocker.Namespace] = struct{}{}
+		}
+		if _, ok := hints[k]; !ok {
+			hints[k] = fmt.Sprintf("Review %s resources created by %s before approving teardown.", resource, platform)
+		}
+	}
+
+	summary := make([]operatorv1.CloudRiskSummary, 0, len(counts))
+	for k, count := range counts {
+		entry := operatorv1.CloudRiskSummary{
+			Platform:     k.platform,
+			ResourceType: k.resource,
+			Count:        count,
+			ConsoleHint:  hints[k],
+		}
+		for namespace := range namespaces[k] {
+			entry.Namespaces = append(entry.Namespaces, namespace)
+		}
+		sort.Strings(entry.Namespaces)
+		summary = append(summary, entry)
+	}
+	sort.Slice(summary, func(i, j int) bool {
+		if summary[i].Platform != summary[j].Platform {
+			return summary[i].Platform < summary[j].Platform
+		}
+		return summary[i].ResourceType < summary[j].ResourceType
+	})
+	return summary
+}
+
 // capBlockers returns the status view and the number of omitted entries. The
 // view is ordered so a truncation can never hide a resource that needs a
 // consent decision; entries of equal priority keep the report's order.
@@ -257,10 +324,9 @@ func reportConsentState(td *operatorv1.HubTeardown) policy.ConsentState {
 		return policy.ConsentState{}
 	}
 	return policy.ConsentState{
-		ApprovedDestructiveActions: td.Spec.ApprovedDestructiveActions,
-		CloudRiskAcknowledged:      td.Spec.AcknowledgeCloudResourceRisk,
-		AcknowledgedDigest:         td.Spec.AcknowledgedReportDigest,
-		ReportDigest:               td.Status.ReportDigest,
+		CloudRiskAcknowledged: td.Spec.AcknowledgeCloudResourceRisk,
+		AcknowledgedDigest:    td.Spec.AcknowledgedReportDigest,
+		ReportDigest:          td.Status.ReportDigest,
 	}
 }
 
@@ -268,17 +334,26 @@ func reportConsentState(td *operatorv1.HubTeardown) policy.ConsentState {
 func buildInspectReport(td *operatorv1.HubTeardown, graph *DependencyGraph, scanTime metav1.Time, kubeVersion string) (inspectReport, reportMeta) {
 	blockers := blockersFromGraph(graph, scanTime, reportConsentState(td))
 	complete := len(graph.Incomplete) == 0
+	discoveryPath := graph.DiscoveryPath
+	if discoveryPath == "" {
+		discoveryPath = inventory.DiscoveryPathLegacy
+	}
+	objectsSeen := graph.ObjectsSeen
+	if objectsSeen == 0 && len(graph.DiscoveredResources) > 0 {
+		objectsSeen = len(graph.DiscoveredResources)
+	}
 
 	report := inspectReport{
 		Teardown: td.Name,
 		ScanTime: scanTime,
 		Inventory: inventorySection{
-			ObjectsSeen:       len(graph.DiscoveredResources),
-			DiscoveryPath:     inventory.DiscoveryPathLegacy,
-			InventoryComplete: complete,
-			Incomplete:        append([]ScanIncomplete(nil), graph.Incomplete...),
-			MCHPresent:        graph.MCH != nil,
-			Ownership:         reportOwnershipClassified,
+			ObjectsSeen:             objectsSeen,
+			DiscoveryPath:           discoveryPath,
+			InventoryComplete:       complete,
+			Incomplete:              append([]ScanIncomplete(nil), graph.Incomplete...),
+			MCHPresent:              graph.MCH != nil,
+			Ownership:               reportOwnershipClassified,
+			LocalClusterDisposition: graph.LocalClusterDisposition,
 		},
 		Summary:  summarizeBlockers(blockers),
 		Blockers: blockers,
@@ -472,9 +547,11 @@ func (r *HubTeardownReconciler) applyInspection(ctx context.Context, log logr.Lo
 
 	summary := report.Summary
 	td.Status.Summary = &summary
+	td.Status.ObservedGeneration = td.Generation
 	capped, truncated := capBlockers(report.Blockers, reportStatusBlockerCap)
 	td.Status.Blockers = capped
 	td.Status.BlockersTruncated = truncated
+	td.Status.CloudRisk = aggregateCloudRisk(report.Blockers)
 	td.Status.ReportRef = ref
 	// Consent is compared against this digest, never against the report name:
 	// a name can be reused after retention, a digest cannot.
@@ -662,8 +739,10 @@ func (r *HubTeardownReconciler) reportConfigMap(td *operatorv1.HubTeardown, name
 			Name:      name,
 			Namespace: td.Namespace,
 			Labels: map[string]string{
-				reportLabelUninstall: "true",
-				reportLabelTeardown:  td.Name,
+				reportLabelUninstall:   "true",
+				reportLabelTeardown:    td.Name,
+				reportInstallerName:    reportInstallerProduct,
+				reportInstallNamespace: td.Namespace,
 			},
 		},
 		Data: map[string]string{

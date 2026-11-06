@@ -13,7 +13,7 @@ import (
 // cutover is pending. Removing the legacy values is part of that cutover, not
 // of the additive API change.
 //
-// +kubebuilder:validation:Enum=DryRun;RemoveBlockingCRs;DisableAddons;DeleteInfrastructureCRs;DetachManagedClusters;DeleteMCH;MonitorMCEChain;DeleteACMCRDs;Complete;Failed;NotStarted;Inspecting;ReportReady;ConsentRequired;Preparing;HandedOff;Stalled;Verifying;CompleteWithResidue
+// +kubebuilder:validation:Enum=DryRun;RemoveBlockingCRs;DisableAddons;DeleteInfrastructureCRs;DetachManagedClusters;DeleteMCH;MonitorMCEChain;DeleteACMCRDs;Complete;Failed;NotStarted;Inspecting;ReportReady;ConsentRequired;Preparing;HandedOff;Stalled;Escalating;Verifying;CompleteWithResidue
 type TeardownPhase string
 
 const (
@@ -33,12 +33,12 @@ const (
 // legacy phase constants above stay until the controller cutover, because
 // they carry 60+ references across six controller files.
 //
-// NotStarted, ConsentRequired, Preparing, HandedOff and Stalled have no
-// producer yet. The same information is carried by conditions
-// (WaitingForApproval, HandoffReady) and by status.phases, so they are kept as
-// reserved values rather than deleted: a future producer must not have to churn
-// the CRD enum. Inspecting, ReportReady, Verifying and CompleteWithResidue are
-// produced today.
+// NotStarted, ConsentRequired, Preparing and HandedOff have no producer yet.
+// The same information is carried by conditions (WaitingForApproval,
+// HandoffReady) and by status.phases, so they are kept as reserved values
+// rather than deleted: a future producer must not have to churn the CRD enum.
+// Inspecting, ReportReady, Stalled, Escalating, Verifying and
+// CompleteWithResidue are produced today.
 const (
 	TeardownPhaseNotStarted          TeardownPhase = "NotStarted"
 	TeardownPhaseInspecting          TeardownPhase = "Inspecting"
@@ -47,6 +47,7 @@ const (
 	TeardownPhasePreparing           TeardownPhase = "Preparing"
 	TeardownPhaseHandedOff           TeardownPhase = "HandedOff"
 	TeardownPhaseStalled             TeardownPhase = "Stalled"
+	TeardownPhaseEscalating          TeardownPhase = "Escalating"
 	TeardownPhaseVerifying           TeardownPhase = "Verifying"
 	TeardownPhaseCompleteWithResidue TeardownPhase = "CompleteWithResidue"
 )
@@ -64,20 +65,32 @@ const (
 
 // HubTeardownSpec defines the desired state of HubTeardown.
 type HubTeardownSpec struct {
+	// HubRef names the MultiClusterHub this teardown targets. It is required:
+	// the CR is cluster-meaningful and must not infer its target from whichever
+	// MultiClusterHub happens to exist.
+	HubRef corev1.ObjectReference `json:"hubRef"`
+
 	// DryRun when true (the default) causes the controller to scan and report
 	// without mutating any cluster resources. Set to false to begin teardown.
 	// Can be toggled back to true at any time to pause and re-scan.
 	// +kubebuilder:default=true
 	DryRun bool `json:"dryRun"`
 
-	// ApprovedDestructiveActions enables Tier 2 (non-cloud) finalizer
-	// patching for stuck resources. Only evaluated when dryRun is false.
-	ApprovedDestructiveActions bool `json:"approvedDestructiveActions,omitempty"`
+	// MCE selects what happens to MultiClusterEngine.
+	//   Default  - MCE is removed only when this MCH created it (installer
+	//              labels match hubRef); a pre-existing MCE is preserved.
+	//   Preserve - MCE is never touched, even when this MCH created it.
+	// Removing a pre-existing, user-installed MCE is deliberately not offered.
+	// +kubebuilder:validation:Enum=Default;Preserve
+	// +kubebuilder:default=Default
+	// +optional
+	MCE MCEDisposition `json:"mce,omitempty"`
 
-	// AcknowledgeCloudResourceRisk enables Tier 1 (cloud-protecting) finalizer
-	// patching. Setting this to true means the admin accepts that cloud
-	// infrastructure (VMs, LBs, storage, DNS) may be orphaned and will
-	// require manual cleanup in the cloud provider console.
+	// AcknowledgeCloudResourceRisk records that an administrator has read the
+	// cloud-risk section of the report and consents to actions that may orphan
+	// cloud resources (VMs, load balancers, DNS records, volumes) outside this
+	// cluster. It is the ONLY source of consent. Consent is honoured only when
+	// AcknowledgedReportDigest matches status.reportDigest.
 	AcknowledgeCloudResourceRisk bool `json:"acknowledgeCloudResourceRisk,omitempty"`
 
 	// AcknowledgedReportDigest is the digest of the inspection report the
@@ -90,21 +103,76 @@ type HubTeardownSpec struct {
 
 	// ForceFinalizerTimeout is the duration to wait for a controller to
 	// process its own finalizer before the teardown controller intervenes.
-	// Defaults to 5m.
+	// When unset, the effective default is 15m.
+	// Deprecated: use spec.escalation.stallTimeout for new CRs.
 	// +optional
 	ForceFinalizerTimeout *metav1.Duration `json:"forceFinalizerTimeout,omitempty"`
 
 	// MaxDuration is the maximum wall-clock time allowed for the entire
-	// teardown. If exceeded, the controller sets a Stalled condition with
-	// guidance on what is blocking. Defaults to 2h.
+	// teardown. If exceeded, the controller writes a terminal Failed phase with
+	// the residue report. Defaults to 2h.
+	// Deprecated: use spec.escalation.maxDuration for new CRs.
 	// +optional
 	MaxDuration *metav1.Duration `json:"maxDuration,omitempty"`
+
+	// Escalation bounds the destructive phase.
+	// +optional
+	Escalation *EscalationSpec `json:"escalation,omitempty"`
+}
+
+// MCEDisposition selects what happens to MultiClusterEngine.
+// +kubebuilder:validation:Enum=Default;Preserve
+type MCEDisposition string
+
+const (
+	MCEDispositionDefault  MCEDisposition = "Default"
+	MCEDispositionPreserve MCEDisposition = "Preserve"
+)
+
+// EscalationMode selects what happens when a stall is detected.
+// +kubebuilder:validation:Enum=Manual;Automatic
+type EscalationMode string
+
+const (
+	EscalationModeManual    EscalationMode = "Manual"
+	EscalationModeAutomatic EscalationMode = "Automatic"
+)
+
+// EscalationSpec bounds the destructive phase.
+type EscalationSpec struct {
+	// StallTimeout is how long the teardown may make no progress before
+	// escalation is offered. It is measured over the Blocker model, not over
+	// wall-clock phase names.
+	// +kubebuilder:default="15m"
+	// +optional
+	StallTimeout *metav1.Duration `json:"stallTimeout,omitempty"`
+
+	// MaxDuration is a terminal bound. On expiry the teardown writes a terminal
+	// Failed phase with the residue report. It is not advisory.
+	// +kubebuilder:default="2h"
+	// +optional
+	MaxDuration *metav1.Duration `json:"maxDuration,omitempty"`
+
+	// Mode selects what happens when a stall is detected.
+	//   Manual    - report and wait for consent (default)
+	//   Automatic - escalate without further consent, except for any blocker
+	//               with cloudRisk.mayOrphan, which always requires consent.
+	// +kubebuilder:validation:Enum=Manual;Automatic
+	// +kubebuilder:default=Manual
+	// +optional
+	Mode EscalationMode `json:"mode,omitempty"`
 }
 
 // HubTeardownStatus defines the observed state of HubTeardown.
 type HubTeardownStatus struct {
 	// Phase is the current high-level phase of the teardown process.
 	Phase TeardownPhase `json:"phase,omitempty"`
+
+	// ObservedGeneration is the metadata.generation the controller last
+	// reconciled. It lets a reader see whether the status reflects the current
+	// spec without diffing every field.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// DryRunReport contains the full teardown preview generated during
 	// dry-run mode. Updated on each reconcile while dryRun is true.
@@ -120,6 +188,12 @@ type HubTeardownStatus struct {
 	// and their platform-specific risk descriptions.
 	// +optional
 	CloudResourceWarnings []CloudResourceWarning `json:"cloudResourceWarnings,omitempty"`
+
+	// CloudRisk is aggregated per platform and resource type and is never
+	// truncated. An administrator must be able to give informed consent from
+	// status alone.
+	// +optional
+	CloudRisk []CloudRiskSummary `json:"cloudRisk,omitempty"`
 
 	// Summary is the never-truncated aggregate over the complete blocker list.
 	// +optional

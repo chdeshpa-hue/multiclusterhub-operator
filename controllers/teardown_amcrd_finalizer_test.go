@@ -79,9 +79,9 @@ func amcrdTestReconciler(t *testing.T, td *operatorv1.HubTeardown, objs ...runti
 func phaseDeleteACMCRDsTestTD() *operatorv1.HubTeardown {
 	return &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
-		Spec: operatorv1.HubTeardownSpec{
-			DryRun:                     false,
-			ApprovedDestructiveActions: true,
+		Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
+			DryRun:                       false,
+			AcknowledgeCloudResourceRisk: true,
 		},
 	}
 }
@@ -91,7 +91,7 @@ func phaseDeleteACMCRDsTestTD() *operatorv1.HubTeardown {
 func TestPhaseDeleteACMCRDsResolvesStuckFinalizer(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	td := phaseDeleteACMCRDsTestTD()
-	obj := stuckObsAddon(6*time.Minute, obsAddonFin)
+	obj := stuckObsAddon(16*time.Minute, obsAddonFin)
 	r := amcrdTestReconciler(t, td, obsAddonCRD(), obj)
 
 	done, err := r.phaseDeleteACMCRDs(context.Background(), ctrllog.Log.WithName("test"), td)
@@ -164,11 +164,12 @@ func TestPhaseDeleteACMCRDsLeavesUnlistedFinalizer(t *testing.T) {
 	}
 }
 
-// Tier 2 still requires approvedDestructiveActions.
-func TestPhaseDeleteACMCRDsRequiresApproval(t *testing.T) {
+// A finalizer is not removable on name or kind alone: ownership must be
+// evidence-backed before the shared authorizer permits the patch.
+func TestPhaseDeleteACMCRDsRequiresOwnershipEvidence(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	td := phaseDeleteACMCRDsTestTD()
-	td.Spec.ApprovedDestructiveActions = false
+	td.Spec.AcknowledgeCloudResourceRisk = false
 	obj := stuckObsAddon(10*time.Minute, obsAddonFin)
 	r := amcrdTestReconciler(t, td, obsAddonCRD(), obj)
 
@@ -177,14 +178,14 @@ func TestPhaseDeleteACMCRDsRequiresApproval(t *testing.T) {
 		t.Fatalf("phaseDeleteACMCRDs error: %v", err)
 	}
 	if done {
-		t.Fatal("phase reported done without approval")
+		t.Fatal("phase reported done without ownership evidence")
 	}
 
 	got := &unstructured.Unstructured{}
 	got.SetGroupVersionKind(obj.GroupVersionKind())
 	_ = r.Client.Get(context.Background(), types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}, got)
 	if len(got.GetFinalizers()) != 1 {
-		t.Fatalf("finalizers = %v, want the finalizer preserved without approval", got.GetFinalizers())
+		t.Fatalf("finalizers = %v, want the finalizer preserved without ownership evidence", got.GetFinalizers())
 	}
 }
 

@@ -44,13 +44,6 @@ func (r *HubTeardownReconciler) failOnTimeout(ctx context.Context, log logr.Logg
 	message := fmt.Sprintf("Teardown ran for %s (limit: %s) and stopped at phase %s.",
 		elapsed.Round(time.Second), limit.Round(time.Second), td.Status.Phase)
 
-	if !td.Spec.ApprovedDestructiveActions {
-		switch stuckPhase {
-		case operatorv1.TeardownPhaseDisableAddons, operatorv1.TeardownPhaseDetachManagedClusters,
-			operatorv1.TeardownPhaseDeleteMCH:
-			message += " Consider setting spec.approvedDestructiveActions=true to resolve stuck Tier 2 finalizers."
-		}
-	}
 	if !td.Spec.AcknowledgeCloudResourceRisk {
 		if stuckPhase == operatorv1.TeardownPhaseDeleteInfrastructureCRs {
 			message += " Consider setting spec.acknowledgeCloudResourceRisk=true to resolve stuck Tier 1 (cloud) finalizers."
@@ -116,6 +109,7 @@ func (r *HubTeardownReconciler) failTerminal(ctx context.Context, log logr.Logge
 		r.setPhaseStatus(td, stuckPhase, operatorv1.PhaseStateFailed, failure.phaseMessage)
 	}
 	td.Status.Phase = operatorv1.TeardownPhaseFailed
+	td.Status.ObservedGeneration = td.Generation
 
 	// A terminal run must stop working. Leaving the Job alive would let it keep
 	// deleting with the handoff identity after the controller has given up.

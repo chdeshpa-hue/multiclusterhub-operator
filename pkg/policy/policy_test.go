@@ -161,7 +161,7 @@ func TestConsentValid(t *testing.T) {
 		want    bool
 	}{
 		{name: "matching digest", consent: ConsentState{CloudRiskAcknowledged: true, AcknowledgedDigest: "d1", ReportDigest: "d1"}, want: true},
-		{name: "destructive approval with matching digest", consent: ConsentState{ApprovedDestructiveActions: true, AcknowledgedDigest: "d1", ReportDigest: "d1"}, want: true},
+		{name: "matching digest without cloud-risk acknowledgement", consent: ConsentState{AcknowledgedDigest: "d1", ReportDigest: "d1"}, want: false},
 		{name: "not acknowledged", consent: ConsentState{AcknowledgedDigest: "d1", ReportDigest: "d1"}, want: false},
 		{name: "report changed", consent: ConsentState{CloudRiskAcknowledged: true, AcknowledgedDigest: "d1", ReportDigest: "d2"}, want: false},
 		{name: "empty acknowledgement", consent: ConsentState{CloudRiskAcknowledged: true, ReportDigest: "d1"}, want: false},
@@ -183,7 +183,7 @@ func TestConsentCloudRiskValid(t *testing.T) {
 		want    bool
 	}{
 		{name: "cloud risk acknowledged", consent: ConsentState{CloudRiskAcknowledged: true, AcknowledgedDigest: "d1", ReportDigest: "d1"}, want: true},
-		{name: "only destructive actions approved", consent: ConsentState{ApprovedDestructiveActions: true, AcknowledgedDigest: "d1", ReportDigest: "d1"}, want: false},
+		{name: "empty acknowledgement", consent: ConsentState{CloudRiskAcknowledged: true, ReportDigest: "d1"}, want: false},
 		{name: "stale digest", consent: ConsentState{CloudRiskAcknowledged: true, AcknowledgedDigest: "d1", ReportDigest: "d2"}, want: false},
 	}
 	for _, tt := range tests {

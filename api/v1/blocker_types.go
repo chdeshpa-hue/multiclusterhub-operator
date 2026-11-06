@@ -110,6 +110,17 @@ type CloudRisk struct {
 	MayOrphan     bool   `json:"mayOrphan"`
 }
 
+// CloudRiskSummary is the aggregated, never-truncated view of cloud risk that
+// status carries. One entry exists per (platform, resourceType) pair; the
+// per-object detail stays in the report ConfigMap.
+type CloudRiskSummary struct {
+	Platform     string   `json:"platform"`
+	ResourceType string   `json:"resourceType"`
+	Count        int32    `json:"count"`
+	Namespaces   []string `json:"namespaces,omitempty"`
+	ConsoleHint  string   `json:"consoleHint,omitempty"`
+}
+
 // Classification names the failure mode a Blocker represents.
 type Classification string
 

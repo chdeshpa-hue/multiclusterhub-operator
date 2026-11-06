@@ -69,8 +69,8 @@ func TestBlockersFromGraph(t *testing.T) {
 
 	blockers := blockersFromGraph(graph, testScanTime, policy.ConsentState{})
 
-	if len(blockers) != 2 {
-		t.Fatalf("expected 2 blockers, got %d: %+v", len(blockers), blockers)
+	if len(blockers) != 3 {
+		t.Fatalf("expected 3 blockers, got %d: %+v", len(blockers), blockers)
 	}
 	if blockers[0].Kind != "ManagedCluster" || blockers[1].Kind != "HostedCluster" {
 		t.Fatalf("expected namespace-first ordering, got %s then %s", blockers[0].Kind, blockers[1].Kind)
@@ -88,6 +88,9 @@ func TestBlockersFromGraph(t *testing.T) {
 	}
 	if blockers[1].APIVersion != "hypershift.openshift.io/v1beta1" {
 		t.Errorf("apiVersion = %q", blockers[1].APIVersion)
+	}
+	if blockers[2].Kind != "Pod" || blockers[2].SuggestedAction != operatorv1.ActionReportOnly {
+		t.Errorf("unrelated finalizer must be reported, never actioned: %+v", blockers[2])
 	}
 }
 

@@ -31,6 +31,16 @@ func isKnownCloudPlatform(platform string) bool {
 	return ok
 }
 
+// mayOrphanOnPlatform is the fail-closed predicate for a cloud-protecting
+// finalizer. Only KubeVirt is known not to provision resources outside this
+// cluster; an empty or unfamiliar platform is treated as a possible cloud
+// provider and therefore requires consent.
+func mayOrphanOnPlatform(platform string) bool {
+	normalised := strings.ToUpper(strings.TrimSpace(platform))
+	_, nonCloud := knownNonCloudPlatforms[normalised]
+	return !nonCloud
+}
+
 // isKnownPlatform reports whether the platform is one the classifier can
 // reason about, cloud or not.
 func isKnownPlatform(platform string) bool {
@@ -43,8 +53,9 @@ func isKnownPlatform(platform string) bool {
 }
 
 // requiresCloudAcknowledgement is the single predicate shared by the report,
-// policy inputs and execution gates. It is true only when the finalizer is
-// Tier 1 AND the object's platform is a known cloud platform.
+// policy inputs and execution gates. It is true when the finalizer is Tier 1
+// and the platform is not known to be local-only. Unknown platforms are
+// fail-closed: acting might orphan resources, so consent is required.
 func requiresCloudAcknowledgement(finalizer, platform string) bool {
-	return IsCloudProtectingFinalizer(finalizer) && isKnownCloudPlatform(platform)
+	return IsCloudProtectingFinalizer(finalizer) && mayOrphanOnPlatform(platform)
 }

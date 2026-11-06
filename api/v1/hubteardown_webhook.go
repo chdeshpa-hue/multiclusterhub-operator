@@ -5,11 +5,13 @@ package v1
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	admissionregistration "k8s.io/api/admissionregistration/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -65,11 +67,26 @@ func (r *HubTeardown) SetupWebhookWithManager(mgr ctrl.Manager) error {
 var _ admission.Defaulter[*HubTeardown] = &HubTeardown{}
 var _ admission.Validator[*HubTeardown] = &HubTeardown{}
 
-// Default is a no-op: dryRun is defaulted by the CRD schema. It exists so the
-// mutating half of the webhook is registered and can gain defaults without a
-// second wiring change.
+// Default supplies the non-boolean defaults that make a programmatically
+// created CR behave like one admitted through the CRD schema. dryRun is left
+// to the CRD because a bool default cannot distinguish omitted from false.
 func (r *HubTeardown) Default(ctx context.Context, obj *HubTeardown) error {
 	htdlog.Info("default", "name", obj.Name, "namespace", obj.Namespace)
+	if obj.Spec.MCE == "" {
+		obj.Spec.MCE = MCEDispositionDefault
+	}
+	if obj.Spec.Escalation == nil {
+		obj.Spec.Escalation = &EscalationSpec{}
+	}
+	if obj.Spec.Escalation.StallTimeout == nil {
+		obj.Spec.Escalation.StallTimeout = &metav1.Duration{Duration: 15 * time.Minute}
+	}
+	if obj.Spec.Escalation.MaxDuration == nil {
+		obj.Spec.Escalation.MaxDuration = &metav1.Duration{Duration: 2 * time.Hour}
+	}
+	if obj.Spec.Escalation.Mode == "" {
+		obj.Spec.Escalation.Mode = EscalationModeManual
+	}
 	return nil
 }
 
@@ -80,6 +97,9 @@ func (r *HubTeardown) Default(ctx context.Context, obj *HubTeardown) error {
 func (r *HubTeardown) ValidateCreate(ctx context.Context, obj *HubTeardown) (admission.Warnings, error) {
 	htdlog.Info("validate create", "Name", obj.Name, "Namespace", obj.Namespace)
 
+	if err := validateHubTeardownTarget(obj); err != nil {
+		return nil, err
+	}
 	if err := validateHubTeardownDurations(obj); err != nil {
 		return nil, err
 	}
@@ -94,6 +114,9 @@ func (r *HubTeardown) ValidateCreate(ctx context.Context, obj *HubTeardown) (adm
 func (r *HubTeardown) ValidateUpdate(ctx context.Context, oldObj, newObj *HubTeardown) (admission.Warnings, error) {
 	htdlog.Info("validate update", "Name", newObj.Name, "Namespace", newObj.Namespace)
 
+	if err := validateHubTeardownTarget(newObj); err != nil {
+		return nil, err
+	}
 	if err := validateHubTeardownDurations(newObj); err != nil {
 		return nil, err
 	}
@@ -103,6 +126,32 @@ func (r *HubTeardown) ValidateUpdate(ctx context.Context, oldObj, newObj *HubTea
 	return nil, nil
 }
 
+// validateHubTeardownTarget requires an explicit, well-formed MultiClusterHub
+// reference. Inferring the target from the only MCH present was the C2 failure:
+// a teardown created in the wrong namespace could act against the hub anyway.
+func validateHubTeardownTarget(obj *HubTeardown) error {
+	ref := obj.Spec.HubRef
+	if strings.TrimSpace(ref.Name) == "" {
+		return fmt.Errorf("spec.hubRef.name is required")
+	}
+	if strings.TrimSpace(ref.Namespace) == "" {
+		return fmt.Errorf("spec.hubRef.namespace is required")
+	}
+	if ref.Kind != "MultiClusterHub" {
+		return fmt.Errorf("spec.hubRef.kind must be MultiClusterHub")
+	}
+	if ref.APIVersion != "" && ref.APIVersion != GroupVersion.String() {
+		return fmt.Errorf("spec.hubRef.apiVersion must be %s", GroupVersion.String())
+	}
+	if errs := validation.IsDNS1123Subdomain(ref.Name); len(errs) > 0 {
+		return fmt.Errorf("spec.hubRef.name is invalid: %s", strings.Join(errs, "; "))
+	}
+	if errs := validation.IsDNS1123Label(ref.Namespace); len(errs) > 0 {
+		return fmt.Errorf("spec.hubRef.namespace is invalid: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
 // ValidateDelete permits deletion. Deleting the teardown is the operator's
 // escape hatch when a teardown has wedged, so it must never be blocked here.
 func (r *HubTeardown) ValidateDelete(ctx context.Context, obj *HubTeardown) (admission.Warnings, error) {
@@ -110,9 +159,9 @@ func (r *HubTeardown) ValidateDelete(ctx context.Context, obj *HubTeardown) (adm
 	return nil, nil
 }
 
-// ensureSingleHubTeardown enforces one teardown per hub. The defect it closes
-// is cross-namespace: a CR created in "default" is accepted by the namespaced
-// CRD and used to reconcile alongside the intended one.
+// ensureSingleHubTeardown enforces one HubTeardown in the cluster. The defect
+// it closes is cross-namespace: a CR created in "default" is accepted by the
+// namespaced CRD and used to reconcile alongside the intended one.
 func ensureSingleHubTeardown(ctx context.Context, obj *HubTeardown) error {
 	if hubTeardownWebhookClient == nil {
 		// Fail closed: without a client the singleton rule cannot be proven,
@@ -136,7 +185,7 @@ func ensureSingleHubTeardown(ctx context.Context, obj *HubTeardown) error {
 			continue
 		}
 		return fmt.Errorf(
-			"a HubTeardown already exists in %s/%s; only one teardown may run per hub",
+			"a HubTeardown already exists in %s/%s; only one HubTeardown may exist in the cluster",
 			existing.Namespace, existing.Name)
 	}
 	return nil
@@ -166,6 +215,31 @@ func validateHubTeardownDurations(obj *HubTeardown) error {
 		return fmt.Errorf(
 			"spec.forceFinalizerTimeout (%s) must be shorter than spec.maxDuration (%s)",
 			forceTimeout.Duration, maxDuration.Duration)
+	}
+
+	if obj.Spec.Escalation != nil {
+		escalation := obj.Spec.Escalation
+		if escalation.StallTimeout != nil && escalation.StallTimeout.Duration <= 0 {
+			return fmt.Errorf("spec.escalation.stallTimeout must be greater than zero")
+		}
+		if escalation.MaxDuration != nil {
+			if escalation.MaxDuration.Duration <= 0 {
+				return fmt.Errorf("spec.escalation.maxDuration must be greater than zero")
+			}
+			if escalation.MaxDuration.Duration > maxAllowedTeardownDuration {
+				return fmt.Errorf("spec.escalation.maxDuration must not exceed %s", maxAllowedTeardownDuration)
+			}
+		}
+		if escalation.StallTimeout != nil && escalation.MaxDuration != nil &&
+			escalation.StallTimeout.Duration >= escalation.MaxDuration.Duration {
+			return fmt.Errorf("spec.escalation.stallTimeout (%s) must be shorter than spec.escalation.maxDuration (%s)",
+				escalation.StallTimeout.Duration, escalation.MaxDuration.Duration)
+		}
+		switch escalation.Mode {
+		case "", EscalationModeManual, EscalationModeAutomatic:
+		default:
+			return fmt.Errorf("spec.escalation.mode must be Manual or Automatic")
+		}
 	}
 	return nil
 }

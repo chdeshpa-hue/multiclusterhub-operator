@@ -10,6 +10,7 @@ import (
 	"github.com/go-logr/logr"
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/metadata"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -17,11 +18,14 @@ import (
 // the CR instead of waiting out spec.maxDuration for a Job that already died.
 var errHandoffJobFailed = stderrors.New("handoff Job failed")
 
-// handoffPhasePlan is the work the handoff Job owns: the two phases whose waits
-// were unbounded in the controller (F-35). The Job's activeDeadlineSeconds is
-// the bound the controller cannot give itself while it holds the same phases.
+// handoffPhasePlan is the work the handoff Job owns. RemoveBlockingCRs is the
+// first handoff step (spec section 6, phase E): downstream DF operators must
+// see the teardown-active contract before the Job removes resources, and the
+// operator must not delete the MCH until this phase records complete.
+// MonitorMCEChain and DeleteACMCRDs are the other unbounded waits (F-35).
 func (r *HubTeardownReconciler) handoffPhasePlan() []teardownPhaseStep {
 	return []teardownPhaseStep{
+		{operatorv1.TeardownPhaseRemoveBlockingCRs, r.phaseRemoveBlockingCRs},
 		{operatorv1.TeardownPhaseMonitorMCEChain, r.phaseMonitorMCEChain},
 		{operatorv1.TeardownPhaseDeleteACMCRDs, r.phaseDeleteACMCRDs},
 	}
@@ -29,8 +33,8 @@ func (r *HubTeardownReconciler) handoffPhasePlan() []teardownPhaseStep {
 
 // RunHandoffJob is the handoff Job entrypoint. Same one-shot contract as
 // RunPrepareJob: no watch, no leader election, no status writes.
-func RunHandoffJob(ctx context.Context, c client.Client, dc discovery.DiscoveryInterface, name, namespace string) error {
-	r, td, log, deadline, err := newJobReconciler(ctx, c, dc, name, namespace, "handoff")
+func RunHandoffJob(ctx context.Context, c client.Client, dc discovery.DiscoveryInterface, mc metadata.Interface, name, namespace string) error {
+	r, td, log, deadline, err := newJobReconciler(ctx, c, dc, mc, name, namespace, "handoff")
 	if err != nil || r == nil {
 		return err
 	}

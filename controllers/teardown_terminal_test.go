@@ -37,7 +37,7 @@ func timedOutCR() *operatorv1.HubTeardown {
 	started := metav1.NewTime(time.Now().Add(-3 * time.Hour))
 	return &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
-		Spec:       operatorv1.HubTeardownSpec{DryRun: false},
+		Spec:       operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: false},
 		Status: operatorv1.HubTeardownStatus{
 			Phase:       operatorv1.TeardownPhaseDetachManagedClusters,
 			ActiveSince: &started,

@@ -52,10 +52,11 @@ type Blocker = operatorv1.Blocker
 // are reused after retention and because two reports with the same digest are
 // the same content - consenting to one is consenting to the other.
 type ConsentState struct {
-	// ApprovedDestructiveActions authorises Tier 2 (non-cloud) finalizer work.
-	ApprovedDestructiveActions bool
-
-	// CloudRiskAcknowledged authorises Tier 1 (cloud-protecting) finalizer work.
+	// CloudRiskAcknowledged is the only consent flag. It records that the
+	// administrator read the cloud-risk section of the inspection report and
+	// accepts that destructive work may orphan resources outside the cluster.
+	// There is deliberately no second, broader approval flag: a flag that is
+	// not bound to this report could authorise work from a stale inspection.
 	CloudRiskAcknowledged bool
 
 	// AcknowledgedDigest is the digest of the report the administrator read.
@@ -69,7 +70,7 @@ type ConsentState struct {
 // currently exists. An empty or stale digest means no consent, never implicit
 // consent: that is the G2 defect, where two booleans authorised any report.
 func (c ConsentState) Valid() bool {
-	return (c.ApprovedDestructiveActions || c.CloudRiskAcknowledged) && c.coversReport()
+	return c.CloudRiskAcknowledged && c.coversReport()
 }
 
 // CloudRiskValid is the narrower rule for acting on a cloud-protecting

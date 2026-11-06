@@ -27,7 +27,7 @@ var _ = Describe("HubTeardown status schema", func() {
 	newTeardown := func(name string) *HubTeardown {
 		return &HubTeardown{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
-			Spec:       HubTeardownSpec{DryRun: true},
+			Spec:       HubTeardownSpec{DryRun: true, HubRef: validHubRef()},
 		}
 	}
 

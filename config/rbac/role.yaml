@@ -665,14 +665,6 @@ rules:
   - update
   - watch
 - apiGroups:
-  - apps
-  resources:
-  - deployments/scale
-  verbs:
-  - get
-  - list
-  - patch
-- apiGroups:
   - apps.open-cluster-management.io
   resources:
   - '*'
@@ -1137,16 +1129,6 @@ rules:
   - watch
 - apiGroups:
   - hive.openshift.io
-  resources:
-  - clusterpools
-  verbs:
-  - delete
-  - get
-  - list
-  - patch
-  - watch
-- apiGroups:
-  - hive.openshift.io
   - multicluster.openshift.io
   resources:
   - clusterimagesets
@@ -1488,11 +1470,8 @@ rules:
   resources:
   - subscriptions/finalizers
   verbs:
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - packages.operators.coreos.com
@@ -1580,6 +1559,17 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resourceNames:
+  - acm-uninstall-handoff
+  resources:
+  - clusterroles
+  verbs:
+  - bind
+  - get
+  - list
   - watch
 - apiGroups:
   - rbac.authorization.k8s.io

@@ -30,10 +30,11 @@ const (
 	conditionTypeHandoffReady = "HandoffReady"
 )
 
-// teardownApprovalFlagsSet reports whether either approval flag is on. It says
-// what kind of work is authorised, not which report it was authorised against.
+// teardownApprovalFlagsSet reports whether the one consent flag is on. It says
+// that the administrator approved destructive work, not which report it was
+// approved against.
 func teardownApprovalFlagsSet(td *operatorv1.HubTeardown) bool {
-	return td.Spec.ApprovedDestructiveActions || td.Spec.AcknowledgeCloudResourceRisk
+	return td.Spec.AcknowledgeCloudResourceRisk
 }
 
 // teardownConsentGiven reports whether the admin has authorised destructive
@@ -45,10 +46,9 @@ func teardownConsentGiven(td *operatorv1.HubTeardown) bool {
 		return false
 	}
 	return policy.ConsentState{
-		ApprovedDestructiveActions: td.Spec.ApprovedDestructiveActions,
-		CloudRiskAcknowledged:      td.Spec.AcknowledgeCloudResourceRisk,
-		AcknowledgedDigest:         td.Spec.AcknowledgedReportDigest,
-		ReportDigest:               td.Status.ReportDigest,
+		CloudRiskAcknowledged: td.Spec.AcknowledgeCloudResourceRisk,
+		AcknowledgedDigest:    td.Spec.AcknowledgedReportDigest,
+		ReportDigest:          td.Status.ReportDigest,
 	}.Valid()
 }
 

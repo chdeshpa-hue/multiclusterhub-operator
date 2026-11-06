@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,12 +38,14 @@ const (
 	conditionTypeContractReady      = "ContractReady"
 	conditionTypeTeardownComplete   = "Complete"
 	conditionTypeTeardownStalled    = "Stalled"
+	conditionTypeTeardownEscalating = "Escalating"
 	conditionTypeDryRunReportStale  = "DryRunReportStale"
 	conditionTypeWaitingForApproval = "WaitingForApproval"
 	conditionTypeInspectIncomplete  = "InspectIncomplete"
 	conditionTypeReportWriteFailed  = "ReportWriteFailed"
 
-	defaultMaxDuration = 2 * time.Hour
+	defaultMaxDuration  = 2 * time.Hour
+	defaultStallTimeout = 15 * time.Minute
 
 	annotationWarningsEmitted = "operator.open-cluster-management.io/warnings-emitted-generation"
 )
@@ -55,30 +58,42 @@ type HubTeardownReconciler struct {
 	Log             logr.Logger
 	Recorder        record.EventRecorder
 	DiscoveryClient discovery.DiscoveryInterface
+	// MetadataClient is the Layer 1 walk client. It is required in production:
+	// the inventory walk lists PartialObjectMetadata and never full objects.
+	// A nil value is a unit-test fallback only and is reported as Legacy.
+	MetadataClient metadata.Interface
+
+	// authz is the per-reconcile authorization snapshot. It is reset at the
+	// start of every reconciliation and every Job loop iteration so a decision
+	// can never be made against a previous cluster state.
+	authz *authzContext
 }
 
 //+kubebuilder:rbac:groups=operator.open-cluster-management.io,resources=hubteardowns,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=operator.open-cluster-management.io,resources=hubteardowns/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=operator.open-cluster-management.io,resources=hubteardowns/finalizers,verbs=update
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-//+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch;delete
-//+kubebuilder:rbac:groups=operators.coreos.com,resources=subscriptions;subscriptions/finalizers;clusterserviceversions,verbs=get;list;watch;update;patch;delete
-//+kubebuilder:rbac:groups=hypershift.openshift.io,resources=hostedclusters;nodepools,verbs=get;list;watch;delete;patch
-//+kubebuilder:rbac:groups=hive.openshift.io,resources=clusterdeployments;clusterpools,verbs=get;list;watch;delete;patch
-//+kubebuilder:rbac:groups=agent-install.openshift.io,resources=infraenvs,verbs=get;list;watch;delete;patch
-//+kubebuilder:rbac:groups=apps,resources=deployments;deployments/scale,verbs=get;list;patch
+//+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
+//+kubebuilder:rbac:groups=operators.coreos.com,resources=subscriptions;subscriptions/finalizers;clusterserviceversions,verbs=get;list;watch
+//+kubebuilder:rbac:groups=hypershift.openshift.io,resources=hostedclusters;nodepools,verbs=get;list;watch
+//+kubebuilder:rbac:groups=hive.openshift.io,resources=clusterdeployments;clusterpools,verbs=get;list;watch
+//+kubebuilder:rbac:groups=agent-install.openshift.io,resources=infraenvs,verbs=get;list;watch
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list
 //+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations;mutatingwebhookconfigurations,verbs=get;list;delete
+//+kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations;mutatingwebhookconfigurations,verbs=get;list
 //+kubebuilder:rbac:groups="",resources=endpoints,verbs=get;list
-//+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;delete
+//+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list
+//+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;delete
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list
 //+kubebuilder:rbac:groups="",resources=pods,verbs=list
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=list;delete
+//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;delete
+//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=get;list;watch;bind,resourceNames=acm-uninstall-handoff
 //+kubebuilder:rbac:groups=addon.open-cluster-management.io,resources=clustermanagementaddons,verbs=get;list;watch;patch
-//+kubebuilder:rbac:groups=cluster.open-cluster-management.io,resources=managedclustersets,verbs=get;list;watch;patch
+//+kubebuilder:rbac:groups=cluster.open-cluster-management.io,resources=managedclustersets,verbs=get;list;watch
 
 func (r *HubTeardownReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := ctrllog.FromContext(ctx).WithName("hubteardown")
+	r.authz = nil
 
 	teardown := &operatorv1.HubTeardown{}
 	if err := r.Client.Get(ctx, req.NamespacedName, teardown); err != nil {
@@ -87,6 +102,9 @@ func (r *HubTeardownReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		return ctrl.Result{}, err
 	}
+	// Every persisted status is an observation of this generation. Setting it
+	// once here covers the phase, condition and terminal writers that follow.
+	teardown.Status.ObservedGeneration = teardown.Generation
 
 	// Singleton guard: only one HubTeardown CR is allowed per namespace.
 	// If multiple exist, refuse to reconcile any except the oldest.
@@ -123,7 +141,7 @@ func (r *HubTeardownReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// Deleting the CR is the only explicit cancel. Clear the contract
 			// first so a surviving MCH does not stay in teardown mode. Best
 			// effort: the finalizer must not be held by a failed patch.
-			if err := r.clearTeardownActiveAnnotation(ctx, log); err != nil {
+			if err := r.clearTeardownActiveAnnotation(ctx, log, teardown); err != nil {
 				log.Error(err, "Failed to clear teardown-active contract during CR deletion")
 			}
 			if err := r.cleanupHandoff(ctx, log, teardown); err != nil {
@@ -308,21 +326,43 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 		}
 	}
 
-	maxDur := defaultMaxDuration
-	if td.Spec.MaxDuration != nil {
-		maxDur = td.Spec.MaxDuration.Duration
-	}
+	maxDur := effectiveMaxDuration(td)
 	elapsed := time.Since(td.Status.ActiveSince.Time)
 	if elapsed > maxDur {
 		return r.failOnTimeout(ctx, log, td, elapsed, maxDur)
 	}
-	if r.isConditionTrue(td, conditionTypeTeardownStalled) {
-		r.setCondition(td, conditionTypeTeardownStalled, metav1.ConditionFalse, "NotStalled",
-			"Teardown is running within spec.maxDuration.")
-		if err := r.Client.Status().Update(ctx, td); err != nil {
-			log.Error(err, "Failed to clear Stalled condition")
+
+	// Stall is measured over the in-progress phase, not the wall clock of the
+	// whole teardown. Consent has already been checked above, so a stall here
+	// is a destructive phase that is not making progress.
+	if stalledPhase, stalled := r.stalledPhase(td); stalled {
+		if !r.isConditionTrue(td, conditionTypeTeardownStalled) {
+			r.setCondition(td, conditionTypeTeardownStalled, metav1.ConditionTrue, "PhaseStalled",
+				fmt.Sprintf("Phase %s has made no progress for longer than %s.", stalledPhase, effectiveStallTimeout(td)))
+			r.Recorder.Eventf(td, corev1.EventTypeWarning, "TeardownStalled",
+				"Phase %s has made no progress for longer than %s", stalledPhase, effectiveStallTimeout(td))
 		}
-		r.Recorder.Event(td, corev1.EventTypeNormal, "StallCleared", "Teardown no longer stalled")
+		td.Status.Phase = operatorv1.TeardownPhaseStalled
+		if teardownConsentGiven(td) {
+			r.setCondition(td, conditionTypeTeardownEscalating, metav1.ConditionTrue, "EscalationStarted",
+				fmt.Sprintf("Consent is present; escalating phase %s to the handoff Job.", stalledPhase))
+			td.Status.Phase = operatorv1.TeardownPhaseEscalating
+		} else {
+			r.setCondition(td, conditionTypeTeardownEscalating, metav1.ConditionFalse, "ConsentRequired",
+				"Manual escalation waits for digest-bound cloud-risk consent.")
+		}
+		if err := r.Client.Status().Update(ctx, td); err != nil {
+			log.Error(err, "Failed to persist stalled/escalating status")
+		}
+	} else if r.isConditionTrue(td, conditionTypeTeardownStalled) || r.isConditionTrue(td, conditionTypeTeardownEscalating) {
+		r.setCondition(td, conditionTypeTeardownStalled, metav1.ConditionFalse, "NotStalled",
+			"Teardown is making progress within the stall timeout.")
+		r.setCondition(td, conditionTypeTeardownEscalating, metav1.ConditionFalse, "NotEscalating",
+			"Teardown is making progress; no escalation is active.")
+		if err := r.Client.Status().Update(ctx, td); err != nil {
+			log.Error(err, "Failed to clear stall/escalation conditions")
+		}
+		r.Recorder.Event(td, corev1.EventTypeNormal, "StallCleared", "Teardown is making progress again")
 	}
 
 	handoffErr := r.ensureHandoff(ctx, log, td)
@@ -341,7 +381,7 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 	// authorised destructive work.
 	if !teardownConsentGiven(td) {
 		reason := "WaitingForApproval"
-		message := "Destructive prepare phases require spec.approvedDestructiveActions or spec.acknowledgeCloudResourceRisk."
+		message := "Destructive phases require spec.acknowledgeCloudResourceRisk=true and spec.acknowledgedReportDigest matching status.reportDigest."
 		if teardownApprovalFlagsSet(td) {
 			// Approval flags without a matching digest is a lapsed consent:
 			// the report changed, or no report was ever written. The empty
@@ -427,7 +467,7 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 	}
 
 	// Clear WaitingForApproval if the user has now granted the required approvals.
-	if td.Spec.ApprovedDestructiveActions || td.Spec.AcknowledgeCloudResourceRisk {
+	if td.Spec.AcknowledgeCloudResourceRisk {
 		r.clearWaitingForApproval(td)
 	}
 
@@ -478,6 +518,7 @@ type teardownPhaseStep struct {
 // controller cannot give itself.
 func (r *HubTeardownReconciler) teardownPhasePlan() []teardownPhaseStep {
 	return []teardownPhaseStep{
+		{operatorv1.TeardownPhaseRemoveBlockingCRs, r.awaitJobPhase(operatorv1.TeardownPhaseRemoveBlockingCRs)},
 		{operatorv1.TeardownPhaseDeleteMCH, r.phaseDeleteMCH},
 		{operatorv1.TeardownPhaseMonitorMCEChain, r.awaitJobPhase(operatorv1.TeardownPhaseMonitorMCEChain)},
 		{operatorv1.TeardownPhaseDeleteACMCRDs, r.awaitJobPhase(operatorv1.TeardownPhaseDeleteACMCRDs)},
@@ -500,8 +541,12 @@ func (r *HubTeardownReconciler) executePhases(ctx context.Context, log logr.Logg
 			return ctrl.Result{}, nil
 		}
 
-		td.Status.Phase = p.phase
-		r.setPhaseStatus(td, p.phase, operatorv1.PhaseStateInProgress, "Executing phase")
+		if td.Status.Phase != operatorv1.TeardownPhaseEscalating {
+			td.Status.Phase = p.phase
+		}
+		if r.phaseState(td, p.phase) != operatorv1.PhaseStateInProgress {
+			r.setPhaseStatus(td, p.phase, operatorv1.PhaseStateInProgress, "Executing phase")
+		}
 
 		done, err := p.execute(ctx, log, td)
 		if err != nil {
@@ -547,14 +592,31 @@ func (r *HubTeardownReconciler) isPhaseComplete(td *operatorv1.HubTeardown, phas
 	return false
 }
 
+// stalledPhase returns the first in-progress phase that has exceeded the
+// configured no-progress timeout. The timeout is bound to the phase's
+// StartTime, which setPhaseStatus refreshes when the phase message changes.
+func (r *HubTeardownReconciler) stalledPhase(td *operatorv1.HubTeardown) (operatorv1.TeardownPhase, bool) {
+	timeout := effectiveStallTimeout(td)
+	for _, phase := range td.Status.Phases {
+		if phase.State != operatorv1.PhaseStateInProgress || phase.StartTime == nil {
+			continue
+		}
+		if time.Since(phase.StartTime.Time) > timeout {
+			return phase.Phase, true
+		}
+	}
+	return "", false
+}
+
 // setPhaseStatus updates or appends a phase status entry.
 func (r *HubTeardownReconciler) setPhaseStatus(td *operatorv1.HubTeardown, phase operatorv1.TeardownPhase, state operatorv1.TeardownPhaseState, msg string) {
+	td.Status.ObservedGeneration = td.Generation
 	now := metav1.Now()
 	for i, ps := range td.Status.Phases {
 		if ps.Phase == phase {
 			td.Status.Phases[i].State = state
 			td.Status.Phases[i].Message = msg
-			if state == operatorv1.PhaseStateInProgress && ps.StartTime == nil {
+			if state == operatorv1.PhaseStateInProgress && (ps.StartTime == nil || ps.Message != msg) {
 				td.Status.Phases[i].StartTime = &now
 			}
 			return
@@ -571,6 +633,15 @@ func (r *HubTeardownReconciler) setPhaseStatus(td *operatorv1.HubTeardown, phase
 	td.Status.Phases = append(td.Status.Phases, entry)
 }
 
+func (r *HubTeardownReconciler) phaseState(td *operatorv1.HubTeardown, phase operatorv1.TeardownPhase) operatorv1.TeardownPhaseState {
+	for _, status := range td.Status.Phases {
+		if status.Phase == phase {
+			return status.State
+		}
+	}
+	return ""
+}
+
 // setPhaseStatusWithTime updates a phase status with an explicit completion time.
 func (r *HubTeardownReconciler) setPhaseStatusWithTime(td *operatorv1.HubTeardown, phase operatorv1.TeardownPhase, state operatorv1.TeardownPhaseState, msg string, completionTime *metav1.Time) {
 	r.setPhaseStatus(td, phase, state, msg)
@@ -584,6 +655,7 @@ func (r *HubTeardownReconciler) setPhaseStatusWithTime(td *operatorv1.HubTeardow
 
 // setCondition sets a metav1.Condition on the HubTeardown status.
 func (r *HubTeardownReconciler) setCondition(td *operatorv1.HubTeardown, condType string, status metav1.ConditionStatus, reason, message string) {
+	td.Status.ObservedGeneration = td.Generation
 	meta.SetStatusCondition(&td.Status.Conditions, metav1.Condition{
 		Type:               condType,
 		Status:             status,

@@ -39,10 +39,10 @@ func newHandoffReconciler(t *testing.T, objs ...client.Object) *HubTeardownRecon
 func handoffTestCR() *operatorv1.HubTeardown {
 	return &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
-		Spec: operatorv1.HubTeardownSpec{
-			DryRun:                     false,
-			ApprovedDestructiveActions: true,
-			AcknowledgedReportDigest:   "test-digest",
+		Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
+			DryRun:                       false,
+			AcknowledgeCloudResourceRisk: true,
+			AcknowledgedReportDigest:     "test-digest",
 		},
 		Status: operatorv1.HubTeardownStatus{
 			ReportDigest: "test-digest",
@@ -75,14 +75,14 @@ func TestTeardownConsentGiven(t *testing.T) {
 		rd   string
 		want bool
 	}{
-		{"dry-run with approvals", operatorv1.HubTeardownSpec{DryRun: true, ApprovedDestructiveActions: true, AcknowledgedReportDigest: digest}, digest, false},
-		{"active without approvals", operatorv1.HubTeardownSpec{DryRun: false, AcknowledgedReportDigest: digest}, digest, false},
-		{"active with destructive approval and matching digest", operatorv1.HubTeardownSpec{DryRun: false, ApprovedDestructiveActions: true, AcknowledgedReportDigest: digest}, digest, true},
-		{"active with cloud acknowledgement and matching digest", operatorv1.HubTeardownSpec{DryRun: false, AcknowledgeCloudResourceRisk: true, AcknowledgedReportDigest: digest}, digest, true},
-		{"approval without a digest", operatorv1.HubTeardownSpec{DryRun: false, ApprovedDestructiveActions: true}, digest, false},
-		{"stale digest", operatorv1.HubTeardownSpec{DryRun: false, ApprovedDestructiveActions: true, AcknowledgedReportDigest: "sha256:old"}, digest, false},
-		{"digest without approval", operatorv1.HubTeardownSpec{DryRun: false, AcknowledgedReportDigest: digest}, digest, false},
-		{"no report yet", operatorv1.HubTeardownSpec{DryRun: false, ApprovedDestructiveActions: true, AcknowledgedReportDigest: digest}, "", false},
+		{"dry-run with approvals", operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: true, AcknowledgeCloudResourceRisk: true, AcknowledgedReportDigest: digest}, digest, false},
+		{"active without approvals", operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: false, AcknowledgedReportDigest: digest}, digest, false},
+		{"active with destructive approval and matching digest", operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: false, AcknowledgeCloudResourceRisk: true, AcknowledgedReportDigest: digest}, digest, true},
+		{"active with cloud acknowledgement and matching digest", operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: false, AcknowledgeCloudResourceRisk: true, AcknowledgedReportDigest: digest}, digest, true},
+		{"approval without a digest", operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: false, AcknowledgeCloudResourceRisk: true}, digest, false},
+		{"stale digest", operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: false, AcknowledgeCloudResourceRisk: true, AcknowledgedReportDigest: "sha256:old"}, digest, false},
+		{"digest without approval", operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: false, AcknowledgedReportDigest: digest}, digest, false},
+		{"no report yet", operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: false, AcknowledgeCloudResourceRisk: true, AcknowledgedReportDigest: digest}, "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -97,7 +97,7 @@ func TestTeardownConsentGiven(t *testing.T) {
 func TestEnsureHandoff_NoConsentCreatesNothing(t *testing.T) {
 	t.Setenv("OPERATOR_IMAGE", "quay.io/test/operator:latest")
 	td := handoffTestCR()
-	td.Spec.ApprovedDestructiveActions = false
+	td.Spec.AcknowledgeCloudResourceRisk = false
 	r := newHandoffReconciler(t, handoffRole())
 
 	if err := r.ensureHandoff(context.Background(), ctrllog.Log, td); err != nil {

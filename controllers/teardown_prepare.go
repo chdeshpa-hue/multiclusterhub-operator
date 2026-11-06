@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/metadata"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -62,7 +63,6 @@ type contractRecord struct {
 // operator plan so the operator can never execute a prepare phase by accident.
 func (r *HubTeardownReconciler) preparePhasePlan() []teardownPhaseStep {
 	return []teardownPhaseStep{
-		{operatorv1.TeardownPhaseRemoveBlockingCRs, r.phaseRemoveBlockingCRs},
 		{operatorv1.TeardownPhaseDisableAddons, r.phaseDisableAddons},
 		{operatorv1.TeardownPhaseDeleteInfrastructureCRs, r.phaseDeleteInfrastructureCRs},
 		{operatorv1.TeardownPhaseDetachManagedClusters, r.phaseDetachManagedClusters},
@@ -187,8 +187,8 @@ func (nopRecorder) AnnotatedEventf(runtime.Object, map[string]string, string, st
 // RunPrepareJob is the Job entrypoint. It is a one-shot loop, not a controller:
 // no watch, no leader election and no status writes, so it can never be a second
 // writer over the HubTeardown status.
-func RunPrepareJob(ctx context.Context, c client.Client, dc discovery.DiscoveryInterface, name, namespace string) error {
-	r, td, log, deadline, err := newJobReconciler(ctx, c, dc, name, namespace, "prepare")
+func RunPrepareJob(ctx context.Context, c client.Client, dc discovery.DiscoveryInterface, mc metadata.Interface, name, namespace string) error {
+	r, td, log, deadline, err := newJobReconciler(ctx, c, dc, mc, name, namespace, "prepare")
 	if err != nil || r == nil {
 		return err
 	}
@@ -198,7 +198,7 @@ func RunPrepareJob(ctx context.Context, c client.Client, dc discovery.DiscoveryI
 // newJobReconciler builds the reconciler a one-shot Job runs with. It returns a
 // nil reconciler and nil error when the CR is already gone: a Job that outlives
 // its teardown has nothing to do.
-func newJobReconciler(ctx context.Context, c client.Client, dc discovery.DiscoveryInterface, name, namespace, job string) (*HubTeardownReconciler, *operatorv1.HubTeardown, logr.Logger, time.Time, error) {
+func newJobReconciler(ctx context.Context, c client.Client, dc discovery.DiscoveryInterface, mc metadata.Interface, name, namespace, job string) (*HubTeardownReconciler, *operatorv1.HubTeardown, logr.Logger, time.Time, error) {
 	td := &operatorv1.HubTeardown{}
 	if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, td); err != nil {
 		if errors.IsNotFound(err) {
@@ -207,16 +207,14 @@ func newJobReconciler(ctx context.Context, c client.Client, dc discovery.Discove
 		return nil, nil, logr.Logger{}, time.Time{}, fmt.Errorf("reading HubTeardown %s/%s: %w", namespace, name, err)
 	}
 
-	maxDur := defaultMaxDuration
-	if td.Spec.MaxDuration != nil {
-		maxDur = td.Spec.MaxDuration.Duration
-	}
+	maxDur := effectiveMaxDuration(td)
 
 	r := &HubTeardownReconciler{
 		Client:          c,
 		UncachedClient:  c,
 		Scheme:          c.Scheme(),
 		DiscoveryClient: dc,
+		MetadataClient:  mc,
 		Recorder:        nopRecorder{},
 	}
 	log := ctrllog.FromContext(ctx).WithName(job)
@@ -233,6 +231,7 @@ func (r *HubTeardownReconciler) runJobLoop(ctx context.Context, log logr.Logger,
 	}
 
 	for {
+		r.authz = nil
 		pending := false
 		for _, step := range plan {
 			if jobPhaseState(progress, step.phase) == operatorv1.PhaseStateComplete {
@@ -254,7 +253,7 @@ func (r *HubTeardownReconciler) runJobLoop(ctx context.Context, log logr.Logger,
 			}
 
 			if step.phase == operatorv1.TeardownPhaseRemoveBlockingCRs {
-				progress.Contract = r.readContract(ctx, log)
+				progress.Contract = r.readContract(ctx, log, td)
 			}
 
 			if !done {

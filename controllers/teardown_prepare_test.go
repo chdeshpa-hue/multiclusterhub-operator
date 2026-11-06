@@ -20,7 +20,6 @@ import (
 func TestPreparePhasePlan(t *testing.T) {
 	r := &HubTeardownReconciler{}
 	want := []operatorv1.TeardownPhase{
-		operatorv1.TeardownPhaseRemoveBlockingCRs,
 		operatorv1.TeardownPhaseDisableAddons,
 		operatorv1.TeardownPhaseDeleteInfrastructureCRs,
 		operatorv1.TeardownPhaseDetachManagedClusters,
@@ -298,7 +297,7 @@ func TestRunPrepareJob_MissingCR(t *testing.T) {
 	td := handoffTestCR()
 	r := newHandoffReconciler(t)
 
-	if err := RunPrepareJob(context.Background(), r.Client, nil, td.Name, td.Namespace); err != nil {
+	if err := RunPrepareJob(context.Background(), r.Client, nil, nil, td.Name, td.Namespace); err != nil {
 		t.Fatalf("missing CR should be a clean exit, got %v", err)
 	}
 }

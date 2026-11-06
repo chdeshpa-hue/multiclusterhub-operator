@@ -9,6 +9,7 @@ import (
 
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -45,7 +46,7 @@ func registerUnstructured(t *testing.T, s *runtime.Scheme, gvks ...schema.GroupV
 func newGateTestReconciler(t *testing.T, objs ...client.Object) *HubTeardownReconciler {
 	t.Helper()
 	s := newTestScheme()
-	registerUnstructured(t, s, hostedClusterGVK, managedClusterGVK)
+	registerUnstructured(t, s, hostedClusterGVK, managedClusterGVK, mcoGVK, dcGVK, ascGVK)
 	return &HubTeardownReconciler{
 		Client:   fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build(),
 		Scheme:   s,
@@ -69,6 +70,27 @@ func newUnstructured(gvk schema.GroupVersionKind, namespace, name string, finali
 func withPlatform(u *unstructured.Unstructured, platform string) *unstructured.Unstructured {
 	_ = unstructured.SetNestedField(u.Object, platform, "spec", "platform", "type")
 	return u
+}
+
+// ownedByTestHub gives a fixture the installer identity the evidence classifier
+// needs. Name matching alone must never authorize a destructive action.
+func ownedByTestHub(u *unstructured.Unstructured) *unstructured.Unstructured {
+	labels := u.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels["installer.name"] = testHubRef().Name
+	labels["installer.namespace"] = testHubRef().Namespace
+	u.SetLabels(labels)
+	return u
+}
+
+// grantTestCloudConsent binds the acknowledgement to the report digest, which
+// is the only consent model the execution path honors.
+func grantTestCloudConsent(td *operatorv1.HubTeardown) {
+	td.Spec.AcknowledgeCloudResourceRisk = true
+	td.Spec.AcknowledgedReportDigest = "test-digest"
+	td.Status.ReportDigest = "test-digest"
 }
 
 func conditionReason(td *operatorv1.HubTeardown, condType string) string {
@@ -104,14 +126,16 @@ func drainEvents(r *HubTeardownReconciler) []string {
 func newTeardownCR() *operatorv1.HubTeardown {
 	return &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
+		Spec:       operatorv1.HubTeardownSpec{HubRef: testHubRef()},
 	}
 }
 
 // Cloud-risk gate: infrastructure CRs exist and acknowledgeCloudResourceRisk is false.
 // The phase must not delete anything and must surface why it is blocked.
-func TestPhaseDeleteInfrastructureCRs_CloudRiskGateBlocks(t *testing.T) {
+func TestPhaseDeleteInfrastructureCRs_CloudRiskConsentBlocks(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	hcp := withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1"), "AWS")
+	hcp := ownedByTestHub(withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1",
+		"hypershift.openshift.io/finalizer"), "AWS"))
 	r := newGateTestReconciler(t, hcp)
 	td := newTeardownCR()
 
@@ -120,7 +144,7 @@ func TestPhaseDeleteInfrastructureCRs_CloudRiskGateBlocks(t *testing.T) {
 		t.Fatalf("phaseDeleteInfrastructureCRs error: %v", err)
 	}
 	if done {
-		t.Fatal("expected cloud-risk gate to block the phase, but it completed")
+		t.Fatal("expected the missing cloud-risk consent to block the phase, but it completed")
 	}
 
 	got := &unstructured.Unstructured{}
@@ -130,37 +154,41 @@ func TestPhaseDeleteInfrastructureCRs_CloudRiskGateBlocks(t *testing.T) {
 	}
 
 	events := strings.Join(drainEvents(r), "\n")
-	if !strings.Contains(events, "CloudRiskGate") || !strings.Contains(events, "acknowledgeCloudResourceRisk") {
-		t.Fatalf("expected CloudRiskGate approval event, got:\n%s", events)
+	if !strings.Contains(events, "InfrastructureCRRetained") || !strings.Contains(events, "digest-bound consent") {
+		t.Fatalf("expected a retained-infrastructure event naming the consent gate, got:\n%s", events)
 	}
 }
 
 // Positive counterpart: the same phase must proceed once acknowledgment is set.
-func TestPhaseDeleteInfrastructureCRs_CloudRiskAckAllowsDeletion(t *testing.T) {
+func TestPhaseDeleteInfrastructureCRs_CloudRiskConsentAllowsDeletion(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	hcp := withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1"), "AWS")
+	hcp := ownedByTestHub(withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1",
+		"hypershift.openshift.io/finalizer"), "AWS"))
 	r := newGateTestReconciler(t, hcp)
 	td := newTeardownCR()
-	td.Spec.AcknowledgeCloudResourceRisk = true
+	grantTestCloudConsent(td)
 
 	done, err := r.phaseDeleteInfrastructureCRs(context.Background(), ctrllog.Log.WithName("test"), td)
 	if err != nil {
 		t.Fatalf("phaseDeleteInfrastructureCRs error: %v", err)
 	}
 	if done {
-		t.Log("phase completed immediately; verifying deletion was still issued")
+		t.Fatal("phase must wait for the finalizer-bearing infrastructure CR to terminate")
 	}
 
 	got := &unstructured.Unstructured{}
 	got.SetGroupVersionKind(hostedClusterGVK)
 	err = r.Client.Get(context.Background(), types.NamespacedName{Namespace: "clusters", Name: "hcp1"}, got)
-	if err == nil && got.GetDeletionTimestamp() == nil {
-		t.Fatal("expected deletion to be requested after acknowledgment")
+	if err != nil {
+		t.Fatalf("infrastructure CR disappeared without a finalizer: %v", err)
+	}
+	if got.GetDeletionTimestamp() == nil {
+		t.Fatal("expected deletion to be requested after digest-bound consent")
 	}
 
 	events := strings.Join(drainEvents(r), "\n")
-	if strings.Contains(events, "CloudRiskGate") {
-		t.Fatalf("cloud-risk gate must not fire after acknowledgment, got:\n%s", events)
+	if strings.Contains(events, "InfrastructureCRRetained") {
+		t.Fatalf("cloud-risk gate must not retain the CR after consent, got:\n%s", events)
 	}
 }
 
@@ -168,7 +196,7 @@ func TestPhaseDeleteInfrastructureCRs_CloudRiskAckAllowsDeletion(t *testing.T) {
 func TestPatchFinalizer_Tier1BlockedWithoutAck(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	const finalizer = "hypershift.openshift.io/finalizer"
-	hcp := newUnstructured(hostedClusterGVK, "clusters", "hcp1", finalizer)
+	hcp := ownedByTestHub(newUnstructured(hostedClusterGVK, "clusters", "hcp1", finalizer))
 	r := newGateTestReconciler(t, hcp)
 	td := newTeardownCR()
 
@@ -181,8 +209,8 @@ func TestPatchFinalizer_Tier1BlockedWithoutAck(t *testing.T) {
 	if removed {
 		t.Fatal("Tier 1 finalizer must not be removed without acknowledgeCloudResourceRisk")
 	}
-	if reason := conditionReason(td, conditionTypeWaitingForApproval); reason != "Tier1CloudFinalizersBlocked" {
-		t.Fatalf("expected Tier1CloudFinalizersBlocked condition, got %q", reason)
+	if reason := conditionReason(td, conditionTypeWaitingForApproval); reason != "CloudRiskConsentRequired" {
+		t.Fatalf("expected CloudRiskConsentRequired condition, got %q", reason)
 	}
 
 	got := &unstructured.Unstructured{}
@@ -198,10 +226,10 @@ func TestPatchFinalizer_Tier1BlockedWithoutAck(t *testing.T) {
 func TestPatchFinalizer_Tier1AllowedWithAck(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	const finalizer = "hypershift.openshift.io/finalizer"
-	hcp := newUnstructured(hostedClusterGVK, "clusters", "hcp1", finalizer)
+	hcp := ownedByTestHub(newUnstructured(hostedClusterGVK, "clusters", "hcp1", finalizer))
 	r := newGateTestReconciler(t, hcp)
 	td := newTeardownCR()
-	td.Spec.AcknowledgeCloudResourceRisk = true
+	grantTestCloudConsent(td)
 
 	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
 		operatorv1.ResourceRef{Group: hostedClusterGVK.Group, Kind: hostedClusterGVK.Kind, Namespace: "clusters", Name: "hcp1"},
@@ -233,10 +261,9 @@ func TestPatchFinalizer_Tier1AllowedWithAck(t *testing.T) {
 func TestPatchFinalizer_KubeVirtNeedsNoCloudAck(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	const finalizer = "hypershift.openshift.io/finalizer"
-	hcp := withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1", finalizer), "KUBEVIRT")
+	hcp := ownedByTestHub(withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1", finalizer), "KUBEVIRT"))
 	r := newGateTestReconciler(t, hcp)
 	td := newTeardownCR()
-	td.Spec.ApprovedDestructiveActions = true
 
 	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
 		operatorv1.ResourceRef{Group: hostedClusterGVK.Group, Kind: hostedClusterGVK.Kind, Namespace: "clusters", Name: "hcp1"},
@@ -261,13 +288,15 @@ func TestPatchFinalizer_KubeVirtNeedsNoCloudAck(t *testing.T) {
 	}
 }
 
-// 22-E5: dropping the cloud gate does not drop the destructive gate.
-func TestPatchFinalizer_KubeVirtRequiresDestructiveApproval(t *testing.T) {
+// A KubeVirt finalizer is not a cloud-risk action, but it still requires
+// evidence-backed ownership before the shared authorizer permits the patch.
+func TestPatchFinalizer_KubeVirtRequiresOwnershipEvidence(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	const finalizer = "hypershift.openshift.io/finalizer"
 	hcp := withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1", finalizer), "KUBEVIRT")
 	r := newGateTestReconciler(t, hcp)
 	td := newTeardownCR()
+	grantTestCloudConsent(td)
 
 	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
 		operatorv1.ResourceRef{Group: hostedClusterGVK.Group, Kind: hostedClusterGVK.Kind, Namespace: "clusters", Name: "hcp1"},
@@ -276,15 +305,15 @@ func TestPatchFinalizer_KubeVirtRequiresDestructiveApproval(t *testing.T) {
 		t.Fatalf("patchFinalizerOffResource error: %v", err)
 	}
 	if removed {
-		t.Fatal("KubeVirt HCP finalizer must not be removed without any approval")
+		t.Fatal("KubeVirt HCP finalizer must not be removed without ownership evidence")
 	}
-	if reason := conditionReason(td, conditionTypeWaitingForApproval); reason != "Tier2FinalizersBlocked" {
-		t.Fatalf("expected Tier2FinalizersBlocked condition, got %q", reason)
+	if reason := conditionReason(td, conditionTypeWaitingForApproval); reason != "" {
+		t.Fatalf("ownership failure must not masquerade as a consent request, got %q", reason)
 	}
 }
 
-// Tier 2 finalizers protect Kubernetes state and require approvedDestructiveActions.
-func TestPatchFinalizer_Tier2BlockedWithoutApproval(t *testing.T) {
+// Ownership is the first gate for every action, including non-cloud finalizers.
+func TestPatchFinalizer_NonCloudBlockedWithoutOwnership(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	const finalizer = "addon.open-cluster-management.io/addon-pre-delete"
 	mc := newUnstructured(managedClusterGVK, "clusters", "mc1", finalizer)
@@ -298,10 +327,10 @@ func TestPatchFinalizer_Tier2BlockedWithoutApproval(t *testing.T) {
 		t.Fatalf("patchFinalizerOffResource error: %v", err)
 	}
 	if removed {
-		t.Fatal("Tier 2 finalizer must not be removed without approvedDestructiveActions")
+		t.Fatal("non-cloud finalizer must not be removed without ownership evidence")
 	}
-	if reason := conditionReason(td, conditionTypeWaitingForApproval); reason != "Tier2FinalizersBlocked" {
-		t.Fatalf("expected Tier2FinalizersBlocked condition, got %q", reason)
+	if reason := conditionReason(td, conditionTypeWaitingForApproval); reason != "" {
+		t.Fatalf("ownership failure must not raise an approval condition, got %q", reason)
 	}
 
 	got := &unstructured.Unstructured{}
@@ -310,17 +339,16 @@ func TestPatchFinalizer_Tier2BlockedWithoutApproval(t *testing.T) {
 		t.Fatalf("get managed cluster: %v", err)
 	}
 	if !hasFinalizer(got, finalizer) {
-		t.Fatal("Tier 2 finalizer was removed despite the missing approval")
+		t.Fatal("non-cloud finalizer was removed despite missing ownership evidence")
 	}
 }
 
-func TestPatchFinalizer_Tier2AllowedWithApproval(t *testing.T) {
+func TestPatchFinalizer_NonCloudAllowedWithOwnership(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	const finalizer = "addon.open-cluster-management.io/addon-pre-delete"
-	mc := newUnstructured(managedClusterGVK, "clusters", "mc1", finalizer)
+	mc := ownedByTestHub(newUnstructured(managedClusterGVK, "clusters", "mc1", finalizer))
 	r := newGateTestReconciler(t, mc)
 	td := newTeardownCR()
-	td.Spec.ApprovedDestructiveActions = true
 
 	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
 		operatorv1.ResourceRef{Group: managedClusterGVK.Group, Kind: managedClusterGVK.Kind, Namespace: "clusters", Name: "mc1"},
@@ -329,7 +357,7 @@ func TestPatchFinalizer_Tier2AllowedWithApproval(t *testing.T) {
 		t.Fatalf("patchFinalizerOffResource error: %v", err)
 	}
 	if !removed {
-		t.Fatal("Tier 2 finalizer must be removed after approval")
+		t.Fatal("owned non-cloud finalizer must be removed when its controller is gone")
 	}
 }
 
@@ -337,11 +365,10 @@ func TestPatchFinalizer_Tier2AllowedWithApproval(t *testing.T) {
 func TestPatchFinalizer_UnknownNotRemoved(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	const finalizer = "example.com/unknown"
-	mc := newUnstructured(managedClusterGVK, "clusters", "mc1", finalizer)
+	mc := ownedByTestHub(newUnstructured(managedClusterGVK, "clusters", "mc1", finalizer))
 	r := newGateTestReconciler(t, mc)
 	td := newTeardownCR()
-	td.Spec.ApprovedDestructiveActions = true
-	td.Spec.AcknowledgeCloudResourceRisk = true
+	grantTestCloudConsent(td)
 
 	removed, err := r.patchFinalizerOffResource(context.Background(), ctrllog.Log.WithName("test"), td,
 		operatorv1.ResourceRef{Group: managedClusterGVK.Group, Kind: managedClusterGVK.Kind, Namespace: "clusters", Name: "mc1"},
@@ -357,25 +384,15 @@ func TestPatchFinalizer_UnknownNotRemoved(t *testing.T) {
 	}
 }
 
-func TestPhaseRemoveBlockingCRs_DeletesBlockingCRsWithoutApproval(t *testing.T) {
-	s := runtime.NewScheme()
-	registerUnstructured(t, s, mchGVK, mcoGVK, dcGVK, ascGVK)
+func TestPhaseRemoveBlockingCRs_DeletesOwnedBlockingCRs(t *testing.T) {
+	mco := ownedByTestHub(newUnstructured(mcoGVK, "", "observability"))
+	dc := ownedByTestHub(newUnstructured(dcGVK, "", "discovery"))
+	asc := ownedByTestHub(newUnstructured(ascGVK, "", "agent"))
 
-	mco := newUnstructured(mcoGVK, "", "observability")
-	dc := newUnstructured(dcGVK, "", "discovery")
-	asc := newUnstructured(ascGVK, "", "agent")
-
-	r := &HubTeardownReconciler{
-		Client:   fake.NewClientBuilder().WithScheme(s).WithObjects(mco, dc, asc).Build(),
-		Scheme:   s,
-		Log:      ctrllog.Log,
-		Recorder: record.NewFakeRecorder(50),
-	}
+	r := newGateTestReconciler(t, mco, dc, asc)
 
 	td := newTeardownCR()
 	td.Spec.DryRun = false
-	td.Spec.ApprovedDestructiveActions = false
-	td.Spec.AcknowledgeCloudResourceRisk = true
 
 	done, err := r.phaseRemoveBlockingCRs(context.Background(), ctrllog.Log, td)
 	if err != nil {
@@ -399,23 +416,21 @@ func TestPhaseRemoveBlockingCRs_DeletesBlockingCRsWithoutApproval(t *testing.T) 
 	}
 }
 
-func TestPhaseRemoveBlockingCRs_CompletesAndDeletesAgentInstallWebhook(t *testing.T) {
-	s := runtime.NewScheme()
-	registerUnstructured(t, s, mchGVK)
-	s.AddKnownTypes(admissionregistrationv1.SchemeGroupVersion,
-		&admissionregistrationv1.ValidatingWebhookConfiguration{},
-		&admissionregistrationv1.MutatingWebhookConfiguration{})
-
+func TestPhaseRemoveBlockingCRs_DeletesOwnedDanglingRegistration(t *testing.T) {
 	vwc := &admissionregistrationv1.ValidatingWebhookConfiguration{
-		ObjectMeta: metav1.ObjectMeta{Name: agentInstallWebhookNames[0]},
+		ObjectMeta: metav1.ObjectMeta{Name: "acm-dangling.example.com"},
+		Webhooks: []admissionregistrationv1.ValidatingWebhook{{
+			Name: "validate.example.com",
+			ClientConfig: admissionregistrationv1.WebhookClientConfig{
+				Service: &admissionregistrationv1.ServiceReference{
+					Namespace: "open-cluster-management",
+					Name:      "missing-webhook-service",
+				},
+			},
+		}},
 	}
 
-	r := &HubTeardownReconciler{
-		Client:   fake.NewClientBuilder().WithScheme(s).WithObjects(vwc).Build(),
-		Scheme:   s,
-		Log:      ctrllog.Log,
-		Recorder: record.NewFakeRecorder(50),
-	}
+	r := newGateTestReconciler(t, vwc)
 
 	td := newTeardownCR()
 	td.Spec.DryRun = false
@@ -425,16 +440,83 @@ func TestPhaseRemoveBlockingCRs_CompletesAndDeletesAgentInstallWebhook(t *testin
 		t.Fatalf("phaseRemoveBlockingCRs error: %v", err)
 	}
 	if !done {
-		t.Fatal("phase must complete once no blocking CRs remain")
+		t.Fatal("phase must complete once the dangling registration is settled")
 	}
 
 	got := &admissionregistrationv1.ValidatingWebhookConfiguration{}
 	err = r.Client.Get(context.Background(), types.NamespacedName{Name: vwc.Name}, got)
 	if err == nil {
-		t.Fatalf("agent-install webhook %q still present after phase completion", vwc.Name)
+		t.Fatalf("owned dangling webhook %q still present after phase completion", vwc.Name)
 	}
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("unexpected error reading webhook: %v", err)
+	}
+}
+
+func TestPhaseRemoveBlockingCRs_RetainsHealthyRegistration(t *testing.T) {
+	vwc := &admissionregistrationv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "acm-healthy.example.com"},
+		Webhooks: []admissionregistrationv1.ValidatingWebhook{{
+			Name: "validate.example.com",
+			ClientConfig: admissionregistrationv1.WebhookClientConfig{
+				Service: &admissionregistrationv1.ServiceReference{
+					Namespace: "open-cluster-management",
+					Name:      "healthy-webhook-service",
+				},
+			},
+		}},
+	}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:      "healthy-webhook-service",
+		Namespace: "open-cluster-management",
+	}}
+	r := newGateTestReconciler(t, vwc, svc)
+	td := newTeardownCR()
+	td.Spec.DryRun = false
+
+	done, err := r.phaseRemoveBlockingCRs(context.Background(), ctrllog.Log, td)
+	if err != nil {
+		t.Fatalf("phaseRemoveBlockingCRs error: %v", err)
+	}
+	if !done {
+		t.Fatal("phase must complete when the webhook is healthy")
+	}
+	got := &admissionregistrationv1.ValidatingWebhookConfiguration{}
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Name: vwc.Name}, got); err != nil {
+		t.Fatalf("healthy webhook must be retained: %v", err)
+	}
+}
+
+func TestPhaseRemoveBlockingCRs_RetainsUnownedDanglingRegistration(t *testing.T) {
+	vwc := &admissionregistrationv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "platform-dangling.example.com"},
+		Webhooks: []admissionregistrationv1.ValidatingWebhook{{
+			Name: "validate.example.com",
+			ClientConfig: admissionregistrationv1.WebhookClientConfig{
+				Service: &admissionregistrationv1.ServiceReference{
+					Namespace: "platform-system",
+					Name:      "missing-webhook-service",
+				},
+			},
+		}},
+	}
+	r := newGateTestReconciler(t, vwc)
+	td := newTeardownCR()
+	td.Spec.DryRun = false
+
+	done, err := r.phaseRemoveBlockingCRs(context.Background(), ctrllog.Log, td)
+	if err != nil {
+		t.Fatalf("phaseRemoveBlockingCRs error: %v", err)
+	}
+	if !done {
+		t.Fatal("report-only registration must be a terminal disposition, not an infinite wait")
+	}
+	got := &admissionregistrationv1.ValidatingWebhookConfiguration{}
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Name: vwc.Name}, got); err != nil {
+		t.Fatalf("unowned webhook must be retained: %v", err)
+	}
+	if events := strings.Join(drainEvents(r), "\n"); !strings.Contains(events, "DanglingRegistrationRetained") {
+		t.Fatalf("expected a retained-registration event, got:\n%s", events)
 	}
 }
 
@@ -451,7 +533,8 @@ func TestSetTeardownActiveAnnotation_SetsAndIsIdempotent(t *testing.T) {
 	}
 
 	for attempt := 1; attempt <= 2; attempt++ {
-		if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log); err != nil {
+		td := newTeardownCR()
+		if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log, td); err != nil {
 			t.Fatalf("setTeardownActiveAnnotation attempt %d error: %v", attempt, err)
 		}
 		got := &unstructured.Unstructured{}

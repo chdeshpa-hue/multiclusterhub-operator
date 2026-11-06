@@ -45,6 +45,21 @@ func contractReconciler(t *testing.T, objs ...client.Object) *HubTeardownReconci
 	}
 }
 
+func contractTeardown(name string) *operatorv1.HubTeardown {
+	if name == "" {
+		name = "multiclusterhub"
+	}
+	return &operatorv1.HubTeardown{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "open-cluster-management"},
+		Spec: operatorv1.HubTeardownSpec{HubRef: corev1.ObjectReference{
+			APIVersion: "operator.open-cluster-management.io/v1",
+			Kind:       "MultiClusterHub",
+			Name:       name,
+			Namespace:  "open-cluster-management",
+		}},
+	}
+}
+
 func readMCHAnnotations(t *testing.T, r *HubTeardownReconciler, namespace, name string) map[string]string {
 	t.Helper()
 	u := newUnstructured(mchGVK, namespace, name)
@@ -59,7 +74,7 @@ func TestSetTeardownActiveAnnotation_WritesValueAndVersion(t *testing.T) {
 	mch := newUnstructured(mchGVK, "open-cluster-management", "multiclusterhub")
 	r := contractReconciler(t, mch)
 
-	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log); err != nil {
+	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log, contractTeardown("")); err != nil {
 		t.Fatalf("setTeardownActiveAnnotation: %v", err)
 	}
 
@@ -88,7 +103,7 @@ func TestSetTeardownActiveAnnotation_PatchFailureIsFatal(t *testing.T) {
 		}).Build(),
 	}
 
-	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log); err == nil {
+	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log, contractTeardown("")); err == nil {
 		t.Fatal("expected an error when the MCH cannot be annotated")
 	}
 }
@@ -99,7 +114,7 @@ func TestSetTeardownActiveAnnotation_RepairsPartialContract(t *testing.T) {
 	mch.SetAnnotations(map[string]string{annotationTeardownActive: "false"})
 	r := contractReconciler(t, mch)
 
-	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log); err != nil {
+	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log, contractTeardown("")); err != nil {
 		t.Fatalf("setTeardownActiveAnnotation: %v", err)
 	}
 
@@ -119,7 +134,7 @@ func TestSetTeardownActiveAnnotation_CreatesNilMap(t *testing.T) {
 	}
 	r := contractReconciler(t, mch)
 
-	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log); err != nil {
+	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log, contractTeardown("")); err != nil {
 		t.Fatalf("setTeardownActiveAnnotation: %v", err)
 	}
 	if got := readMCHAnnotations(t, r, mch.GetNamespace(), mch.GetName()); len(got) != 2 {
@@ -127,19 +142,21 @@ func TestSetTeardownActiveAnnotation_CreatesNilMap(t *testing.T) {
 	}
 }
 
-// E-6: every MCH is annotated; the contract is cluster-wide by design.
+// E-6: only the MCH named by hubRef is annotated. A teardown must never
+// signal a different hub.
 func TestSetTeardownActiveAnnotation_MultipleMCH(t *testing.T) {
 	first := newUnstructured(mchGVK, "open-cluster-management", "hub-a")
 	second := newUnstructured(mchGVK, "open-cluster-management", "hub-b")
 	r := contractReconciler(t, first, second)
 
-	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log); err != nil {
+	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log, contractTeardown("hub-a")); err != nil {
 		t.Fatalf("setTeardownActiveAnnotation: %v", err)
 	}
-	for _, name := range []string{"hub-a", "hub-b"} {
-		if got := readMCHAnnotations(t, r, "open-cluster-management", name); got[annotationTeardownActive] != "true" {
-			t.Fatalf("%s not annotated: %v", name, got)
-		}
+	if got := readMCHAnnotations(t, r, "open-cluster-management", "hub-a"); got[annotationTeardownActive] != "true" {
+		t.Fatalf("hub-a not annotated: %v", got)
+	}
+	if got := readMCHAnnotations(t, r, "open-cluster-management", "hub-b"); len(got) != 0 {
+		t.Fatalf("hub-b must not be annotated: %v", got)
 	}
 }
 
@@ -147,7 +164,7 @@ func TestSetTeardownActiveAnnotation_MultipleMCH(t *testing.T) {
 func TestReadContract_NoMCHIsSatisfied(t *testing.T) {
 	r := contractReconciler(t)
 
-	record := r.readContract(context.Background(), ctrllog.Log)
+	record := r.readContract(context.Background(), ctrllog.Log, contractTeardown(""))
 	if record == nil || !record.Signalled {
 		t.Fatalf("no-MCH contract must be satisfied, got %+v", record)
 	}
@@ -164,7 +181,7 @@ func TestReadContract_ReportsEveryMCH(t *testing.T) {
 	})
 	r := contractReconciler(t, mch)
 
-	record := r.readContract(context.Background(), ctrllog.Log)
+	record := r.readContract(context.Background(), ctrllog.Log, contractTeardown(""))
 	if !record.Signalled || record.Reason != "Signalled" {
 		t.Fatalf("contract should be signalled, got %+v", record)
 	}
@@ -178,7 +195,7 @@ func TestReadContract_MissingVersionIsIncomplete(t *testing.T) {
 	mch.SetAnnotations(map[string]string{annotationTeardownActive: "true"})
 	r := contractReconciler(t, mch)
 
-	record := r.readContract(context.Background(), ctrllog.Log)
+	record := r.readContract(context.Background(), ctrllog.Log, contractTeardown(""))
 	if record.Signalled {
 		t.Fatalf("a contract without the version must not be reported as signalled: %+v", record)
 	}
@@ -190,13 +207,13 @@ func TestReadContract_NoMatchIsSatisfied(t *testing.T) {
 	r := &HubTeardownReconciler{
 		Scheme: s,
 		Client: fake.NewClientBuilder().WithScheme(s).WithInterceptorFuncs(interceptor.Funcs{
-			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				return &apimeta.NoKindMatchError{GroupKind: schema.GroupKind{Group: mchGVK.Group, Kind: mchGVK.Kind}}
 			},
 		}).Build(),
 	}
 
-	record := r.readContract(context.Background(), ctrllog.Log)
+	record := r.readContract(context.Background(), ctrllog.Log, contractTeardown(""))
 	if !record.Signalled || record.Reason != "NoMCH" {
 		t.Fatalf("no-match must be treated as no MCH, got %+v", record)
 	}
@@ -212,7 +229,7 @@ func TestClearTeardownActiveAnnotation_RemovesBoth(t *testing.T) {
 	})
 	r := contractReconciler(t, mch)
 
-	if err := r.clearTeardownActiveAnnotation(context.Background(), ctrllog.Log); err != nil {
+	if err := r.clearTeardownActiveAnnotation(context.Background(), ctrllog.Log, contractTeardown("")); err != nil {
 		t.Fatalf("clearTeardownActiveAnnotation: %v", err)
 	}
 
@@ -315,7 +332,7 @@ func TestSetTeardownActiveAnnotation_SecondCallDoesNotPatch(t *testing.T) {
 		}).Build(),
 	}
 
-	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log); err != nil {
+	if err := r.setTeardownActiveAnnotation(context.Background(), ctrllog.Log, contractTeardown("")); err != nil {
 		t.Fatalf("setTeardownActiveAnnotation: %v", err)
 	}
 	if patches != 0 {

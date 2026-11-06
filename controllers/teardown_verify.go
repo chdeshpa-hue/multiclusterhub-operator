@@ -96,6 +96,7 @@ func (r *HubTeardownReconciler) phaseVerify(ctx context.Context, log logr.Logger
 
 	if report.Complete {
 		td.Status.Phase = operatorv1.TeardownPhaseComplete
+		td.Status.ObservedGeneration = td.Generation
 		message := fmt.Sprintf("Teardown verified: no residue outside %d expected survivors.", len(report.Expected))
 		switch n := len(report.Unclassified); {
 		case n > 0 && !input.SnapshotPresent:
@@ -114,6 +115,7 @@ func (r *HubTeardownReconciler) phaseVerify(ctx context.Context, log logr.Logger
 		log.Info("Teardown verified complete", "expectedSurvivors", len(report.Expected))
 	} else {
 		td.Status.Phase = operatorv1.TeardownPhaseCompleteWithResidue
+		td.Status.ObservedGeneration = td.Generation
 		reason := "ResidueDetected"
 		message := fmt.Sprintf("Teardown finished with %d residue item(s); see status.residue.", len(report.Residue))
 		if report.RefusedReason != "" {

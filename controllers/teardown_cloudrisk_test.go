@@ -44,8 +44,8 @@ func TestCloudRiskDerivedFromPlatform(t *testing.T) {
 		{
 			name: "22-N1 empty platform AgentServiceConfig", group: "agent-install.openshift.io", kind: "AgentServiceConfig",
 			finalizer: "agentserviceconfig.agent-install.openshift.io/ai-deprovision", platform: "",
-			wantMayOrphan: false, wantKnown: false, wantConsent: false,
-			wantAction: operatorv1.ActionResolveFinalizer, wantCloudClass: false,
+			wantMayOrphan: true, wantKnown: false, wantConsent: true,
+			wantAction: operatorv1.ActionResolveFinalizerWithConsent, wantCloudClass: true,
 		},
 		{
 			name: "22-N2 KubeVirt NodePool", group: "hypershift.openshift.io", kind: "NodePool",
@@ -56,8 +56,8 @@ func TestCloudRiskDerivedFromPlatform(t *testing.T) {
 		{
 			name: "22-E1 unknown platform", group: "hypershift.openshift.io", kind: "HostedCluster",
 			finalizer: "hypershift.openshift.io/finalizer", platform: "FOO",
-			wantMayOrphan: false, wantKnown: false, wantConsent: false,
-			wantAction: operatorv1.ActionResolveFinalizer, wantCloudClass: false,
+			wantMayOrphan: true, wantKnown: false, wantConsent: true,
+			wantAction: operatorv1.ActionResolveFinalizerWithConsent, wantCloudClass: true,
 		},
 	}
 

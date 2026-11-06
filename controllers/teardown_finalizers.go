@@ -304,65 +304,49 @@ func (r *HubTeardownReconciler) patchFinalizerOffResource(
 	gvk schema.GroupVersionKind,
 	platform string,
 ) (bool, error) {
-	tier, description := ClassifyFinalizer(finalizer)
-
-	switch tier {
-	case FinalizerTier1Cloud:
-		if !isKnownCloudPlatform(platform) {
-			// The finalizer is Tier 1 by identity, but on this platform it
-			// protects nothing outside the cluster. Removing it is still
-			// destructive, so it moves behind the destructive approval rather
-			// than the cloud acknowledgement.
-			if !td.Spec.ApprovedDestructiveActions {
-				log.Info("Skipping Tier 1 finalizer on a non-cloud platform: approvedDestructiveActions not set",
-					"resource", fmt.Sprintf("%s/%s/%s", ref.Kind, ref.Namespace, ref.Name),
-					"finalizer", finalizer, "platform", platform)
-				r.setWaitingForApproval(td, "Tier2FinalizersBlocked",
-					fmt.Sprintf("Finalizer %q on %s/%s protects no cloud resource on platform %q, but removing it is destructive. Set spec.approvedDestructiveActions=true to proceed.",
-						finalizer, ref.Kind, ref.Name, platform))
-				return false, nil
-			}
-			log.Info("Removing Tier 1 finalizer on a non-cloud platform",
-				"resource", fmt.Sprintf("%s/%s/%s", ref.Kind, ref.Namespace, ref.Name),
-				"finalizer", finalizer, "platform", platform)
-			break
-		}
-		if !td.Spec.AcknowledgeCloudResourceRisk {
-			log.Info("Skipping Tier 1 finalizer (cloud-protecting): acknowledgeCloudResourceRisk not set",
-				"resource", fmt.Sprintf("%s/%s/%s", ref.Kind, ref.Namespace, ref.Name),
-				"finalizer", finalizer)
-			r.setWaitingForApproval(td, "Tier1CloudFinalizersBlocked",
-				fmt.Sprintf("Cloud-protecting finalizer %q on %s/%s blocked. Set spec.acknowledgeCloudResourceRisk=true after verifying cloud state.",
-					finalizer, ref.Kind, ref.Name))
-			return false, nil
-		}
-		r.Recorder.Eventf(td, corev1.EventTypeWarning, "FinalizerRemovalWarning",
-			"About to remove cloud-protecting finalizer %q from %s/%s/%s. Cloud resources (%s) will be ORPHANED and require manual cleanup.",
-			finalizer, ref.Kind, ref.Namespace, ref.Name, description)
-
-	case FinalizerTier2NonCloud:
-		if !td.Spec.ApprovedDestructiveActions {
-			log.Info("Skipping Tier 2 finalizer: approvedDestructiveActions not set",
-				"resource", fmt.Sprintf("%s/%s/%s", ref.Kind, ref.Namespace, ref.Name),
-				"finalizer", finalizer)
-			r.setWaitingForApproval(td, "Tier2FinalizersBlocked",
-				fmt.Sprintf("Tier 2 finalizer %q on %s/%s blocked. Set spec.approvedDestructiveActions=true to proceed.",
-					finalizer, ref.Kind, ref.Name))
-			return false, nil
-		}
-
-	case FinalizerTierUnknown:
-		log.Info("Skipping unknown finalizer (not in allowlist)",
-			"resource", fmt.Sprintf("%s/%s/%s", ref.Kind, ref.Namespace, ref.Name),
-			"finalizer", finalizer)
-		return false, nil
-	}
-
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(gvk)
 	key := types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name}
 	if err := r.Client.Get(ctx, key, obj); err != nil {
 		return false, fmt.Errorf("getting resource %s/%s: %w", ref.Kind, ref.Name, err)
+	}
+
+	// One authorization function decides every destructive action. The tier
+	// table no longer authorizes a patch; it only tells the authorizer whether
+	// the action may orphan cloud resources. Liveness and ownership decide.
+	authz, err := r.authorizationFor(ctx, log, td)
+	if err != nil {
+		return false, err
+	}
+	meta := partialFromUnstructured(obj)
+	meta.APIVersion = gvk.GroupVersion().String()
+	meta.Kind = gvk.Kind
+	decision, authzErr := r.authorize(ctx, authz, authzRequest{
+		Action:     actionRemoveFinalizer,
+		Object:     meta,
+		Finalizers: obj.GetFinalizers(),
+		Platform:   platform,
+	})
+	if authzErr != nil {
+		return false, authzErr
+	}
+	if !decision.Allowed {
+		log.Info("Finalizer removal is not authorized",
+			"resource", fmt.Sprintf("%s/%s/%s", ref.Kind, ref.Namespace, ref.Name),
+			"finalizer", finalizer,
+			"confidence", decision.Verdict.Confidence,
+			"controllerAlive", decision.ControllerAlive,
+			"reason", decision.Reason)
+		if decision.Policy.RequiresConsent {
+			r.setWaitingForApproval(td, "CloudRiskConsentRequired", decision.Reason)
+		}
+		return false, nil
+	}
+	_, description := ClassifyFinalizer(finalizer)
+	if decision.CloudRisk != nil && decision.CloudRisk.MayOrphan {
+		r.Recorder.Eventf(td, corev1.EventTypeWarning, "FinalizerRemovalWarning",
+			"About to remove cloud-protecting finalizer %q from %s/%s/%s. Cloud resources (%s) will be ORPHANED and require manual cleanup.",
+			finalizer, ref.Kind, ref.Namespace, ref.Name, description)
 	}
 
 	existing := obj.GetFinalizers()
@@ -387,7 +371,7 @@ func (r *HubTeardownReconciler) patchFinalizerOffResource(
 
 	eventType := corev1.EventTypeNormal
 	eventReason := "FinalizerRemoved"
-	if tier == FinalizerTier1Cloud {
+	if decision.CloudRisk != nil && decision.CloudRisk.MayOrphan {
 		eventType = corev1.EventTypeWarning
 		eventReason = "CloudResourceOrphaned"
 	}
@@ -397,7 +381,9 @@ func (r *HubTeardownReconciler) patchFinalizerOffResource(
 
 	log.Info("Removed finalizer",
 		"resource", fmt.Sprintf("%s/%s/%s", ref.Kind, ref.Namespace, ref.Name),
-		"finalizer", finalizer, "tier", tier)
+		"finalizer", finalizer,
+		"confidence", decision.Verdict.Confidence,
+		"controllerAlive", decision.ControllerAlive)
 
 	return true, nil
 }
@@ -417,14 +403,6 @@ func (r *HubTeardownReconciler) resolveStuckFinalizers(
 		}
 
 		for _, finalizer := range dr.Finalizers {
-			if !IsAllowlistedFinalizer(finalizer) {
-				log.Info("Finalizer not in allowlist, skipping",
-					"resource", fmt.Sprintf("%s/%s/%s", dr.Ref.Kind, dr.Ref.Namespace, dr.Ref.Name),
-					"finalizer", finalizer)
-				allResolved = false
-				continue
-			}
-
 			version := dr.Version
 			if version == "" {
 				version = "v1"

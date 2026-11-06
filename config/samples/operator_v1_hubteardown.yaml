@@ -3,33 +3,29 @@
 # Example HubTeardown CR for orchestrated RHACM uninstallation.
 #
 # Usage:
-#   1. Apply this CR to start a dry-run scan:
+#   1. Apply this CR to start a dry-run scan. Nothing is deleted.
 #      oc apply -f operator_v1_hubteardown.yaml
 #
-#   2. Review the scan results (pick any):
+#   2. Review the report and the blockers:
+#      oc get hubteardown teardown -n open-cluster-management
 #      oc get hubteardown teardown -n open-cluster-management -o yaml
-#      oc describe hubteardown teardown -n open-cluster-management
+#      oc get configmap -n open-cluster-management \
+#        -l open-cluster-management.io/uninstall-report=true
 #
-#   3. Check cloud resource warnings:
-#      oc get hubteardown teardown -n open-cluster-management -o jsonpath='{range .status.cloudResourceWarnings[*]}{.resource.kind}/{.resource.namespace}/{.resource.name}: {.riskSummary}{"\n"}{end}'
+#   3. Start teardown with the digest of the report you reviewed. Without a
+#      matching digest the controller parks at ConsentRequired.
+#      oc patch hubteardown teardown -n open-cluster-management --type=merge \
+#        -p '{"spec":{"dryRun":false,"acknowledgedReportDigest":"<status.reportDigest>"}}'
 #
-#   4. Check events emitted by the controller:
-#      oc get events -n open-cluster-management --field-selector reason!=LeaderElection --sort-by='.lastTimestamp' | grep -i teardown
+#   4. If an action may orphan cloud resources, read the cloud-risk section
+#      first and then acknowledge it explicitly (CAUTION: VMs, load balancers,
+#      DNS records and volumes may require manual cleanup):
+#      oc patch hubteardown teardown -n open-cluster-management --type=merge \
+#        -p '{"spec":{"acknowledgeCloudResourceRisk":true}}'
 #
-#   5. Check operator logs for dry-run details:
-#      oc logs -n open-cluster-management deployment/multiclusterhub-operator --tail=100 | grep -i hubteardown
-#
-#   6. Disable dry-run to begin teardown (non-destructive phases):
-#      oc patch hubteardown teardown -n open-cluster-management --type=merge -p '{"spec":{"dryRun":false}}'
-#
-#   7. If stuck resources need Tier 2 (non-cloud) finalizer patching:
-#      oc patch hubteardown teardown -n open-cluster-management --type=merge -p '{"spec":{"approvedDestructiveActions":true}}'
-#
-#   8. If cloud-protecting finalizers need patching (CAUTION: orphans cloud resources):
-#      oc patch hubteardown teardown -n open-cluster-management --type=merge -p '{"spec":{"acknowledgeCloudResourceRisk":true}}'
-#
-#   9. Pause at any time to re-scan:
-#      oc patch hubteardown teardown -n open-cluster-management --type=merge -p '{"spec":{"dryRun":true}}'
+#   5. Pause at any time to re-scan:
+#      oc patch hubteardown teardown -n open-cluster-management --type=merge \
+#        -p '{"spec":{"dryRun":true}}'
 
 apiVersion: operator.open-cluster-management.io/v1
 kind: HubTeardown
@@ -37,4 +33,26 @@ metadata:
   name: teardown
   namespace: open-cluster-management
 spec:
+  # Required. The teardown targets exactly this MultiClusterHub; it never
+  # infers the target from whichever MCH happens to exist.
+  hubRef:
+    apiVersion: operator.open-cluster-management.io/v1
+    kind: MultiClusterHub
+    name: multiclusterhub
+    namespace: open-cluster-management
+
+  # Dry-run is the default and inspects only.
   dryRun: true
+
+  # Default removes an MCE created by this MCH and preserves a pre-existing
+  # one. Preserve never touches MCE, even when this MCH created it.
+  mce: Default
+
+  # Consent is bound to the report digest, not to a report name.
+  acknowledgeCloudResourceRisk: false
+  acknowledgedReportDigest: ""
+
+  escalation:
+    stallTimeout: 15m
+    maxDuration: 2h
+    mode: Manual

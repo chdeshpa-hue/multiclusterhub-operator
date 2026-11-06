@@ -313,29 +313,35 @@ func (r *MultiClusterHubReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
-	// Do not deploy components while HubTeardown is actively running.
+	// Do not deploy components while a HubTeardown targeting this hub is
+	// actively running.
 	// The teardown controller manages resource lifecycle during teardown;
 	// re-creating components here would fight teardown phase 3 (DisableAddons).
-	// Only the oldest non-deleting CR counts (same singleton rule as the teardown controller).
+	// Match the exact hubRef: a teardown for another MCH must not suspend or
+	// mirror into this one.
 	var teardownList operatorv1.HubTeardownList
-	if err := r.Client.List(ctx, &teardownList, client.InNamespace(multiClusterHub.GetNamespace())); err == nil {
-		var oldest *operatorv1.HubTeardown
+	if err := r.Client.List(ctx, &teardownList); err == nil {
+		var target *operatorv1.HubTeardown
 		for i := range teardownList.Items {
 			td := &teardownList.Items[i]
 			if td.GetDeletionTimestamp() != nil {
 				continue
 			}
-			if oldest == nil || td.CreationTimestamp.Before(&oldest.CreationTimestamp) {
-				oldest = td
+			if td.Spec.HubRef.Namespace != multiClusterHub.GetNamespace() ||
+				td.Spec.HubRef.Name != multiClusterHub.GetName() {
+				continue
+			}
+			if target == nil || td.CreationTimestamp.Before(&target.CreationTimestamp) {
+				target = td
 			}
 		}
 		// G1: the mirror is written here because this reconciler owns the MCH
 		// status. A teardown-owned write would be dropped by calculateStatus,
 		// which rebuilds the status from scratch (status.go:285).
-		multiClusterHub.Status.Uninstall = uninstallMirrorFor(oldest)
-		if oldest != nil && !oldest.Spec.DryRun {
+		multiClusterHub.Status.Uninstall = uninstallMirrorFor(target)
+		if target != nil && !target.Spec.DryRun {
 			r.Log.Info("HubTeardown is active — skipping component reconciliation",
-				"teardown", oldest.Name, "phase", oldest.Status.Phase)
+				"teardown", target.Name, "phase", target.Status.Phase)
 			condition := NewHubCondition(operatorv1.Progressing, metav1.ConditionFalse, "TeardownInProgress",
 				"Component reconciliation suspended — HubTeardown is actively running.")
 			SetHubCondition(&multiClusterHub.Status, *condition)

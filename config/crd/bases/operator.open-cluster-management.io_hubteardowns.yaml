@@ -66,10 +66,11 @@ spec:
             properties:
               acknowledgeCloudResourceRisk:
                 description: |-
-                  AcknowledgeCloudResourceRisk enables Tier 1 (cloud-protecting) finalizer
-                  patching. Setting this to true means the admin accepts that cloud
-                  infrastructure (VMs, LBs, storage, DNS) may be orphaned and will
-                  require manual cleanup in the cloud provider console.
+                  AcknowledgeCloudResourceRisk records that an administrator has read the
+                  cloud-risk section of the report and consents to actions that may orphan
+                  cloud resources (VMs, load balancers, DNS records, volumes) outside this
+                  cluster. It is the ONLY source of consent. Consent is honoured only when
+                  AcknowledgedReportDigest matches status.reportDigest.
                 type: boolean
               acknowledgedReportDigest:
                 description: |-
@@ -79,11 +80,6 @@ spec:
                   lapses. Required in practice for any destructive phase; an empty value
                   keeps the teardown parked at ConsentRequired.
                 type: string
-              approvedDestructiveActions:
-                description: |-
-                  ApprovedDestructiveActions enables Tier 2 (non-cloud) finalizer
-                  patching for stuck resources. Only evaluated when dryRun is false.
-                type: boolean
               dryRun:
                 default: true
                 description: |-
@@ -91,20 +87,117 @@ spec:
                   without mutating any cluster resources. Set to false to begin teardown.
                   Can be toggled back to true at any time to pause and re-scan.
                 type: boolean
+              escalation:
+                description: Escalation bounds the destructive phase.
+                properties:
+                  maxDuration:
+                    default: 2h
+                    description: |-
+                      MaxDuration is a terminal bound. On expiry the teardown writes a terminal
+                      Failed phase with the residue report. It is not advisory.
+                    type: string
+                  mode:
+                    allOf:
+                    - enum:
+                      - Manual
+                      - Automatic
+                    - enum:
+                      - Manual
+                      - Automatic
+                    default: Manual
+                    description: |-
+                      Mode selects what happens when a stall is detected.
+                        Manual    - report and wait for consent (default)
+                        Automatic - escalate without further consent, except for any blocker
+                                    with cloudRisk.mayOrphan, which always requires consent.
+                    type: string
+                  stallTimeout:
+                    default: 15m
+                    description: |-
+                      StallTimeout is how long the teardown may make no progress before
+                      escalation is offered. It is measured over the Blocker model, not over
+                      wall-clock phase names.
+                    type: string
+                type: object
               forceFinalizerTimeout:
                 description: |-
                   ForceFinalizerTimeout is the duration to wait for a controller to
                   process its own finalizer before the teardown controller intervenes.
-                  Defaults to 5m.
+                  When unset, the effective default is 15m.
+                  Deprecated: use spec.escalation.stallTimeout for new CRs.
                 type: string
+              hubRef:
+                description: |-
+                  HubRef names the MultiClusterHub this teardown targets. It is required:
+                  the CR is cluster-meaningful and must not infer its target from whichever
+                  MultiClusterHub happens to exist.
+                properties:
+                  apiVersion:
+                    description: API version of the referent.
+                    type: string
+                  fieldPath:
+                    description: |-
+                      If referring to a piece of an object instead of an entire object, this string
+                      should contain a valid JSON/Go field access statement, such as desiredState.manifest.containers[2].
+                      For example, if the object reference is to a container within a pod, this would take on a value like:
+                      "spec.containers{name}" (where "name" refers to the name of the container that triggered
+                      the event) or if no container name is specified "spec.containers[2]" (container with
+                      index 2 in this pod). This syntax is chosen only to have some well-defined way of
+                      referencing a part of an object.
+                    type: string
+                  kind:
+                    description: |-
+                      Kind of the referent.
+                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+                    type: string
+                  name:
+                    description: |-
+                      Name of the referent.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace of the referent.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
+                    type: string
+                  resourceVersion:
+                    description: |-
+                      Specific resourceVersion to which this reference is made, if any.
+                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#concurrency-control-and-consistency
+                    type: string
+                  uid:
+                    description: |-
+                      UID of the referent.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
               maxDuration:
                 description: |-
                   MaxDuration is the maximum wall-clock time allowed for the entire
-                  teardown. If exceeded, the controller sets a Stalled condition with
-                  guidance on what is blocking. Defaults to 2h.
+                  teardown. If exceeded, the controller writes a terminal Failed phase with
+                  the residue report. Defaults to 2h.
+                  Deprecated: use spec.escalation.maxDuration for new CRs.
+                type: string
+              mce:
+                allOf:
+                - enum:
+                  - Default
+                  - Preserve
+                - enum:
+                  - Default
+                  - Preserve
+                default: Default
+                description: |-
+                  MCE selects what happens to MultiClusterEngine.
+                    Default  - MCE is removed only when this MCH created it (installer
+                               labels match hubRef); a pre-existing MCE is preserved.
+                    Preserve - MCE is never touched, even when this MCH created it.
+                  Removing a pre-existing, user-installed MCE is deliberately not offered.
                 type: string
             required:
             - dryRun
+            - hubRef
             type: object
           status:
             description: HubTeardownStatus defines the observed state of HubTeardown.
@@ -223,6 +316,7 @@ spec:
                       - Preparing
                       - HandedOff
                       - Stalled
+                      - Escalating
                       - Verifying
                       - CompleteWithResidue
                       type: string
@@ -406,6 +500,36 @@ spec:
                   - riskSummary
                   type: object
                 type: array
+              cloudRisk:
+                description: |-
+                  CloudRisk is aggregated per platform and resource type and is never
+                  truncated. An administrator must be able to give informed consent from
+                  status alone.
+                items:
+                  description: |-
+                    CloudRiskSummary is the aggregated, never-truncated view of cloud risk that
+                    status carries. One entry exists per (platform, resourceType) pair; the
+                    per-object detail stays in the report ConfigMap.
+                  properties:
+                    consoleHint:
+                      type: string
+                    count:
+                      format: int32
+                      type: integer
+                    namespaces:
+                      items:
+                        type: string
+                      type: array
+                    platform:
+                      type: string
+                    resourceType:
+                      type: string
+                  required:
+                  - count
+                  - platform
+                  - resourceType
+                  type: object
+                type: array
               conditions:
                 description: Conditions reflect the current state of the teardown
                   process.
@@ -510,6 +634,7 @@ spec:
                           - Preparing
                           - HandedOff
                           - Stalled
+                          - Escalating
                           - Verifying
                           - CompleteWithResidue
                           type: string
@@ -553,6 +678,13 @@ spec:
                   read as an observation rather than as a missing scan.
                 format: date-time
                 type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the metadata.generation the controller last
+                  reconciled. It lets a reader see whether the status reflects the current
+                  spec without diffing every field.
+                format: int64
+                type: integer
               pausedAt:
                 description: |-
                   PausedAt records when the admin paused an active teardown by setting
@@ -581,6 +713,7 @@ spec:
                 - Preparing
                 - HandedOff
                 - Stalled
+                - Escalating
                 - Verifying
                 - CompleteWithResidue
                 type: string
@@ -618,6 +751,7 @@ spec:
                       - Preparing
                       - HandedOff
                       - Stalled
+                      - Escalating
                       - Verifying
                       - CompleteWithResidue
                       type: string

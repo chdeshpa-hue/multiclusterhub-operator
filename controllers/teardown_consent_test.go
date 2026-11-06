@@ -59,9 +59,9 @@ func TestReconcileLapsesConsentWhenReportChanged(t *testing.T) {
 			Name:      "teardown-consent",
 			Namespace: "open-cluster-management",
 		},
-		Spec: operatorv1.HubTeardownSpec{
-			DryRun:                     false,
-			ApprovedDestructiveActions: true,
+		Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
+			DryRun:                       false,
+			AcknowledgeCloudResourceRisk: true,
 			// Approved against a report that no longer exists.
 			AcknowledgedReportDigest: "sha256:approved-earlier",
 		},
@@ -112,10 +112,10 @@ func TestReconcileLapsesConsentWhenReportChanged(t *testing.T) {
 func TestConsentDoesNotSurviveRecreatedCR(t *testing.T) {
 	recreated := &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
-		Spec: operatorv1.HubTeardownSpec{
-			DryRun:                     false,
-			ApprovedDestructiveActions: true,
-			AcknowledgedReportDigest:   "sha256:from-a-previous-life",
+		Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
+			DryRun:                       false,
+			AcknowledgeCloudResourceRisk: true,
+			AcknowledgedReportDigest:     "sha256:from-a-previous-life",
 		},
 	}
 	if teardownConsentGiven(recreated) {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	subv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	mcev1 "github.com/stolostron/backplane-operator/api/v1"
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -16,11 +17,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
@@ -523,7 +527,9 @@ func newTestScheme() *runtime.Scheme {
 	_ = appsv1.AddToScheme(s)
 	_ = apixv1.AddToScheme(s)
 	_ = subv1alpha1.AddToScheme(s)
+	_ = mcev1.AddToScheme(s)
 	_ = admissionregistrationv1.AddToScheme(s)
+	_ = apiregistrationv1.AddToScheme(s)
 	_ = rbacv1.AddToScheme(s)
 	return s
 }
@@ -792,7 +798,7 @@ func TestSingletonGuard_RejectsSecondCR(t *testing.T) {
 			Namespace:         "open-cluster-management",
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-1 * time.Hour)),
 		},
-		Spec: operatorv1.HubTeardownSpec{DryRun: true},
+		Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: true},
 	}
 	newer := &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{
@@ -800,7 +806,7 @@ func TestSingletonGuard_RejectsSecondCR(t *testing.T) {
 			Namespace:         "open-cluster-management",
 			CreationTimestamp: metav1.NewTime(time.Now()),
 		},
-		Spec: operatorv1.HubTeardownSpec{DryRun: true},
+		Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: true},
 	}
 
 	cb := fake.NewClientBuilder().WithScheme(s).
@@ -848,7 +854,7 @@ func TestSingletonGuard_AllowsSingleCR(t *testing.T) {
 			Name:      "teardown",
 			Namespace: "open-cluster-management",
 		},
-		Spec: operatorv1.HubTeardownSpec{DryRun: true},
+		Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(), DryRun: true},
 	}
 
 	cb := fake.NewClientBuilder().WithScheme(s).
@@ -969,7 +975,7 @@ func TestPhaseDeleteInfrastructureCRs_SkipsGateWhenEmpty(t *testing.T) {
 			Name:      "teardown",
 			Namespace: "open-cluster-management",
 		},
-		Spec: operatorv1.HubTeardownSpec{
+		Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
 			AcknowledgeCloudResourceRisk: false,
 		},
 	}
@@ -987,7 +993,7 @@ func TestPhaseDeleteInfrastructureCRs_SkipsGateWhenEmpty(t *testing.T) {
 
 func TestShouldResolveStuckFinalizers(t *testing.T) {
 	r := newTeardownTestReconciler()
-	pastTime := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	pastTime := metav1.NewTime(time.Now().Add(-20 * time.Minute))
 	recentTime := metav1.NewTime(time.Now().Add(-30 * time.Second))
 
 	deletingOld := &unstructured.Unstructured{}
@@ -1005,9 +1011,9 @@ func TestShouldResolveStuckFinalizers(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "default timeout, resource deleted 10m ago",
+			name: "default 15m timeout, resource deleted 20m ago",
 			td: &operatorv1.HubTeardown{
-				Spec: operatorv1.HubTeardownSpec{},
+				Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef()},
 			},
 			obj:  deletingOld,
 			want: true,
@@ -1015,7 +1021,7 @@ func TestShouldResolveStuckFinalizers(t *testing.T) {
 		{
 			name: "default timeout, resource deleted 30s ago",
 			td: &operatorv1.HubTeardown{
-				Spec: operatorv1.HubTeardownSpec{},
+				Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef()},
 			},
 			obj:  deletingRecent,
 			want: false,
@@ -1023,7 +1029,7 @@ func TestShouldResolveStuckFinalizers(t *testing.T) {
 		{
 			name: "no deletion timestamp",
 			td: &operatorv1.HubTeardown{
-				Spec: operatorv1.HubTeardownSpec{},
+				Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef()},
 			},
 			obj:  notDeleting,
 			want: false,
@@ -1031,7 +1037,7 @@ func TestShouldResolveStuckFinalizers(t *testing.T) {
 		{
 			name: "custom short timeout (1s), resource deleted 30s ago",
 			td: &operatorv1.HubTeardown{
-				Spec: operatorv1.HubTeardownSpec{
+				Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
 					ForceFinalizerTimeout: &metav1.Duration{Duration: 1 * time.Second},
 				},
 			},
@@ -1041,7 +1047,7 @@ func TestShouldResolveStuckFinalizers(t *testing.T) {
 		{
 			name: "custom long timeout (1h), resource deleted 10m ago",
 			td: &operatorv1.HubTeardown{
-				Spec: operatorv1.HubTeardownSpec{
+				Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
 					ForceFinalizerTimeout: &metav1.Duration{Duration: 1 * time.Hour},
 				},
 			},
@@ -1060,78 +1066,14 @@ func TestShouldResolveStuckFinalizers(t *testing.T) {
 	}
 }
 
-func TestDeleteAgentInstallWebhooks_DeletesVWC(t *testing.T) {
-	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	s := newTestScheme()
-
-	sideEffects := admissionregistrationv1.SideEffectClassNone
-	vwc := &admissionregistrationv1.ValidatingWebhookConfiguration{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "infraenvvalidators.admission.agentinstall.openshift.io",
-		},
-		Webhooks: []admissionregistrationv1.ValidatingWebhook{
-			{
-				Name:                    "infraenvvalidators.admission.agentinstall.openshift.io",
-				SideEffects:             &sideEffects,
-				AdmissionReviewVersions: []string{"v1"},
-				ClientConfig: admissionregistrationv1.WebhookClientConfig{
-					Service: &admissionregistrationv1.ServiceReference{
-						Namespace: "assisted-installer",
-						Name:      "assisted-service",
-					},
-				},
-			},
-		},
-	}
-
-	cb := fake.NewClientBuilder().WithScheme(s).WithObjects(vwc)
-	r := &HubTeardownReconciler{
-		Client:   cb.Build(),
-		Scheme:   s,
-		Log:      ctrllog.Log,
-		Recorder: record.NewFakeRecorder(10),
-	}
-
-	td := &operatorv1.HubTeardown{
-		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
-	}
-	ctx := context.Background()
-	log := ctrllog.Log.WithName("test")
-
-	if err := r.deleteAgentInstallWebhooks(ctx, log, td); err != nil {
-		t.Fatalf("deleteAgentInstallWebhooks error: %v", err)
-	}
-
-	fetched := &admissionregistrationv1.ValidatingWebhookConfiguration{}
-	err := r.Client.Get(ctx, types.NamespacedName{Name: vwc.Name}, fetched)
-	if err == nil {
-		t.Error("Expected VWC to be deleted, but it still exists")
-	}
-}
-
-func TestDeleteAgentInstallWebhooks_NoWebhooksIsNoop(t *testing.T) {
-	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
-	r := newTeardownTestReconciler()
-
-	td := &operatorv1.HubTeardown{
-		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
-	}
-	ctx := context.Background()
-	log := ctrllog.Log.WithName("test")
-
-	if err := r.deleteAgentInstallWebhooks(ctx, log, td); err != nil {
-		t.Fatalf("deleteAgentInstallWebhooks should be a noop: %v", err)
-	}
-}
-
 func TestResolveMCHBlockingFinalizers_NoMatchIsNoop(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	r := newTeardownTestReconciler()
 
 	td := &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
-		Spec: operatorv1.HubTeardownSpec{
-			ApprovedDestructiveActions: true,
+		Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
+			AcknowledgeCloudResourceRisk: true,
 		},
 	}
 	ctx := context.Background()
@@ -1139,6 +1081,103 @@ func TestResolveMCHBlockingFinalizers_NoMatchIsNoop(t *testing.T) {
 
 	if err := r.resolveMCHBlockingFinalizers(ctx, log, td); err != nil {
 		t.Fatalf("resolveMCHBlockingFinalizers should be a noop when CRD types are missing: %v", err)
+	}
+}
+
+// A deleting MCH waits on its operands' finalizers. MonitorMCEChain must clear
+// those blockers before it starts waiting for the MCH to disappear, otherwise
+// the finalizer it is waiting to resolve can never be resolved.
+func TestPhaseMonitorMCEChain_ResolvesBlockingFinalizersBeforeWaitingForMCH(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	deleting := metav1.NewTime(time.Now().Add(-time.Hour))
+
+	mch := &operatorv1.MultiClusterHub{
+		TypeMeta: metav1.TypeMeta{APIVersion: mchGVK.GroupVersion().String(), Kind: mchGVK.Kind},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              testHubRef().Name,
+			Namespace:         testHubRef().Namespace,
+			Finalizers:        []string{"operator.open-cluster-management.io/finalizer"},
+			DeletionTimestamp: &deleting,
+		},
+	}
+
+	mcsGVK := schema.GroupVersionKind{
+		Group:   "cluster.open-cluster-management.io",
+		Version: "v1beta2",
+		Kind:    "ManagedClusterSet",
+	}
+	mcs := ownedByTestHub(newUnstructured(mcsGVK, "", "default",
+		"cluster.open-cluster-management.io/submariner-cleanup"))
+	mcs.SetDeletionTimestamp(&deleting)
+
+	s := newTestScheme()
+	registerUnstructured(t, s, mcsGVK)
+	r := &HubTeardownReconciler{
+		Client:   fake.NewClientBuilder().WithScheme(s).WithObjects(mch, mcs).Build(),
+		Scheme:   s,
+		Log:      ctrllog.Log,
+		Recorder: record.NewFakeRecorder(50),
+	}
+	td := newTeardownCR()
+
+	done, err := r.phaseMonitorMCEChain(context.Background(), ctrllog.Log.WithName("test"), td)
+	if err != nil {
+		t.Fatalf("phaseMonitorMCEChain: %v", err)
+	}
+	if done {
+		t.Fatal("phase must keep waiting while the target MCH still exists")
+	}
+
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(mcsGVK)
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Name: "default"}, got); err != nil {
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		t.Fatalf("get ManagedClusterSet: %v", err)
+	}
+	if len(got.GetFinalizers()) != 0 {
+		t.Fatalf("expected the MCH-blocking finalizer to be resolved before the wait, got %v", got.GetFinalizers())
+	}
+}
+
+func TestPhaseDeleteMCHTargetsOnlyHubRef(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+
+	target := newUnstructured(mchGVK, testHubRef().Namespace, testHubRef().Name)
+	other := newUnstructured(mchGVK, testHubRef().Namespace, "other-hub")
+	s := runtime.NewScheme()
+	if err := apixv1.AddToScheme(s); err != nil {
+		t.Fatalf("add apiextensions scheme: %v", err)
+	}
+	registerUnstructured(t, s, mchGVK)
+	r := &HubTeardownReconciler{
+		Client:   fake.NewClientBuilder().WithScheme(s).WithObjects(target, other).Build(),
+		Scheme:   s,
+		Log:      ctrllog.Log,
+		Recorder: record.NewFakeRecorder(10),
+	}
+
+	done, err := r.phaseDeleteMCH(context.Background(), ctrllog.Log.WithName("test"), newTeardownCR())
+	if err != nil {
+		t.Fatalf("phaseDeleteMCH: %v", err)
+	}
+	if done {
+		t.Fatal("phase must re-observe the target MCH before reporting completion")
+	}
+
+	gotTarget := newUnstructured(mchGVK, target.GetNamespace(), target.GetName())
+	if err := r.Client.Get(context.Background(), types.NamespacedName{
+		Namespace: target.GetNamespace(), Name: target.GetName(),
+	}, gotTarget); !apierrors.IsNotFound(err) {
+		t.Fatalf("target MCH error = %v, want NotFound", err)
+	}
+
+	gotOther := newUnstructured(mchGVK, other.GetNamespace(), other.GetName())
+	if err := r.Client.Get(context.Background(), types.NamespacedName{
+		Namespace: other.GetNamespace(), Name: other.GetName(),
+	}, gotOther); err != nil {
+		t.Fatalf("non-target MCH must be retained: %v", err)
 	}
 }
 
@@ -1154,8 +1193,91 @@ func TestEnsureMCEDeleted_NoMatchIsNoop(t *testing.T) {
 	ctx := context.Background()
 	log := ctrllog.Log.WithName("test")
 
-	if err := r.ensureMCEDeleted(ctx, log, td); err != nil {
+	settled, err := r.ensureMCEDeleted(ctx, log, td)
+	if err != nil {
 		t.Fatalf("ensureMCEDeleted should be a noop when MCE CRD is not registered: %v", err)
+	}
+	if !settled {
+		t.Fatal("an absent MCE must settle immediately")
+	}
+}
+
+func TestEnsureMCEDeleted_PreserveNeverTouchesMCE(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	mce := &mcev1.MultiClusterEngine{ObjectMeta: metav1.ObjectMeta{
+		Name: "mce",
+		Labels: map[string]string{
+			"installer.name":      testHubRef().Name,
+			"installer.namespace": testHubRef().Namespace,
+		},
+	}}
+	r := newTeardownTestReconciler()
+	r.Client = fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(mce).Build()
+
+	td := &operatorv1.HubTeardown{
+		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
+		Spec:       operatorv1.HubTeardownSpec{HubRef: testHubRef(), MCE: operatorv1.MCEDispositionPreserve},
+	}
+	settled, err := r.ensureMCEDeleted(context.Background(), ctrllog.Log.WithName("test"), td)
+	if err != nil {
+		t.Fatalf("ensureMCEDeleted: %v", err)
+	}
+	if !settled {
+		t.Fatal("Preserve must be a settled disposition")
+	}
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Name: "mce"}, &mcev1.MultiClusterEngine{}); err != nil {
+		t.Fatalf("Preserve touched the MCE: %v", err)
+	}
+}
+
+func TestEnsureMCEDeleted_DefaultRetainsPreExistingMCE(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	mce := &mcev1.MultiClusterEngine{ObjectMeta: metav1.ObjectMeta{Name: "mce"}}
+	r := newTeardownTestReconciler()
+	r.Client = fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(mce).Build()
+
+	td := &operatorv1.HubTeardown{
+		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
+		Spec:       operatorv1.HubTeardownSpec{HubRef: testHubRef()},
+	}
+	settled, err := r.ensureMCEDeleted(context.Background(), ctrllog.Log.WithName("test"), td)
+	if err != nil {
+		t.Fatalf("ensureMCEDeleted: %v", err)
+	}
+	if !settled {
+		t.Fatal("a retained pre-existing MCE must not wait forever")
+	}
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Name: "mce"}, &mcev1.MultiClusterEngine{}); err != nil {
+		t.Fatalf("pre-existing MCE was deleted: %v", err)
+	}
+}
+
+func TestEnsureMCEDeleted_DefaultDeletesMCECreatedByThisMCH(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	mce := &mcev1.MultiClusterEngine{ObjectMeta: metav1.ObjectMeta{
+		Name: "mce",
+		Labels: map[string]string{
+			"installer.name":      testHubRef().Name,
+			"installer.namespace": testHubRef().Namespace,
+		},
+	}}
+	r := newTeardownTestReconciler()
+	r.Client = fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(mce).Build()
+
+	td := &operatorv1.HubTeardown{
+		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
+		Spec:       operatorv1.HubTeardownSpec{HubRef: testHubRef()},
+	}
+	settled, err := r.ensureMCEDeleted(context.Background(), ctrllog.Log.WithName("test"), td)
+	if err != nil {
+		t.Fatalf("ensureMCEDeleted: %v", err)
+	}
+	if settled {
+		t.Fatal("deleting the MCE is not settled until it disappears")
+	}
+	err = r.Client.Get(context.Background(), types.NamespacedName{Name: "mce"}, &mcev1.MultiClusterEngine{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("MCE created by this MCH was not deleted: %v", err)
 	}
 }
 
@@ -1180,8 +1302,8 @@ func TestPhaseMonitorMCEChain_AllGoneCompletesPhase(t *testing.T) {
 
 	td := &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
-		Spec: operatorv1.HubTeardownSpec{
-			ApprovedDestructiveActions: true,
+		Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
+			AcknowledgeCloudResourceRisk: true,
 		},
 	}
 	ctx := context.Background()
@@ -1207,11 +1329,11 @@ func TestSweepMCSAndCMA_NoMatchIsNoop(t *testing.T) {
 
 	td := &operatorv1.HubTeardown{
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
-		Spec:       operatorv1.HubTeardownSpec{ApprovedDestructiveActions: true},
+		Spec:       operatorv1.HubTeardownSpec{HubRef: testHubRef(), AcknowledgeCloudResourceRisk: true},
 	}
 
 	// Should not panic or error when MCS/CMA CRDs are not registered
-	r.sweepMCSAndCMA(context.Background(), log, td)
+	r.sweepMCSAndCMA(context.Background(), log, td, nil)
 }
 
 func TestEnsureMCEDeleted_NoMatchIsNoop_v11(t *testing.T) {
@@ -1223,7 +1345,11 @@ func TestEnsureMCEDeleted_NoMatchIsNoop_v11(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
 	}
 
-	if err := r.ensureMCEDeleted(context.Background(), log, td); err != nil {
+	settled, err := r.ensureMCEDeleted(context.Background(), log, td)
+	if err != nil {
 		t.Fatalf("ensureMCEDeleted should be a noop when MCE CRD is not registered: %v", err)
+	}
+	if !settled {
+		t.Fatal("an absent MCE must settle immediately")
 	}
 }

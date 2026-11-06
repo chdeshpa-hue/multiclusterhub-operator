@@ -21,6 +21,7 @@ import (
 func TestHandoffPhasePlan(t *testing.T) {
 	r := &HubTeardownReconciler{}
 	want := []operatorv1.TeardownPhase{
+		operatorv1.TeardownPhaseRemoveBlockingCRs,
 		operatorv1.TeardownPhaseMonitorMCEChain,
 		operatorv1.TeardownPhaseDeleteACMCRDs,
 	}
@@ -348,7 +349,7 @@ func TestFailOnHandoffJob(t *testing.T) {
 
 func TestRunHandoffJob_MissingCR(t *testing.T) {
 	r := newHandoffReconciler(t)
-	if err := RunHandoffJob(context.Background(), r.Client, nil, "absent", "open-cluster-management"); err != nil {
+	if err := RunHandoffJob(context.Background(), r.Client, nil, nil, "absent", "open-cluster-management"); err != nil {
 		t.Fatalf("RunHandoffJob on a missing CR must be a no-op, got %v", err)
 	}
 }

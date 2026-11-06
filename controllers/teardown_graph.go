@@ -84,6 +84,33 @@ type DependencyGraph struct {
 	// kind and installer labels. The index needs it to answer "is the defining
 	// CRD part of this installation?" without a second API read.
 	CRDRefs []inventory.CRDRef
+
+	// CRDs is the full CRD set seen by the same scan. Execution phases must use
+	// this snapshot instead of re-listing CRDs, so the object that is authorized
+	// is the object that was inspected.
+	CRDs []apixv1.CustomResourceDefinition
+
+	// DiscoveryPath records which discovery API the inventory walk used.
+	DiscoveryPath string
+
+	// InventoryComplete is false when any resource type could not be listed.
+	InventoryComplete bool
+
+	// ObjectsSeen is the number of objects the walk returned, across all types.
+	ObjectsSeen int
+
+	// LocalCluster is the self-managed ManagedCluster when present. It is
+	// carried separately because it is deliberately excluded from the detach
+	// phase and removed only after MCH is gone; a silent skip is not a
+	// disposition.
+	LocalCluster *DiscoveredResource
+
+	// LocalClusterDisposition is the explicit, reported treatment of
+	// local-cluster. Empty when the hub is not self-managed.
+	LocalClusterDisposition string
+
+	// TargetHub is the exact MultiClusterHub reference this graph describes.
+	TargetHub types.NamespacedName
 }
 
 // ScanIncomplete is one reason the scan did not see everything.
@@ -140,13 +167,60 @@ func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, td *op
 	ctx, cancel := context.WithTimeout(ctx, teardownScanTimeout)
 	defer cancel()
 
-	graph := &DependencyGraph{ScanTime: metav1.Now()}
+	graph := &DependencyGraph{
+		ScanTime:      metav1.Now(),
+		DiscoveryPath: inventory.DiscoveryPathLegacy,
+	}
+	if td != nil {
+		graph.TargetHub = types.NamespacedName{
+			Namespace: td.Spec.HubRef.Namespace,
+			Name:      td.Spec.HubRef.Name,
+		}
+	}
 
 	crdList := &apixv1.CustomResourceDefinitionList{}
 	if err := r.Client.List(ctx, crdList); err != nil {
 		return nil, fmt.Errorf("listing CRDs: %w", err)
 	}
+	graph.CRDs = append([]apixv1.CustomResourceDefinition(nil), crdList.Items...)
+	for i := range crdList.Items {
+		crd := &crdList.Items[i]
+		graph.CRDRefs = append(graph.CRDRefs, inventory.CRDRef{
+			Group:    crd.Spec.Group,
+			Kind:     crd.Spec.Names.Kind,
+			Labels:   crd.Labels,
+			ACMOwned: ownsACMGroups(crd.Spec.Group),
+		})
+	}
 
+	// Layer 1 is the production inventory. The manual CRD-instance scan
+	// remains only as a unit-test fallback for a reconciler without a metadata
+	// client; a missing walker is reported as the legacy path, never hidden.
+	if r.MetadataClient != nil && r.DiscoveryClient != nil {
+		if err := r.walkInventory(ctx, log, graph); err != nil {
+			log.Error(err, "Layer 1 inventory walk failed; reporting an incomplete inventory")
+		}
+	} else {
+		log.Info("Metadata client not configured; using the legacy full-object scan for this unit-test fallback")
+		if err := r.scanCRDInventory(ctx, log, graph, crdList); err != nil {
+			return nil, err
+		}
+	}
+	graph.InventoryComplete = len(graph.Incomplete) == 0
+
+	r.classifyBlockingResources(graph)
+	r.classifyManagedClusters(graph)
+	r.classifyAddons(graph)
+	r.findMCHAndMCE(graph)
+	r.classifyOwnership(graph)
+	r.classifyBlockerBehaviour(ctx, graph, r.previousBlockerUIDs(ctx, td, log))
+
+	return graph, nil
+}
+
+// scanCRDInventory is the unit-test fallback. Production never reaches it
+// because MetadataClient is set by main and by both Job entrypoints.
+func (r *HubTeardownReconciler) scanCRDInventory(ctx context.Context, log logr.Logger, graph *DependencyGraph, crdList *apixv1.CustomResourceDefinitionList) error {
 	for i := range crdList.Items {
 		crd := &crdList.Items[i]
 		if !isACMAPIGroup(crd.Spec.Group) {
@@ -160,22 +234,99 @@ func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, td *op
 				Reason:   err.Error(),
 			})
 		}
-		graph.CRDRefs = append(graph.CRDRefs, inventory.CRDRef{
-			Group:    crd.Spec.Group,
-			Kind:     crd.Spec.Names.Kind,
-			Labels:   crd.Labels,
-			ACMOwned: ownsACMGroups(crd.Spec.Group),
+	}
+	return nil
+}
+
+// walkInventory builds the graph from the bounded metadata walk. It lists
+// PartialObjectMetadata only; full objects are read individually and only for
+// the fields the Blocker model needs and metadata cannot carry (platform and
+// the ManagedCluster Available condition).
+func (r *HubTeardownReconciler) walkInventory(ctx context.Context, log logr.Logger, graph *DependencyGraph) error {
+	walker := &inventory.Walker{
+		Discovery: r.DiscoveryClient,
+		Lister:    inventory.MetadataLister{Client: r.MetadataClient},
+	}
+	result, err := walker.Walk(ctx, inventory.WalkOptions{})
+	if result == nil {
+		return err
+	}
+
+	graph.DiscoveryPath = result.DiscoveryPath
+	graph.ObjectsSeen = len(result.Objects)
+	for _, incomplete := range result.Incomplete {
+		graph.Incomplete = append(graph.Incomplete, ScanIncomplete{
+			Group:    incomplete.Group,
+			Resource: incomplete.Resource,
+			Reason:   incomplete.Reason,
 		})
 	}
 
-	r.classifyBlockingResources(graph)
-	r.classifyManagedClusters(graph)
-	r.classifyAddons(graph)
-	r.findMCHAndMCE(graph)
-	r.classifyOwnership(graph)
-	r.classifyBlockerBehaviour(ctx, graph, r.previousBlockerUIDs(ctx, td, log))
+	for i := range result.Objects {
+		object := &result.Objects[i]
+		groupVersion, parseErr := schema.ParseGroupVersion(object.APIVersion)
+		if parseErr != nil || !isACMAPIGroup(groupVersion.Group) {
+			continue
+		}
+		dr := discoveredResourceFromMetadata(object, groupVersion)
+		if needsFullObject(dr.Ref.Kind) {
+			if enrichErr := r.enrichDiscoveredResource(ctx, &dr); enrichErr != nil {
+				graph.Incomplete = append(graph.Incomplete, ScanIncomplete{
+					Group:    dr.Ref.Group,
+					Resource: dr.Ref.Kind,
+					Reason:   fmt.Sprintf("reading %s/%s: %v", dr.Ref.Namespace, dr.Ref.Name, enrichErr),
+				})
+			}
+		}
+		graph.DiscoveredResources = append(graph.DiscoveredResources, dr)
+	}
+	if err != nil {
+		log.Error(err, "Inventory walk returned an error with a partial result")
+	}
+	return nil
+}
 
-	return graph, nil
+func discoveredResourceFromMetadata(object *metav1.PartialObjectMetadata, groupVersion schema.GroupVersion) DiscoveredResource {
+	return DiscoveredResource{
+		Ref: operatorv1.ResourceRef{
+			Group:     groupVersion.Group,
+			Kind:      object.Kind,
+			Namespace: object.GetNamespace(),
+			Name:      object.GetName(),
+		},
+		Version:           groupVersion.Version,
+		UID:               object.GetUID(),
+		Finalizers:        object.GetFinalizers(),
+		DeletionTimestamp: object.GetDeletionTimestamp(),
+		IsDeleting:        object.GetDeletionTimestamp() != nil,
+		Labels:            object.GetLabels(),
+		OwnerReferences:   object.GetOwnerReferences(),
+	}
+}
+
+// needsFullObject names the few kinds whose non-metadata fields feed the
+// Blocker model. Everything else stays metadata-only.
+func needsFullObject(kind string) bool {
+	switch kind {
+	case "HostedCluster", "HostedControlPlane", "NodePool", "ClusterDeployment", "ClusterPool", "ManagedCluster":
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *HubTeardownReconciler) enrichDiscoveredResource(ctx context.Context, dr *DiscoveredResource) error {
+	gvk := schema.GroupVersionKind{Group: dr.Ref.Group, Version: dr.Version, Kind: dr.Ref.Kind}
+	object := &unstructured.Unstructured{}
+	object.SetGroupVersionKind(gvk)
+	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: dr.Ref.Namespace, Name: dr.Ref.Name}, object); err != nil {
+		return err
+	}
+	dr.Platform = detectPlatform(dr.Ref.Kind, object)
+	if dr.Ref.Kind == "ManagedCluster" {
+		dr.AvailableStatus, dr.AvailableSince = availableCondition(object)
+	}
+	return nil
 }
 
 // isACMAPIGroup checks if an API group belongs to the ACM/MCE ecosystem.
@@ -411,12 +562,18 @@ func (r *HubTeardownReconciler) classifyBlockingResources(graph *DependencyGraph
 
 // classifyManagedClusters finds non-local ManagedClusters that block MCH deletion.
 func (r *HubTeardownReconciler) classifyManagedClusters(graph *DependencyGraph) {
-	for _, dr := range graph.DiscoveredResources {
+	for i := range graph.DiscoveredResources {
+		dr := &graph.DiscoveredResources[i]
 		if dr.Ref.Kind == "ManagedCluster" && dr.Ref.Group == "cluster.open-cluster-management.io" {
 			if dr.Ref.Name == "local-cluster" {
+				// local-cluster cannot be detached before MCH is deleted: the
+				// MCH webhook requires it. It is not skipped silently; the
+				// treatment is carried in the report and status.
+				graph.LocalCluster = dr
+				graph.LocalClusterDisposition = "Retained until MultiClusterHub deletion, then detached as the final cleanup step"
 				continue
 			}
-			graph.NonLocalManagedClusters = append(graph.NonLocalManagedClusters, dr)
+			graph.NonLocalManagedClusters = append(graph.NonLocalManagedClusters, *dr)
 			graph.BlockingResources = append(graph.BlockingResources, operatorv1.BlockingResource{
 				Group:  dr.Ref.Group,
 				Kind:   dr.Ref.Kind,
@@ -460,13 +617,20 @@ func (r *HubTeardownReconciler) classifyAddons(graph *DependencyGraph) {
 	}
 }
 
-// findMCHAndMCE locates the MultiClusterHub and MultiClusterEngine resources.
+// findMCHAndMCE locates the target MultiClusterHub and its MultiClusterEngine.
+// The MCH is matched by spec.hubRef namespace/name, never by being the only
+// MCH the walk happened to see.
 func (r *HubTeardownReconciler) findMCHAndMCE(graph *DependencyGraph) {
+	// The caller's teardown reference is attached to the graph by
+	// buildDependencyGraph through targetHubRef.
 	for i, dr := range graph.DiscoveredResources {
-		if dr.Ref.Kind == "MultiClusterHub" && dr.Ref.Group == "operator.open-cluster-management.io" {
+		if dr.Ref.Kind == "MultiClusterHub" && dr.Ref.Group == "operator.open-cluster-management.io" &&
+			dr.Ref.Namespace == graph.TargetHub.Namespace && dr.Ref.Name == graph.TargetHub.Name {
 			graph.MCH = &graph.DiscoveredResources[i]
 		}
-		if dr.Ref.Kind == "MultiClusterEngine" && dr.Ref.Group == "multicluster.openshift.io" {
+		if dr.Ref.Kind == "MultiClusterEngine" && dr.Ref.Group == "multicluster.openshift.io" &&
+			dr.Labels["installer.name"] == graph.TargetHub.Name &&
+			dr.Labels["installer.namespace"] == graph.TargetHub.Namespace {
 			graph.MCE = &graph.DiscoveredResources[i]
 		}
 	}

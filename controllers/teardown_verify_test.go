@@ -37,6 +37,7 @@ func TestTeardownPhasePlan(t *testing.T) {
 	// Prepare phases moved into the Job (increment 8); the dry-run report still
 	// lists them because it describes the whole teardown, not one executor's share.
 	want := []operatorv1.TeardownPhase{
+		operatorv1.TeardownPhaseRemoveBlockingCRs,
 		operatorv1.TeardownPhaseDeleteMCH,
 		operatorv1.TeardownPhaseMonitorMCEChain,
 		operatorv1.TeardownPhaseDeleteACMCRDs,

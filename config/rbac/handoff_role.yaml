@@ -16,6 +16,12 @@ metadata:
     app: hubteardown
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - create
+- apiGroups:
   - "*"
   resources:
   - "*"

@@ -48,10 +48,7 @@ func teardownNamespace(td *operatorv1.HubTeardown) string {
 // teardownJobDeadline bounds the Job by the same wall clock the controller
 // uses for stall detection, so a hung Job cannot outlive spec.maxDuration.
 func teardownJobDeadline(td *operatorv1.HubTeardown) *int64 {
-	maxDur := defaultMaxDuration
-	if td.Spec.MaxDuration != nil {
-		maxDur = td.Spec.MaxDuration.Duration
-	}
+	maxDur := effectiveMaxDuration(td)
 	seconds := int64(maxDur.Seconds())
 	if seconds < 60 {
 		seconds = 60

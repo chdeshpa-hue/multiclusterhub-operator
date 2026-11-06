@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	mcev1 "github.com/stolostron/backplane-operator/api/v1"
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
+	"github.com/stolostron/multiclusterhub-operator/pkg/multiclusterengineutils"
 	"github.com/stolostron/multiclusterhub-operator/pkg/ownership"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -43,114 +46,57 @@ const (
 	teardownContractVersion         = "1"
 )
 
-// agentInstallWebhookNames lists admission webhook configurations created by
-// the assisted-installer whose backing service may be gone after
-// AgentServiceConfig is deleted in phaseRemoveBlockingCRs.
-var agentInstallWebhookNames = []string{
-	"infraenvvalidators.admission.agentinstall.openshift.io",
-	"agentvalidators.admission.agentinstall.openshift.io",
-	"agentclusterinstallvalidators.admission.agentinstall.openshift.io",
-	"agentclusterinstallmutators.admission.agentinstall.openshift.io",
-}
-
-// deleteAgentInstallWebhooks unconditionally deletes agent-install admission
-// webhooks. Called after AgentServiceConfig is confirmed deleted — the backing
-// service is gone, so these webhooks (failurePolicy: Fail) would reject PATCH
-// calls in subsequent phases.
-func (r *HubTeardownReconciler) deleteAgentInstallWebhooks(
-	ctx context.Context,
-	log logr.Logger,
-	td *operatorv1.HubTeardown,
-) error {
-	for _, name := range agentInstallWebhookNames {
-		key := types.NamespacedName{Name: name}
-
-		vwc := &admissionregistrationv1.ValidatingWebhookConfiguration{}
-		if err := r.Client.Get(ctx, key, vwc); err == nil {
-			log.Info("Deleting agent-install ValidatingWebhookConfiguration", "name", name)
-			if err := r.Client.Delete(ctx, vwc); err != nil && !errors.IsNotFound(err) {
-				return fmt.Errorf("deleting VWC %s: %w", name, err)
-			}
-			r.Recorder.Eventf(td, corev1.EventTypeNormal, "AgentWebhookDeleted",
-				"Deleted ValidatingWebhookConfiguration %s (agent-install service gone)", name)
-			continue
-		}
-
-		mwc := &admissionregistrationv1.MutatingWebhookConfiguration{}
-		if err := r.Client.Get(ctx, key, mwc); err == nil {
-			log.Info("Deleting agent-install MutatingWebhookConfiguration", "name", name)
-			if err := r.Client.Delete(ctx, mwc); err != nil && !errors.IsNotFound(err) {
-				return fmt.Errorf("deleting MWC %s: %w", name, err)
-			}
-			r.Recorder.Eventf(td, corev1.EventTypeNormal, "AgentWebhookDeleted",
-				"Deleted MutatingWebhookConfiguration %s (agent-install service gone)", name)
-		}
-	}
-	return nil
-}
-
 // setTeardownActiveAnnotation annotates the MCH CR with the teardown-active
 // signal. Downstream operators watch for this annotation to activate their
 // own teardown-aware paths (see DF-1, DF-3, DF-4). Idempotent — skips if
 // already set. Called at the start of PrepareAndDrain (phaseRemoveBlockingCRs).
-func (r *HubTeardownReconciler) setTeardownActiveAnnotation(ctx context.Context, log logr.Logger) error {
-	mchGVK := schema.GroupVersionKind{
-		Group:   "operator.open-cluster-management.io",
-		Version: "v1",
-		Kind:    "MultiClusterHubList",
-	}
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(mchGVK)
-
-	if err := r.Client.List(ctx, list); err != nil {
-		if isNoMatchError(err) {
+func (r *HubTeardownReconciler) setTeardownActiveAnnotation(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) error {
+	target, err := r.targetMCH(ctx, td)
+	if err != nil {
+		if isNoMatchError(err) || errors.IsNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("listing MCH for teardown-active annotation: %w", err)
+		return fmt.Errorf("reading target MCH for teardown-active annotation: %w", err)
 	}
 
-	for i := range list.Items {
-		mch := &list.Items[i]
-		annotations := mch.GetAnnotations()
-		if annotations[annotationTeardownActive] == "true" &&
-			annotations[annotationTeardownActiveVersion] == teardownContractVersion {
-			continue
-		}
-		if annotations == nil {
-			annotations = make(map[string]string)
-		}
-		patch := client.MergeFrom(mch.DeepCopy())
-		annotations[annotationTeardownActive] = "true"
-		annotations[annotationTeardownActiveVersion] = teardownContractVersion
-		mch.SetAnnotations(annotations)
-		if err := r.Client.Patch(ctx, mch, patch); err != nil {
-			if errors.IsNotFound(err) {
-				continue
-			}
-			return fmt.Errorf("setting teardown-active annotation on MCH %s: %w", mch.GetName(), err)
-		}
-		log.Info("Set teardown-active annotation on MCH — downstream operators will activate teardown paths",
-			"name", mch.GetName(), "annotation", annotationTeardownActive)
+	annotations := target.GetAnnotations()
+	if annotations[annotationTeardownActive] == "true" &&
+		annotations[annotationTeardownActiveVersion] == teardownContractVersion {
+		return nil
 	}
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	patch := client.MergeFrom(target.DeepCopy())
+	annotations[annotationTeardownActive] = "true"
+	annotations[annotationTeardownActiveVersion] = teardownContractVersion
+	target.SetAnnotations(annotations)
+	if err := r.Client.Patch(ctx, target, patch); err != nil {
+		return fmt.Errorf("setting teardown-active annotation on MCH %s/%s: %w",
+			target.GetNamespace(), target.GetName(), err)
+	}
+	log.Info("Set teardown-active annotation on the target MCH — downstream operators will activate teardown paths",
+		"namespace", target.GetNamespace(), "name", target.GetName(), "annotation", annotationTeardownActive)
 	return nil
 }
 
 // readContract reports what the contract looks like on the hub. The prepare Job
 // calls it after RemoveBlockingCRs so the operator can surface the result; the
 // Job never writes status.
-func (r *HubTeardownReconciler) readContract(ctx context.Context, log logr.Logger) *contractRecord {
+func (r *HubTeardownReconciler) readContract(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) *contractRecord {
 	record := &contractRecord{Version: teardownContractVersion, Signalled: true}
 
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "operator.open-cluster-management.io",
-		Version: "v1",
-		Kind:    "MultiClusterHubList",
-	})
-	if err := r.Client.List(ctx, list); err != nil {
+	mch, err := r.targetMCH(ctx, td)
+	if err != nil {
 		if isNoMatchError(err) {
 			record.Reason = "NoMCH"
 			record.Message = "MultiClusterHub API is not installed; nothing to signal."
+			return record
+		}
+		if errors.IsNotFound(err) {
+			record.Reason = "NoMCH"
+			record.Message = fmt.Sprintf("Target MultiClusterHub %s/%s is gone; nothing to signal.",
+				td.Spec.HubRef.Namespace, td.Spec.HubRef.Name)
 			return record
 		}
 		record.Signalled = false
@@ -159,14 +105,11 @@ func (r *HubTeardownReconciler) readContract(ctx context.Context, log logr.Logge
 		return record
 	}
 
-	for i := range list.Items {
-		mch := &list.Items[i]
-		annotations := mch.GetAnnotations()
-		record.MCHs = append(record.MCHs, mch.GetName())
-		if annotations[annotationTeardownActive] != "true" ||
-			annotations[annotationTeardownActiveVersion] != teardownContractVersion {
-			record.Signalled = false
-		}
+	annotations := mch.GetAnnotations()
+	record.MCHs = append(record.MCHs, mch.GetName())
+	if annotations[annotationTeardownActive] != "true" ||
+		annotations[annotationTeardownActiveVersion] != teardownContractVersion {
+		record.Signalled = false
 	}
 
 	switch {
@@ -175,11 +118,11 @@ func (r *HubTeardownReconciler) readContract(ctx context.Context, log logr.Logge
 		record.Message = "No MultiClusterHub present; nothing to signal."
 	case record.Signalled:
 		record.Reason = "Signalled"
-		record.Message = fmt.Sprintf("Signalled %d MultiClusterHub(s) at contract version %s.",
-			len(record.MCHs), teardownContractVersion)
+		record.Message = fmt.Sprintf("Signalled the target MultiClusterHub at contract version %s.",
+			teardownContractVersion)
 	default:
 		record.Reason = "SignallingIncomplete"
-		record.Message = "One or more MultiClusterHub objects are missing the teardown-active contract."
+		record.Message = "The target MultiClusterHub is missing the teardown-active contract."
 	}
 	log.V(1).Info("Read teardown-active contract", "signalled", record.Signalled, "reason", record.Reason)
 	return record
@@ -189,41 +132,35 @@ func (r *HubTeardownReconciler) readContract(ctx context.Context, log logr.Logge
 // called when the HubTeardown CR is deleted, which is the only explicit cancel.
 // Best effort by design: a stuck patch must not hold the CR finalizer on a hub
 // that may already be gone.
-func (r *HubTeardownReconciler) clearTeardownActiveAnnotation(ctx context.Context, log logr.Logger) error {
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "operator.open-cluster-management.io",
-		Version: "v1",
-		Kind:    "MultiClusterHubList",
-	})
-	if err := r.Client.List(ctx, list); err != nil {
-		if isNoMatchError(err) {
+func (r *HubTeardownReconciler) clearTeardownActiveAnnotation(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) error {
+	mch, err := r.targetMCH(ctx, td)
+	if err != nil {
+		if isNoMatchError(err) || errors.IsNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("listing MCH to clear teardown-active contract: %w", err)
+		return fmt.Errorf("reading target MCH to clear teardown-active contract: %w", err)
 	}
 
-	for i := range list.Items {
-		mch := &list.Items[i]
-		annotations := mch.GetAnnotations()
-		if annotations == nil {
-			continue
-		}
-		if _, ok := annotations[annotationTeardownActive]; !ok {
-			if _, ok := annotations[annotationTeardownActiveVersion]; !ok {
-				continue
-			}
-		}
-
-		patch := client.MergeFrom(mch.DeepCopy())
-		delete(annotations, annotationTeardownActive)
-		delete(annotations, annotationTeardownActiveVersion)
-		mch.SetAnnotations(annotations)
-		if err := r.Client.Patch(ctx, mch, patch); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("clearing teardown-active contract on MCH %s: %w", mch.GetName(), err)
-		}
-		log.Info("Cleared teardown-active contract from MCH", "name", mch.GetName())
+	annotations := mch.GetAnnotations()
+	if annotations == nil {
+		return nil
 	}
+	if _, ok := annotations[annotationTeardownActive]; !ok {
+		if _, ok := annotations[annotationTeardownActiveVersion]; !ok {
+			return nil
+		}
+	}
+
+	patch := client.MergeFrom(mch.DeepCopy())
+	delete(annotations, annotationTeardownActive)
+	delete(annotations, annotationTeardownActiveVersion)
+	mch.SetAnnotations(annotations)
+	if err := r.Client.Patch(ctx, mch, patch); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("clearing teardown-active contract on MCH %s/%s: %w",
+			mch.GetNamespace(), mch.GetName(), err)
+	}
+	log.Info("Cleared teardown-active contract from the target MCH",
+		"namespace", mch.GetNamespace(), "name", mch.GetName())
 	return nil
 }
 
@@ -236,8 +173,13 @@ func (r *HubTeardownReconciler) phaseRemoveBlockingCRs(ctx context.Context, log 
 	// deleting resources so DF-1/DF-3/DF-4 activate their teardown paths.
 	// A hub that cannot signal the contract must not go on to delete
 	// resources: the DF operators would recreate what this phase removes.
-	if err := r.setTeardownActiveAnnotation(ctx, log); err != nil {
+	if err := r.setTeardownActiveAnnotation(ctx, log, td); err != nil {
 		return false, fmt.Errorf("signalling teardown-active contract: %w", err)
+	}
+
+	authz, err := r.authorizationFor(ctx, log, td)
+	if err != nil {
+		return false, err
 	}
 
 	blockingTypes := []struct {
@@ -274,6 +216,24 @@ func (r *HubTeardownReconciler) phaseRemoveBlockingCRs(ctx context.Context, log 
 				allGone = false
 				continue
 			}
+			decision, authzErr := r.authorize(ctx, authz, authzRequest{
+				Action:         actionDeleteObject,
+				Object:         partialFromUnstructured(item),
+				Finalizers:     item.GetFinalizers(),
+				Classification: operatorv1.ClassDanglingRegistration,
+			})
+			if authzErr != nil {
+				return false, authzErr
+			}
+			if !decision.Allowed {
+				log.Info("Blocking CR deletion not authorized; retaining it",
+					"kind", bt.kind, "namespace", item.GetNamespace(), "name", item.GetName(),
+					"reason", decision.Reason)
+				r.Recorder.Eventf(td, corev1.EventTypeWarning, "BlockingCRRetained",
+					"Retained %s %s/%s: %s", bt.kind, item.GetNamespace(), item.GetName(), decision.Reason)
+				allGone = false
+				continue
+			}
 			log.Info("Deleting blocking CR", "kind", bt.kind, "name", item.GetName())
 			if err := r.Client.Delete(ctx, item); err != nil && !errors.IsNotFound(err) {
 				return false, fmt.Errorf("deleting %s/%s: %w", bt.kind, item.GetName(), err)
@@ -285,12 +245,207 @@ func (r *HubTeardownReconciler) phaseRemoveBlockingCRs(ctx context.Context, log 
 	}
 
 	if allGone {
-		if err := r.deleteAgentInstallWebhooks(ctx, log, td); err != nil {
-			log.Error(err, "Error deleting agent-install webhooks after blocking CRs removed")
+		return r.sweepDanglingRegistrations(ctx, log, td, authz)
+	}
+	return allGone, nil
+}
+
+// sweepDanglingRegistrations is policy P-8. A webhook or APIService whose
+// backing Service is gone is a dangling registration: it cannot serve, and a
+// failurePolicy=Fail webhook left behind rejects the patches later phases need.
+// A registration is deleted only when every backing Service is absent and the
+// shared authorizer accepts its ownership evidence. Healthy and unowned
+// registrations are reported and retained.
+func (r *HubTeardownReconciler) sweepDanglingRegistrations(
+	ctx context.Context,
+	log logr.Logger,
+	td *operatorv1.HubTeardown,
+	authz *authzContext,
+) (bool, error) {
+	servicePresent := func(namespace, name string) (bool, error) {
+		if namespace == "" || name == "" {
+			return false, nil
+		}
+		svc := &corev1.Service{}
+		err := r.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, svc)
+		if err == nil {
+			return true, nil
+		}
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	allSettled := true
+
+	vwcList := &admissionregistrationv1.ValidatingWebhookConfigurationList{}
+	if err := r.Client.List(ctx, vwcList); err != nil && !isNoMatchError(err) {
+		return false, fmt.Errorf("listing ValidatingWebhookConfigurations: %w", err)
+	} else if err == nil {
+		for i := range vwcList.Items {
+			config := &vwcList.Items[i]
+			services, decisive := validatingRegistrationServices(config.Webhooks)
+			if !decisive {
+				continue
+			}
+			dangling, err := allServicesAbsent(services, servicePresent)
+			if err != nil {
+				return false, err
+			}
+			if !dangling {
+				continue
+			}
+			if !r.deleteDanglingRegistration(ctx, log, td, authz, config,
+				"admissionregistration.k8s.io/v1", "ValidatingWebhookConfiguration", services[0].Namespace) {
+				allSettled = false
+			}
+		}
+	}
+
+	mwcList := &admissionregistrationv1.MutatingWebhookConfigurationList{}
+	if err := r.Client.List(ctx, mwcList); err != nil && !isNoMatchError(err) {
+		return false, fmt.Errorf("listing MutatingWebhookConfigurations: %w", err)
+	} else if err == nil {
+		for i := range mwcList.Items {
+			config := &mwcList.Items[i]
+			services, decisive := mutatingRegistrationServices(config.Webhooks)
+			if !decisive {
+				continue
+			}
+			dangling, err := allServicesAbsent(services, servicePresent)
+			if err != nil {
+				return false, err
+			}
+			if !dangling {
+				continue
+			}
+			if !r.deleteDanglingRegistration(ctx, log, td, authz, config,
+				"admissionregistration.k8s.io/v1", "MutatingWebhookConfiguration", services[0].Namespace) {
+				allSettled = false
+			}
+		}
+	}
+
+	apiServiceList := &apiregistrationv1.APIServiceList{}
+	if err := r.Client.List(ctx, apiServiceList); err != nil && !isNoMatchError(err) {
+		return false, fmt.Errorf("listing APIServices: %w", err)
+	} else if err == nil {
+		for i := range apiServiceList.Items {
+			apiService := &apiServiceList.Items[i]
+			service := apiService.Spec.Service
+			if service == nil || service.Name == "" || service.Namespace == "" {
+				continue
+			}
+			present, err := servicePresent(service.Namespace, service.Name)
+			if err != nil {
+				return false, err
+			}
+			if present {
+				continue
+			}
+			if !r.deleteDanglingRegistration(ctx, log, td, authz, apiService,
+				"apiregistration.k8s.io/v1", "APIService", service.Namespace) {
+				allSettled = false
+			}
+		}
+	}
+
+	return allSettled, nil
+}
+
+type registrationService struct {
+	Namespace string
+	Name      string
+}
+
+// validatingRegistrationServices returns every backing Service named by a
+// webhook set. decisive is false when any webhook is URL-based: without a
+// Service reference its backing cannot be proven absent, so the registration
+// is report-only.
+func validatingRegistrationServices(webhooks []admissionregistrationv1.ValidatingWebhook) ([]registrationService, bool) {
+	services := make([]registrationService, 0, len(webhooks))
+	for _, webhook := range webhooks {
+		if webhook.ClientConfig.Service == nil {
+			return nil, false
+		}
+		services = append(services, registrationService{
+			Namespace: webhook.ClientConfig.Service.Namespace,
+			Name:      webhook.ClientConfig.Service.Name,
+		})
+	}
+	return services, len(services) > 0
+}
+
+func mutatingRegistrationServices(webhooks []admissionregistrationv1.MutatingWebhook) ([]registrationService, bool) {
+	services := make([]registrationService, 0, len(webhooks))
+	for _, webhook := range webhooks {
+		if webhook.ClientConfig.Service == nil {
+			return nil, false
+		}
+		services = append(services, registrationService{
+			Namespace: webhook.ClientConfig.Service.Namespace,
+			Name:      webhook.ClientConfig.Service.Name,
+		})
+	}
+	return services, len(services) > 0
+}
+
+func allServicesAbsent(
+	services []registrationService,
+	present func(namespace, name string) (bool, error),
+) (bool, error) {
+	for _, service := range services {
+		found, err := present(service.Namespace, service.Name)
+		if err != nil {
+			return false, err
+		}
+		if found {
 			return false, nil
 		}
 	}
-	return allGone, nil
+	return len(services) > 0, nil
+}
+
+func (r *HubTeardownReconciler) deleteDanglingRegistration(
+	ctx context.Context,
+	log logr.Logger,
+	td *operatorv1.HubTeardown,
+	authz *authzContext,
+	object client.Object,
+	apiVersion string,
+	kind string,
+	serviceNamespace string,
+) bool {
+	meta := partialMetadataFor(object, apiVersion, kind)
+	decision, authzErr := r.authorize(ctx, authz, authzRequest{
+		Action:           actionDeleteObject,
+		Object:           meta,
+		Classification:   operatorv1.ClassDanglingRegistration,
+		ServiceNamespace: serviceNamespace,
+	})
+	if authzErr != nil {
+		log.Error(authzErr, "Authorization failed for dangling registration", "kind", kind, "name", object.GetName())
+		return false
+	}
+	if !decision.Allowed {
+		log.Info("Dangling registration retained: ownership is not evidence-backed",
+			"kind", kind, "name", object.GetName(), "reason", decision.Reason)
+		r.Recorder.Eventf(td, corev1.EventTypeWarning, "DanglingRegistrationRetained",
+			"Retained %s %s: %s", kind, object.GetName(), decision.Reason)
+		// Report-only is a terminal disposition for this pass. Returning false
+		// here would make the phase wait forever on an object policy forbids
+		// it to touch.
+		return true
+	}
+	log.Info("Deleting dangling registration", "kind", kind, "name", object.GetName())
+	if err := r.Client.Delete(ctx, object); err != nil && !errors.IsNotFound(err) {
+		log.Error(err, "Failed to delete dangling registration", "kind", kind, "name", object.GetName())
+		return false
+	}
+	r.Recorder.Eventf(td, corev1.EventTypeNormal, "DanglingRegistrationDeleted",
+		"Deleted %s %s: backing Service is absent and ownership is evidence-backed", kind, object.GetName())
+	return true
 }
 
 // phaseDisableAddons deletes ManagedClusterAddOns for non-local ManagedClusters.
@@ -298,6 +453,11 @@ func (r *HubTeardownReconciler) phaseRemoveBlockingCRs(ctx context.Context, log 
 // MCAs and resolves stuck addon finalizers on terminating MCAs.
 func (r *HubTeardownReconciler) phaseDisableAddons(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error) {
 	log.Info("Phase: DisableAddons")
+
+	authz, err := r.authorizationFor(ctx, log, td)
+	if err != nil {
+		return false, err
+	}
 
 	// Step 1: Disable ClusterManagementAddOn placements to break CMAO recreation loop.
 	if err := r.disableAddonPlacements(ctx, log); err != nil {
@@ -333,17 +493,30 @@ func (r *HubTeardownReconciler) phaseDisableAddons(ctx context.Context, log logr
 
 		// Addons on unreachable clusters will never terminate gracefully
 		// because the klusterlet has no connectivity to process finalizers.
-		// Still require approvedDestructiveActions + forceFinalizerTimeout
-		// to avoid stripping finalizers on clusters with transient network issues.
+		// Removal still requires ownership and a dead controller; the stall
+		// timeout only says when to try.
 		if unreachableMCs[ns] {
 			if addon.GetDeletionTimestamp() == nil {
 				log.Info("Deleting addon on unreachable cluster", "namespace", ns, "name", addon.GetName())
+				decision, authzErr := r.authorize(ctx, authz, authzRequest{
+					Action:     actionDeleteObject,
+					Object:     partialFromUnstructured(addon),
+					Finalizers: addon.GetFinalizers(),
+				})
+				if authzErr != nil {
+					return false, authzErr
+				}
+				if !decision.Allowed {
+					log.Info("Addon deletion not authorized", "namespace", ns, "name", addon.GetName(), "reason", decision.Reason)
+					remaining++
+					continue
+				}
 				if err := r.Client.Delete(ctx, addon); err != nil && !errors.IsNotFound(err) {
 					return false, fmt.Errorf("deleting addon %s/%s: %w", ns, addon.GetName(), err)
 				}
 			}
 			if addon.GetDeletionTimestamp() != nil && len(addon.GetFinalizers()) > 0 {
-				if td.Spec.ApprovedDestructiveActions && r.shouldResolveStuckFinalizers(td, addon) {
+				if r.shouldResolveStuckFinalizers(td, addon) {
 					r.resolveAddonFinalizers(ctx, log, td, addon)
 				} else {
 					remaining++
@@ -353,12 +526,27 @@ func (r *HubTeardownReconciler) phaseDisableAddons(ctx context.Context, log logr
 		}
 
 		if addon.GetDeletionTimestamp() != nil {
-			// Resolve stuck addon finalizers if past timeout and approvedDestructiveActions
+			// Resolve stuck addon finalizers only after the stall timeout; the
+			// shared authorizer still requires ownership, a dead controller and
+			// digest-bound consent for cloud risk.
 			if r.shouldResolveStuckFinalizers(td, addon) {
 				r.resolveAddonFinalizers(ctx, log, td, addon)
 			} else {
 				remaining++
 			}
+			continue
+		}
+		decision, authzErr := r.authorize(ctx, authz, authzRequest{
+			Action:     actionDeleteObject,
+			Object:     partialFromUnstructured(addon),
+			Finalizers: addon.GetFinalizers(),
+		})
+		if authzErr != nil {
+			return false, authzErr
+		}
+		if !decision.Allowed {
+			log.Info("Addon deletion not authorized", "namespace", ns, "name", addon.GetName(), "reason", decision.Reason)
+			remaining++
 			continue
 		}
 		log.Info("Deleting addon", "namespace", ns, "name", addon.GetName())
@@ -370,31 +558,7 @@ func (r *HubTeardownReconciler) phaseDisableAddons(ctx context.Context, log logr
 
 	if remaining > 0 {
 		msg := fmt.Sprintf("Waiting for %d addons to terminate.", remaining)
-		needsApproval := false
-		for i := range list.Items {
-			addon := &list.Items[i]
-			if addon.GetNamespace() == "local-cluster" || addon.GetDeletionTimestamp() == nil {
-				continue
-			}
-			for _, f := range addon.GetFinalizers() {
-				if !IsAllowlistedFinalizer(f) {
-					continue
-				}
-				if IsCloudProtectingFinalizer(f) && !td.Spec.AcknowledgeCloudResourceRisk {
-					msg += " Set spec.acknowledgeCloudResourceRisk=true to patch Tier 1 (cloud-protecting) finalizers."
-					needsApproval = true
-				} else if !IsCloudProtectingFinalizer(f) && !td.Spec.ApprovedDestructiveActions {
-					msg += " Set spec.approvedDestructiveActions=true to patch Tier 2 (non-cloud) finalizers."
-					needsApproval = true
-				}
-				if needsApproval {
-					break
-				}
-			}
-			if needsApproval {
-				break
-			}
-		}
+		msg += " Finalizers are removed only when ownership is evidence-backed, the owning controller is not alive, and any cloud risk is covered by the digest-bound acknowledgement."
 		r.setPhaseStatus(td, operatorv1.TeardownPhaseDisableAddons, operatorv1.PhaseStateInProgress, msg)
 		log.Info(msg, "remaining", remaining)
 		return false, nil
@@ -513,6 +677,11 @@ func (r *HubTeardownReconciler) resolveAddonFinalizers(ctx context.Context, log 
 func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error) {
 	log.Info("Phase: DeleteInfrastructureCRs")
 
+	authz, err := r.authorizationFor(ctx, log, td)
+	if err != nil {
+		return false, err
+	}
+
 	infraTypes := []struct {
 		group   string
 		version string
@@ -567,25 +736,6 @@ func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context
 		return true, nil
 	}
 
-	// Gate: require explicit acknowledgment only when at least one infra CR
-	// can orphan cloud resources. A KubeVirt-only hub provisions VMs inside
-	// this cluster; its HostedCluster finalizers are Tier 1 by identity but
-	// carry no cloud risk.
-	cloudRiskItems := 0
-	for _, ii := range allItems {
-		if isKnownCloudPlatform(detectPlatform(ii.kind, ii.obj)) {
-			cloudRiskItems++
-		}
-	}
-	if cloudRiskItems > 0 && !td.Spec.AcknowledgeCloudResourceRisk {
-		log.Info("Waiting for spec.acknowledgeCloudResourceRisk=true before deleting infrastructure CRs",
-			"infraCRCount", len(allItems), "cloudRiskItemCount", cloudRiskItems)
-		r.Recorder.Eventf(td, corev1.EventTypeWarning, "CloudRiskGate",
-			"%d of %d infrastructure CRs can orphan cloud resources and require spec.acknowledgeCloudResourceRisk=true to proceed",
-			cloudRiskItems, len(allItems))
-		return false, nil
-	}
-
 	remaining := 0
 	for _, ii := range allItems {
 		item := ii.obj
@@ -607,6 +757,25 @@ func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context
 			continue
 		}
 
+		decision, authzErr := r.authorize(ctx, authz, authzRequest{
+			Action:     actionDeleteObject,
+			Object:     partialFromUnstructured(item),
+			Finalizers: item.GetFinalizers(),
+			Platform:   detectPlatform(ii.kind, item),
+		})
+		if authzErr != nil {
+			return false, authzErr
+		}
+		if !decision.Allowed {
+			log.Info("Infrastructure CR deletion not authorized; retaining it",
+				"kind", ii.kind, "namespace", item.GetNamespace(), "name", item.GetName(),
+				"reason", decision.Reason)
+			r.Recorder.Eventf(td, corev1.EventTypeWarning, "InfrastructureCRRetained",
+				"Retained %s %s/%s: %s", ii.kind, item.GetNamespace(), item.GetName(), decision.Reason)
+			remaining++
+			continue
+		}
+
 		log.Info("Deleting infrastructure CR",
 			"kind", ii.kind, "name", item.GetName(), "namespace", item.GetNamespace())
 		if err := r.Client.Delete(ctx, item); err != nil && !errors.IsNotFound(err) {
@@ -619,32 +788,7 @@ func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context
 
 	if remaining > 0 {
 		msg := fmt.Sprintf("Waiting for %d infrastructure CRs to terminate.", remaining)
-		needsApproval := false
-		for _, ii := range allItems {
-			item := ii.obj
-			if item.GetDeletionTimestamp() == nil {
-				continue
-			}
-			for _, f := range item.GetFinalizers() {
-				if !IsAllowlistedFinalizer(f) {
-					continue
-				}
-				cloudRisk := requiresCloudAcknowledgement(f, detectPlatform(ii.kind, item))
-				if cloudRisk && !td.Spec.AcknowledgeCloudResourceRisk {
-					msg += " Set spec.acknowledgeCloudResourceRisk=true to patch Tier 1 (cloud-protecting) finalizers."
-					needsApproval = true
-				} else if !cloudRisk && !td.Spec.ApprovedDestructiveActions {
-					msg += " Set spec.approvedDestructiveActions=true to patch Tier 2 (non-cloud) finalizers."
-					needsApproval = true
-				}
-				if needsApproval {
-					break
-				}
-			}
-			if needsApproval {
-				break
-			}
-		}
+		msg += " Finalizers are removed only when ownership is evidence-backed, the owning controller is not alive, and any cloud risk is covered by the digest-bound acknowledgement."
 		r.setPhaseStatus(td, operatorv1.TeardownPhaseDeleteInfrastructureCRs, operatorv1.PhaseStateInProgress, msg)
 		log.Info(msg, "remaining", remaining)
 		return false, nil
@@ -660,6 +804,11 @@ func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context
 // are only removed through the policy gate; unknown finalizers are reported and retained.
 func (r *HubTeardownReconciler) phaseDetachManagedClusters(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error) {
 	log.Info("Phase: DetachManagedClusters")
+
+	authz, err := r.authorizationFor(ctx, log, td)
+	if err != nil {
+		return false, err
+	}
 
 	mcGVK := schema.GroupVersionKind{
 		Group:   "cluster.open-cluster-management.io",
@@ -680,6 +829,8 @@ func (r *HubTeardownReconciler) phaseDetachManagedClusters(ctx context.Context, 
 	for i := range list.Items {
 		mc := &list.Items[i]
 		if mc.GetName() == "local-cluster" {
+			log.Info("ManagedCluster local-cluster is retained until MCH deletion; this is the explicit detach disposition",
+				"disposition", "detach after MultiClusterHub is gone")
 			continue
 		}
 
@@ -700,9 +851,7 @@ func (r *HubTeardownReconciler) phaseDetachManagedClusters(ctx context.Context, 
 				if err != nil {
 					log.Error(err, "Error resolving stuck finalizers on ManagedCluster", "name", mc.GetName())
 				}
-				if resolved {
-					remaining--
-				} else {
+				if !resolved {
 					log.Info("Finalizers remain on ManagedCluster; ownership/liveness policy does not permit removal",
 						"name", mc.GetName(), "finalizers", mc.GetFinalizers())
 					r.Recorder.Eventf(td, corev1.EventTypeWarning, "FinalizersRetained",
@@ -710,6 +859,23 @@ func (r *HubTeardownReconciler) phaseDetachManagedClusters(ctx context.Context, 
 						mc.GetName(), len(mc.GetFinalizers()))
 				}
 			}
+			continue
+		}
+
+		decision, authzErr := r.authorize(ctx, authz, authzRequest{
+			Action:     actionDeleteObject,
+			Object:     partialFromUnstructured(mc),
+			Finalizers: mc.GetFinalizers(),
+		})
+		if authzErr != nil {
+			return false, authzErr
+		}
+		if !decision.Allowed {
+			log.Info("ManagedCluster deletion not authorized; retaining it",
+				"name", mc.GetName(), "reason", decision.Reason)
+			r.Recorder.Eventf(td, corev1.EventTypeWarning, "ManagedClusterRetained",
+				"Retained ManagedCluster %s: %s", mc.GetName(), decision.Reason)
+			remaining++
 			continue
 		}
 
@@ -724,113 +890,82 @@ func (r *HubTeardownReconciler) phaseDetachManagedClusters(ctx context.Context, 
 
 	if remaining > 0 {
 		msg := fmt.Sprintf("Waiting for %d ManagedClusters to terminate.", remaining)
-		needsApproval := false
-		for i := range list.Items {
-			mc := &list.Items[i]
-			if mc.GetName() == "local-cluster" || mc.GetDeletionTimestamp() == nil {
-				continue
-			}
-			for _, f := range mc.GetFinalizers() {
-				if !IsAllowlistedFinalizer(f) {
-					continue
-				}
-				if IsCloudProtectingFinalizer(f) && !td.Spec.AcknowledgeCloudResourceRisk {
-					msg += " Set spec.acknowledgeCloudResourceRisk=true to patch Tier 1 (cloud-protecting) finalizers."
-					needsApproval = true
-				} else if !IsCloudProtectingFinalizer(f) && !td.Spec.ApprovedDestructiveActions {
-					msg += " Set spec.approvedDestructiveActions=true to patch Tier 2 (non-cloud) finalizers."
-					needsApproval = true
-				}
-				if needsApproval {
-					break
-				}
-			}
-			if needsApproval {
-				break
-			}
-		}
+		msg += " Finalizers are removed only when ownership is evidence-backed, the owning controller is not alive, and any cloud risk is covered by the digest-bound acknowledgement. local-cluster is retained until MCH deletion."
 		r.setPhaseStatus(td, operatorv1.TeardownPhaseDetachManagedClusters, operatorv1.PhaseStateInProgress, msg)
 		log.Info(msg, "remaining", remaining)
 		return false, nil
 	}
 
-	r.sweepMCSAndCMA(ctx, log, td)
+	r.sweepMCSAndCMA(ctx, log, td, authz)
 	return true, nil
 }
 
-// phaseDeleteMCH deletes the MultiClusterHub CR.
-//
-// CONCURRENT RECONCILER NOTE: Deleting the MCH triggers the MCH reconciler's
-// finalizeHub in the same operator process. finalizeHub and HubTeardown phases
-// 7-9 (MonitorMCEChain, CleanOrphans, DeleteACMCRDs) overlap in scope — both
-// delete operands, remove CRDs, and clean up resources. This is by design:
-// HubTeardown orchestrates the preconditions so finalizeHub can run cleanly,
-// then monitors and mops up what finalizeHub leaves behind. The overlap is
-// safe because all delete operations are idempotent (NotFound is ignored),
-// but duplicate events and log entries are expected during this window.
+// phaseDeleteMCH deletes exactly the MultiClusterHub named by spec.hubRef.
+// Deleting it triggers the MCH reconciler's finalizeHub in the same operator
+// process; the handoff Job then monitors and mops up what finalizeHub leaves
+// behind. The operator itself never patches an MCH finalizer.
 func (r *HubTeardownReconciler) phaseDeleteMCH(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error) {
 	log.Info("Phase: DeleteMCH")
 
-	mchGVK := schema.GroupVersionKind{
-		Group:   "operator.open-cluster-management.io",
-		Version: "v1",
-		Kind:    "MultiClusterHubList",
-	}
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(mchGVK)
-
-	if err := r.Client.List(ctx, list); err != nil {
-		return false, fmt.Errorf("listing MultiClusterHub: %w", err)
-	}
-
-	if len(list.Items) == 0 {
-		log.Info("No MultiClusterHub found, phase complete")
-		return true, nil
-	}
-
-	for i := range list.Items {
-		mch := &list.Items[i]
-		if mch.GetDeletionTimestamp() != nil {
-			if r.shouldResolveStuckFinalizers(td, mch) {
-				log.Info("MCH stuck deleting past timeout, resolving blocking finalizers", "name", mch.GetName())
-				if err := r.resolveMCHBlockingFinalizers(ctx, log, td); err != nil {
-					log.Error(err, "Error resolving MCH-blocking finalizers")
-				}
-				dr := DiscoveredResource{
-					Ref: operatorv1.ResourceRef{
-						Group:     "operator.open-cluster-management.io",
-						Kind:      "MultiClusterHub",
-						Namespace: mch.GetNamespace(),
-						Name:      mch.GetName(),
-					},
-					Version:    "v1",
-					Finalizers: mch.GetFinalizers(),
-				}
-				if _, err := r.resolveStuckFinalizers(ctx, log, td, []DiscoveredResource{dr}); err != nil {
-					log.Error(err, "Error resolving MCH finalizers")
-				}
-			} else {
-				log.Info("MCH already deleting, waiting for finalizer to complete", "name", mch.GetName())
-			}
-			return false, nil
+	mch, err := r.targetMCH(ctx, td)
+	if err != nil {
+		if errors.IsNotFound(err) || isNoMatchError(err) {
+			log.Info("Target MultiClusterHub is gone, phase complete",
+				"namespace", td.Spec.HubRef.Namespace, "name", td.Spec.HubRef.Name)
+			return true, nil
 		}
-		log.Info("Deleting MultiClusterHub", "name", mch.GetName(), "namespace", mch.GetNamespace())
-		if err := r.Client.Delete(ctx, mch); err != nil {
-			if errors.IsNotFound(err) {
-				continue
-			}
-			return false, fmt.Errorf("deleting MCH %s: %w", mch.GetName(), err)
-		}
-		r.Recorder.Eventf(td, corev1.EventTypeNormal, "MCHDeleted",
-			"Deleted MultiClusterHub %s/%s", mch.GetNamespace(), mch.GetName())
+		return false, fmt.Errorf("reading target MultiClusterHub %s/%s: %w",
+			td.Spec.HubRef.Namespace, td.Spec.HubRef.Name, err)
 	}
 
+	if mch.GetDeletionTimestamp() != nil {
+		// The operator waits. Finalizer removal, when policy permits it, runs
+		// in the handoff Job (PH-3); a stuck MCH is visible through status and
+		// bounded by the Job deadline.
+		log.Info("Target MultiClusterHub is already deleting, waiting for its finalizer to complete",
+			"namespace", mch.GetNamespace(), "name", mch.GetName())
+		return false, nil
+	}
+
+	authz, err := r.authorizationFor(ctx, log, td)
+	if err != nil {
+		return false, err
+	}
+	decision, authzErr := r.authorize(ctx, authz, authzRequest{
+		Action:     actionDeleteObject,
+		Object:     partialFromUnstructured(mch),
+		Finalizers: mch.GetFinalizers(),
+	})
+	if authzErr != nil {
+		return false, authzErr
+	}
+	if !decision.Allowed {
+		log.Info("MultiClusterHub deletion not authorized; retaining it",
+			"namespace", mch.GetNamespace(), "name", mch.GetName(), "reason", decision.Reason)
+		r.Recorder.Eventf(td, corev1.EventTypeWarning, "MCHRetained",
+			"Retained MultiClusterHub %s/%s: %s", mch.GetNamespace(), mch.GetName(), decision.Reason)
+		return false, nil
+	}
+
+	log.Info("Deleting target MultiClusterHub", "namespace", mch.GetNamespace(), "name", mch.GetName())
+	if err := r.Client.Delete(ctx, mch); err != nil {
+		if errors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("deleting MCH %s/%s: %w", mch.GetNamespace(), mch.GetName(), err)
+	}
+	r.Recorder.Eventf(td, corev1.EventTypeNormal, "MCHDeleted",
+		"Deleted MultiClusterHub %s/%s", mch.GetNamespace(), mch.GetName())
+
+	// Re-observe on the next pass; the API server may report NotFound then.
 	return false, nil
 }
 
 // resolveMCHBlockingFinalizers resolves stuck finalizers on resources that
 // block the MCH's own finalizer (finalizeHub). Submariner's cleanup finalizers
 // on ClusterManagementAddOns and ManagedClusterSets are the known blockers.
+// It runs only inside the handoff Job; the always-on operator never patches a
+// finalizer (spec section 6.1, PH-3).
 func (r *HubTeardownReconciler) resolveMCHBlockingFinalizers(
 	ctx context.Context,
 	log logr.Logger,
@@ -896,6 +1031,7 @@ func (r *HubTeardownReconciler) sweepMCSAndCMA(
 	ctx context.Context,
 	log logr.Logger,
 	td *operatorv1.HubTeardown,
+	authz *authzContext,
 ) {
 	sweepTypes := []struct {
 		group   string
@@ -927,6 +1063,22 @@ func (r *HubTeardownReconciler) sweepMCSAndCMA(
 			item := &list.Items[i]
 
 			if item.GetDeletionTimestamp() == nil {
+				decision, authzErr := r.authorize(ctx, authz, authzRequest{
+					Action:     actionDeleteObject,
+					Object:     partialFromUnstructured(item),
+					Finalizers: item.GetFinalizers(),
+				})
+				if authzErr != nil {
+					log.Error(authzErr, "Authorization failed in MCS/CMA sweep", "kind", st.kind, "name", item.GetName())
+					continue
+				}
+				if !decision.Allowed {
+					log.Info("MCS/CMA sweep retained an object whose ownership is not evidence-backed",
+						"kind", st.kind, "name", item.GetName(), "reason", decision.Reason)
+					r.Recorder.Eventf(td, corev1.EventTypeWarning, "MCSCMASweepRetained",
+						"Retained %s %s: %s", st.kind, item.GetName(), decision.Reason)
+					continue
+				}
 				log.Info("Sweeping pre-MCH-delete resource", "kind", st.kind, "name", item.GetName())
 				if err := r.Client.Delete(ctx, item); err != nil && !errors.IsNotFound(err) {
 					log.Error(err, "Failed to delete in MCS/CMA sweep", "kind", st.kind, "name", item.GetName())
@@ -955,20 +1107,24 @@ func (r *HubTeardownReconciler) sweepMCSAndCMA(
 func (r *HubTeardownReconciler) phaseMonitorMCEChain(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error) {
 	log.Info("Phase: MonitorMCEChain")
 
-	mchGone, err := r.isResourceGone(ctx, "operator.open-cluster-management.io", "v1", "MultiClusterHub")
+	// finalizeHub blocks MCH removal on the finalizers of its own operands.
+	// Resolve those before waiting for the MCH to disappear: doing it after the
+	// wait deadlocks whenever a ClusterManagementAddOn or ManagedClusterSet
+	// finalizer is exactly what keeps the MCH around. This still only touches
+	// objects that are already deleting, and the shared authorizer still
+	// requires evidence-backed ownership, a dead controller, and cloud consent.
+	if err := r.resolveMCHBlockingFinalizers(ctx, log, td); err != nil {
+		log.Error(err, "Error resolving MCH-blocking finalizers in MonitorMCEChain")
+	}
+
+	mchGone, err := r.targetMCHGone(ctx, td)
 	if err != nil {
 		return false, err
 	}
 	if !mchGone {
-		log.Info("Waiting for MultiClusterHub to be fully removed")
+		log.Info("Waiting for the target MultiClusterHub to be fully removed",
+			"namespace", td.Spec.HubRef.Namespace, "name", td.Spec.HubRef.Name)
 		return false, nil
-	}
-
-	// Resolve stuck submariner/addon finalizers on ClusterManagementAddOns and
-	// ManagedClusterSets. When MCH was present, resolveMCHBlockingFinalizers ran
-	// inside phaseDeleteMCH. When MCH was already gone, the call never fired.
-	if err := r.resolveMCHBlockingFinalizers(ctx, log, td); err != nil {
-		log.Error(err, "Error resolving MCH-blocking finalizers in MonitorMCEChain")
 	}
 
 	// Clean up local-cluster addons and ManagedCluster. Earlier phases skip
@@ -978,18 +1134,15 @@ func (r *HubTeardownReconciler) phaseMonitorMCEChain(ctx context.Context, log lo
 		log.Error(err, "Error cleaning up local-cluster")
 	}
 
-	// Ensure MCE is deleted. When the MCH finalizer cascade ran, MCE is already
-	// deleting. When MCH was already gone, nobody issued the delete.
-	if err := r.ensureMCEDeleted(ctx, log, td); err != nil {
-		return false, err
-	}
-
-	mceGone, err := r.isResourceGone(ctx, "multicluster.openshift.io", "v1", "MultiClusterEngine")
+	// Ensure MCE is settled. Default removes only an MCE this MCH created;
+	// Preserve never touches it. A retained pre-existing MCE is a disposition,
+	// not a reason to wait forever.
+	mceSettled, err := r.ensureMCEDeleted(ctx, log, td)
 	if err != nil {
 		return false, err
 	}
-	if !mceGone {
-		log.Info("Waiting for MultiClusterEngine to be fully removed")
+	if !mceSettled {
+		log.Info("Waiting for the MultiClusterEngine disposition to settle")
 		return false, nil
 	}
 
@@ -1003,44 +1156,92 @@ func (r *HubTeardownReconciler) phaseMonitorMCEChain(ctx context.Context, log lo
 // ClusterManager delete ordering), the natural chain (MCE operator ->
 // ClusterManager -> OCM hub cleanup) completes without intervention.
 // If stuck, the handoff path resolves the finalizer under its own identity.
-func (r *HubTeardownReconciler) ensureMCEDeleted(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) error {
-	mceGVK := schema.GroupVersionKind{
-		Group:   "multicluster.openshift.io",
-		Version: "v1",
-		Kind:    "MultiClusterEngineList",
+func (r *HubTeardownReconciler) ensureMCEDeleted(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error) {
+	if td.Spec.MCE == operatorv1.MCEDispositionPreserve {
+		log.Info("spec.mce=Preserve: MultiClusterEngine is never touched")
+		return true, nil
 	}
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(mceGVK)
 
+	list := &mcev1.MultiClusterEngineList{}
 	if err := r.Client.List(ctx, list); err != nil {
 		if isNoMatchError(err) {
-			return nil
+			return true, nil
 		}
-		return fmt.Errorf("listing MultiClusterEngine: %w", err)
+		return false, fmt.Errorf("listing MultiClusterEngine: %w", err)
+	}
+	if len(list.Items) == 0 {
+		return true, nil
 	}
 
+	authz, err := r.authorizationFor(ctx, log, td)
+	if err != nil {
+		return false, err
+	}
+
+	settled := true
 	for i := range list.Items {
 		mce := &list.Items[i]
-		if mce.GetDeletionTimestamp() != nil {
-			// With DF-2, backplane waits for ClusterManager finalization before
-			// deleting templates — the natural MCE->CM chain completes without
-			// intervention. If stuck, the handoff path resolves the finalizer
-			// under its own identity.
-			log.Info("MCE is deleting, waiting for natural chain to complete", "name", mce.GetName())
-			return nil
+		if !multiclusterengineutils.MCECreatedByMCH(mce, td.Spec.HubRef.Name, td.Spec.HubRef.Namespace) {
+			log.Info("Retaining pre-existing MultiClusterEngine: it was not created by this MultiClusterHub",
+				"name", mce.GetName())
+			r.Recorder.Eventf(td, corev1.EventTypeNormal, "MCEPreserved",
+				"Retained MultiClusterEngine %s: installer labels do not match %s/%s",
+				mce.GetName(), td.Spec.HubRef.Namespace, td.Spec.HubRef.Name)
+			continue
 		}
 
-		log.Info("Deleting MultiClusterEngine (MCH cascade did not fire)", "name", mce.GetName())
-		if err := r.Client.Delete(ctx, mce); err != nil {
-			if errors.IsNotFound(err) {
-				continue
+		if mce.GetDeletionTimestamp() != nil {
+			// With DF-2, backplane waits for ClusterManager finalization before
+			// deleting templates. If the wait outlives the stall timeout, the
+			// handoff Job resolves only finalizers policy allows.
+			if r.shouldResolveStuckFinalizersTime(td, mce.GetDeletionTimestamp()) {
+				dr := DiscoveredResource{
+					Ref: operatorv1.ResourceRef{
+						Group: "multicluster.openshift.io",
+						Kind:  "MultiClusterEngine",
+						Name:  mce.GetName(),
+					},
+					Version:    "v1",
+					Finalizers: mce.GetFinalizers(),
+				}
+				if _, err := r.resolveStuckFinalizers(ctx, log, td, []DiscoveredResource{dr}); err != nil {
+					log.Error(err, "Error resolving MultiClusterEngine finalizers", "name", mce.GetName())
+				}
 			}
-			return fmt.Errorf("deleting MCE %s: %w", mce.GetName(), err)
+			log.Info("MultiClusterEngine is deleting, waiting for the natural chain to complete", "name", mce.GetName())
+			settled = false
+			continue
+		}
+
+		meta := metav1.PartialObjectMetadata{ObjectMeta: *mce.ObjectMeta.DeepCopy()}
+		meta.APIVersion = "multicluster.openshift.io/v1"
+		meta.Kind = "MultiClusterEngine"
+		decision, authzErr := r.authorize(ctx, authz, authzRequest{
+			Action:     actionDeleteObject,
+			Object:     meta,
+			Finalizers: mce.GetFinalizers(),
+		})
+		if authzErr != nil {
+			return false, authzErr
+		}
+		if !decision.Allowed {
+			log.Info("MultiClusterEngine deletion not authorized; retaining it",
+				"name", mce.GetName(), "reason", decision.Reason)
+			r.Recorder.Eventf(td, corev1.EventTypeWarning, "MCERetained",
+				"Retained MultiClusterEngine %s: %s", mce.GetName(), decision.Reason)
+			settled = false
+			continue
+		}
+
+		log.Info("Deleting MultiClusterEngine created by this MultiClusterHub", "name", mce.GetName())
+		if err := r.Client.Delete(ctx, mce); err != nil && !errors.IsNotFound(err) {
+			return false, fmt.Errorf("deleting MCE %s: %w", mce.GetName(), err)
 		}
 		r.Recorder.Eventf(td, corev1.EventTypeNormal, "MCEDeleted",
 			"Deleted MultiClusterEngine %s", mce.GetName())
+		settled = false
 	}
-	return nil
+	return settled, nil
 }
 
 // cleanupLocalCluster deletes local-cluster ManagedClusterAddOns and the
@@ -1048,6 +1249,11 @@ func (r *HubTeardownReconciler) ensureMCEDeleted(ctx context.Context, log logr.L
 // MCH webhook requires it for MCH deletion. This function runs after MCH is
 // confirmed gone, so the webhook constraint is satisfied.
 func (r *HubTeardownReconciler) cleanupLocalCluster(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) error {
+	authz, err := r.authorizationFor(ctx, log, td)
+	if err != nil {
+		return err
+	}
+
 	addonGVK := schema.GroupVersionKind{
 		Group:   "addon.open-cluster-management.io",
 		Version: "v1alpha1",
@@ -1067,6 +1273,21 @@ func (r *HubTeardownReconciler) cleanupLocalCluster(ctx context.Context, log log
 				if r.shouldResolveStuckFinalizers(td, addon) {
 					r.resolveAddonFinalizers(ctx, log, td, addon)
 				}
+				continue
+			}
+			decision, authzErr := r.authorize(ctx, authz, authzRequest{
+				Action:     actionDeleteObject,
+				Object:     partialFromUnstructured(addon),
+				Finalizers: addon.GetFinalizers(),
+			})
+			if authzErr != nil {
+				return authzErr
+			}
+			if !decision.Allowed {
+				log.Info("local-cluster addon deletion not authorized; retaining it",
+					"name", addon.GetName(), "reason", decision.Reason)
+				r.Recorder.Eventf(td, corev1.EventTypeWarning, "LocalClusterAddonRetained",
+					"Retained local-cluster ManagedClusterAddOn %s: %s", addon.GetName(), decision.Reason)
 				continue
 			}
 			log.Info("Deleting local-cluster addon", "name", addon.GetName())
@@ -1111,6 +1332,21 @@ func (r *HubTeardownReconciler) cleanupLocalCluster(ctx context.Context, log log
 		return nil
 	}
 
+	decision, authzErr := r.authorize(ctx, authz, authzRequest{
+		Action:     actionDeleteObject,
+		Object:     partialFromUnstructured(mc),
+		Finalizers: mc.GetFinalizers(),
+	})
+	if authzErr != nil {
+		return authzErr
+	}
+	if !decision.Allowed {
+		log.Info("local-cluster ManagedCluster deletion not authorized; retaining it", "reason", decision.Reason)
+		r.Recorder.Eventf(td, corev1.EventTypeWarning, "LocalClusterRetained",
+			"Retained local-cluster ManagedCluster: %s", decision.Reason)
+		return nil
+	}
+
 	log.Info("Deleting local-cluster ManagedCluster")
 	if err := r.Client.Delete(ctx, mc); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("deleting local-cluster ManagedCluster: %w", err)
@@ -1135,11 +1371,16 @@ const hubteardownCRDName = "hubteardowns.operator.open-cluster-management.io"
 func (r *HubTeardownReconciler) phaseDeleteACMCRDs(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error) {
 	log.Info("Phase: DeleteACMCRDs")
 
-	crdList := &apixv1.CustomResourceDefinitionList{}
-	if err := r.Client.List(ctx, crdList); err != nil {
-		return false, fmt.Errorf("listing CRDs: %w", err)
+	authz, err := r.authorizationFor(ctx, log, td)
+	if err != nil {
+		return false, err
 	}
-	observedAt := metav1.Now()
+	if authz.graph == nil {
+		return false, fmt.Errorf("inventory snapshot is missing; refusing to delete CRDs without ownership evidence")
+	}
+	// Consume the CRDs seen by the same scan that produced the ownership
+	// verdicts. A fresh list here would authorize one object and delete another.
+	crdList := &apixv1.CustomResourceDefinitionList{Items: append([]apixv1.CustomResourceDefinition(nil), authz.graph.CRDs...)}
 
 	// Pre-check: verify no stuck-terminating CRs remain before deleting CRDs.
 	// Deleting a CRD while CRs with finalizers are still terminating can wedge
@@ -1147,13 +1388,21 @@ func (r *HubTeardownReconciler) phaseDeleteACMCRDs(ctx context.Context, log logr
 	// CRs whose finalizers are still being processed.
 	for i := range crdList.Items {
 		crd := &crdList.Items[i]
-		if !isACMAPIGroup(crd.Spec.Group) || crd.Name == hubteardownCRDName {
+		if !isACMAPIGroup(crd.Spec.Group) || !ownsACMGroups(crd.Spec.Group) || crd.Name == hubteardownCRDName {
 			continue
 		}
-		verdict := crdOwnershipVerdict(crd, observedAt)
-		if !ownership.AllowsDestruction(verdict) {
+		meta := metav1.PartialObjectMetadata{ObjectMeta: *crd.ObjectMeta.DeepCopy()}
+		decision, authzErr := r.authorize(ctx, authz, authzRequest{
+			Action:        actionDeleteCRD,
+			Object:        meta,
+			ACMOwnedGroup: ownsACMGroups(crd.Spec.Group),
+		})
+		if authzErr != nil {
+			return false, authzErr
+		}
+		if !decision.Allowed {
 			log.Info("Skipping CRD: ownership not established",
-				"crd", crd.Name, "group", crd.Spec.Group, "confidence", verdict.Confidence)
+				"crd", crd.Name, "group", crd.Spec.Group, "confidence", decision.Verdict.Confidence)
 			continue
 		}
 		version := preferredVersion(crd)
@@ -1176,9 +1425,9 @@ func (r *HubTeardownReconciler) phaseDeleteACMCRDs(ctx context.Context, log logr
 				continue
 			}
 			// Deleting the CRD now would wedge it in Terminating behind a CR
-			// nobody is left to finalize. Resolve the finalizer here, using the
-			// same tiered gate every other phase uses, and only report the CR as
-			// blocking while it still carries one.
+			// nobody is left to finalize. Resolve the finalizer here through
+			// the shared authorizer, and only report the CR as blocking while
+			// it still carries one.
 			if r.shouldResolveStuckFinalizers(td, item) {
 				dr := drFromUnstructured(item, crd.Spec.Group, version, crd.Spec.Names.Kind)
 				if _, err := r.resolveStuckFinalizers(ctx, log, td, []DiscoveredResource{dr}); err != nil {
@@ -1206,12 +1455,30 @@ func (r *HubTeardownReconciler) phaseDeleteACMCRDs(ctx context.Context, log logr
 			continue
 		}
 
-		verdict := crdOwnershipVerdict(crd, observedAt)
-		if !ownership.AllowsDestruction(verdict) {
+		// The scan is deliberately broader than the deletion set: metal3.io is
+		// observed and reported because ACM can integrate with bare metal, but
+		// it is platform API, never ACM-owned. A stray installer label must not
+		// turn it into a deletion candidate.
+		if !ownsACMGroups(crd.Spec.Group) {
+			log.Info("Retaining CRD: API group is not ACM-owned",
+				"crd", crd.Name, "group", crd.Spec.Group)
+			continue
+		}
+
+		meta := metav1.PartialObjectMetadata{ObjectMeta: *crd.ObjectMeta.DeepCopy()}
+		decision, authzErr := r.authorize(ctx, authz, authzRequest{
+			Action:        actionDeleteCRD,
+			Object:        meta,
+			ACMOwnedGroup: ownsACMGroups(crd.Spec.Group),
+		})
+		if authzErr != nil {
+			return false, authzErr
+		}
+		if !decision.Allowed {
 			log.Info("Retaining CRD: ownership not established",
-				"crd", crd.Name, "group", crd.Spec.Group, "confidence", verdict.Confidence)
+				"crd", crd.Name, "group", crd.Spec.Group, "confidence", decision.Verdict.Confidence)
 			r.Recorder.Eventf(td, corev1.EventTypeWarning, "CRDRetained",
-				"CRD %s retained: ownership confidence %s", crd.Name, verdict.Confidence)
+				"CRD %s retained: ownership confidence %s", crd.Name, decision.Verdict.Confidence)
 			continue
 		}
 
@@ -1292,18 +1559,90 @@ func (r *HubTeardownReconciler) isResourceGone(ctx context.Context, group, versi
 	return len(list.Items) == 0, nil
 }
 
+// targetMCH resolves the exact MultiClusterHub named by spec.hubRef. Teardown
+// must never infer its target from whichever MCH happens to exist.
+func (r *HubTeardownReconciler) targetMCH(ctx context.Context, td *operatorv1.HubTeardown) (*unstructured.Unstructured, error) {
+	mch := &unstructured.Unstructured{}
+	mch.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "operator.open-cluster-management.io",
+		Version: "v1",
+		Kind:    "MultiClusterHub",
+	})
+	if err := r.Client.Get(ctx, types.NamespacedName{
+		Namespace: td.Spec.HubRef.Namespace,
+		Name:      td.Spec.HubRef.Name,
+	}, mch); err != nil {
+		return nil, err
+	}
+	return mch, nil
+}
+
+func (r *HubTeardownReconciler) targetMCHGone(ctx context.Context, td *operatorv1.HubTeardown) (bool, error) {
+	_, err := r.targetMCH(ctx, td)
+	if err == nil {
+		return false, nil
+	}
+	if errors.IsNotFound(err) || isNoMatchError(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+func partialMetadataFor(object client.Object, apiVersion, kind string) metav1.PartialObjectMetadata {
+	return metav1.PartialObjectMetadata{
+		TypeMeta: metav1.TypeMeta{APIVersion: apiVersion, Kind: kind},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              object.GetName(),
+			Namespace:         object.GetNamespace(),
+			UID:               object.GetUID(),
+			ResourceVersion:   object.GetResourceVersion(),
+			Labels:            object.GetLabels(),
+			Annotations:       object.GetAnnotations(),
+			OwnerReferences:   object.GetOwnerReferences(),
+			Finalizers:        object.GetFinalizers(),
+			DeletionTimestamp: object.GetDeletionTimestamp(),
+		},
+	}
+}
+
+// effectiveMaxDuration is the terminal bound. The new escalation block wins;
+// the deprecated field remains for CRs written before it existed.
+func effectiveMaxDuration(td *operatorv1.HubTeardown) time.Duration {
+	if td != nil && td.Spec.Escalation != nil && td.Spec.Escalation.MaxDuration != nil {
+		return td.Spec.Escalation.MaxDuration.Duration
+	}
+	if td != nil && td.Spec.MaxDuration != nil {
+		return td.Spec.MaxDuration.Duration
+	}
+	return defaultMaxDuration
+}
+
+// effectiveStallTimeout is the no-progress bound. Precedence is the new
+// escalation block, then the deprecated forceFinalizerTimeout, then 15m.
+func effectiveStallTimeout(td *operatorv1.HubTeardown) time.Duration {
+	if td != nil && td.Spec.Escalation != nil && td.Spec.Escalation.StallTimeout != nil {
+		return td.Spec.Escalation.StallTimeout.Duration
+	}
+	if td != nil && td.Spec.ForceFinalizerTimeout != nil {
+		return td.Spec.ForceFinalizerTimeout.Duration
+	}
+	return defaultStallTimeout
+}
+
 // shouldResolveStuckFinalizers determines if enough time has passed for a stuck resource.
-// Uses spec.forceFinalizerTimeout if set, otherwise falls back to defaultFinalizerTimeout.
 func (r *HubTeardownReconciler) shouldResolveStuckFinalizers(td *operatorv1.HubTeardown, obj *unstructured.Unstructured) bool {
 	ts := obj.GetDeletionTimestamp()
 	if ts == nil {
 		return false
 	}
-	timeout := defaultFinalizerTimeout
-	if td.Spec.ForceFinalizerTimeout != nil {
-		timeout = td.Spec.ForceFinalizerTimeout.Duration
+	return r.shouldResolveStuckFinalizersTime(td, ts)
+}
+
+func (r *HubTeardownReconciler) shouldResolveStuckFinalizersTime(td *operatorv1.HubTeardown, ts *metav1.Time) bool {
+	if ts == nil {
+		return false
 	}
-	return time.Since(ts.Time) > timeout
+	return time.Since(ts.Time) > effectiveStallTimeout(td)
 }
 
 // drFromUnstructured builds a DiscoveredResource from an unstructured item.

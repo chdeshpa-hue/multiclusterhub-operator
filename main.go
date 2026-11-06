@@ -70,6 +70,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/metadata"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/util/workqueue"
 	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
@@ -378,6 +379,7 @@ func main() {
 		UncachedClient: uncachedClient,
 		Scheme:         mgr.GetScheme(),
 		Log:            ctrl.Log.WithName("Controller").WithName("HubTeardown"),
+		MetadataClient: metadata.NewForConfigOrDie(mgr.GetConfig()),
 	}
 	if err = teardownReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "HubTeardown")
@@ -440,7 +442,7 @@ const (
 func runTeardownJobMode(plan string) {
 	setupLog.Info("Starting in teardown Job mode", "plan", plan)
 
-	var run func(context.Context, client.Client, discovery.DiscoveryInterface, string, string) error
+	var run func(context.Context, client.Client, discovery.DiscoveryInterface, metadata.Interface, string, string) error
 	switch plan {
 	case controllers.TeardownPlanPrepare:
 		run = controllers.RunPrepareJob
@@ -473,8 +475,10 @@ func runTeardownJobMode(plan string) {
 		os.Exit(1)
 	}
 
+	metadataClient := metadata.NewForConfigOrDie(restConfig)
+
 	setupLog.Info("Running teardown plan", "plan", plan, "teardownName", tdName, "teardownNamespace", tdNamespace)
-	if err := run(ctrl.SetupSignalHandler(), uncachedClient, discoveryClient, tdName, tdNamespace); err != nil {
+	if err := run(ctrl.SetupSignalHandler(), uncachedClient, discoveryClient, metadataClient, tdName, tdNamespace); err != nil {
 		setupLog.Error(err, "teardown Job failed", "plan", plan)
 		os.Exit(1)
 	}

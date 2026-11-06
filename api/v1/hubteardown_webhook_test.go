@@ -11,12 +11,93 @@ import (
 	. "github.com/onsi/gomega"
 
 	admissionregistration "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func duration(d time.Duration) *metav1.Duration {
 	return &metav1.Duration{Duration: d}
+}
+
+func validHubRef() corev1.ObjectReference {
+	return corev1.ObjectReference{
+		APIVersion: GroupVersion.String(),
+		Kind:       "MultiClusterHub",
+		Name:       "multiclusterhub",
+		Namespace:  "open-cluster-management",
+	}
+}
+
+// API-1: the target is explicit and well-formed. Inferring it from whichever
+// MCH exists was the C2 failure.
+func TestValidateHubTeardownTarget(t *testing.T) {
+	valid := HubTeardownSpec{HubRef: corev1.ObjectReference{
+		APIVersion: GroupVersion.String(),
+		Kind:       "MultiClusterHub",
+		Name:       "multiclusterhub",
+		Namespace:  "open-cluster-management",
+	}}
+	cases := []struct {
+		name    string
+		ref     corev1.ObjectReference
+		wantErr string
+	}{
+		{name: "valid", ref: valid.HubRef},
+		{name: "missing name", ref: corev1.ObjectReference{Kind: "MultiClusterHub", Namespace: "ns"}, wantErr: "hubRef.name is required"},
+		{name: "missing namespace", ref: corev1.ObjectReference{Kind: "MultiClusterHub", Name: "hub"}, wantErr: "hubRef.namespace is required"},
+		{name: "wrong kind", ref: corev1.ObjectReference{APIVersion: GroupVersion.String(), Kind: "MultiClusterEngine", Name: "hub", Namespace: "ns"}, wantErr: "must be MultiClusterHub"},
+		{name: "wrong apiVersion", ref: corev1.ObjectReference{APIVersion: "v1", Kind: "MultiClusterHub", Name: "hub", Namespace: "ns"}, wantErr: "hubRef.apiVersion"},
+		{name: "invalid name", ref: corev1.ObjectReference{APIVersion: GroupVersion.String(), Kind: "MultiClusterHub", Name: "Not_A_Name", Namespace: "ns"}, wantErr: "hubRef.name is invalid"},
+		{name: "invalid namespace", ref: corev1.ObjectReference{APIVersion: GroupVersion.String(), Kind: "MultiClusterHub", Name: "hub", Namespace: "Not_A_Namespace"}, wantErr: "hubRef.namespace is invalid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := &HubTeardown{Spec: HubTeardownSpec{HubRef: tc.ref}}
+			err := validateHubTeardownTarget(obj)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// API-2/API-3: escalation is bounded and the MCE disposition is an enum.
+func TestValidateHubTeardownEscalation(t *testing.T) {
+	cases := []struct {
+		name     string
+		escalate *EscalationSpec
+		wantErr  string
+	}{
+		{name: "nil", escalate: nil},
+		{name: "valid", escalate: &EscalationSpec{StallTimeout: duration(15 * time.Minute), MaxDuration: duration(2 * time.Hour), Mode: EscalationModeAutomatic}},
+		{name: "zero stall", escalate: &EscalationSpec{StallTimeout: duration(0)}, wantErr: "stallTimeout must be greater than zero"},
+		{name: "zero max", escalate: &EscalationSpec{MaxDuration: duration(0)}, wantErr: "maxDuration must be greater than zero"},
+		{name: "max above ceiling", escalate: &EscalationSpec{MaxDuration: duration(25 * time.Hour)}, wantErr: "must not exceed"},
+		{name: "stall equals max", escalate: &EscalationSpec{StallTimeout: duration(time.Hour), MaxDuration: duration(time.Hour)}, wantErr: "must be shorter"},
+		{name: "invalid mode", escalate: &EscalationSpec{Mode: EscalationMode("Sometimes")}, wantErr: "must be Manual or Automatic"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := &HubTeardown{Spec: HubTeardownSpec{Escalation: tc.escalate}}
+			err := validateHubTeardownDurations(obj)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
 }
 
 // W-8..W-12: the duration rules are pure, so they are tested without a cluster.
@@ -139,7 +220,7 @@ var _ = Describe("HubTeardown admission", func() {
 	newTeardown := func(name, namespace string) *HubTeardown {
 		return &HubTeardown{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-			Spec:       HubTeardownSpec{DryRun: true},
+			Spec:       HubTeardownSpec{DryRun: true, HubRef: validHubRef()},
 		}
 	}
 
@@ -154,7 +235,7 @@ var _ = Describe("HubTeardown admission", func() {
 
 		err := k8sClient.Create(ctx, newTeardown("admit-default", "default"))
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("only one teardown may run per hub"))
+		Expect(err.Error()).To(ContainSubstring("only one HubTeardown may exist in the cluster"))
 	})
 
 	It("rejects a second teardown in the same namespace (W-5)", func() {
@@ -162,7 +243,7 @@ var _ = Describe("HubTeardown admission", func() {
 
 		err := k8sClient.Create(ctx, newTeardown("admit-b", "default"))
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("only one teardown may run per hub"))
+		Expect(err.Error()).To(ContainSubstring("only one HubTeardown may exist in the cluster"))
 	})
 
 	It("admits an update to the existing teardown (W-3, W-6)", func() {

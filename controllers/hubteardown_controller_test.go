@@ -123,7 +123,7 @@ var _ = Describe("HubTeardown controller", func() {
 				Name:      tdName,
 				Namespace: tdNs,
 			},
-			Spec: operatorv1.HubTeardownSpec{
+			Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
 				DryRun: true,
 			},
 		}
@@ -155,7 +155,7 @@ var _ = Describe("HubTeardown controller", func() {
 				Name:      tdName + "-fin",
 				Namespace: tdNs,
 			},
-			Spec: operatorv1.HubTeardownSpec{
+			Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
 				DryRun: true,
 			},
 		}
@@ -185,7 +185,7 @@ var _ = Describe("HubTeardown controller", func() {
 				Name:      tdName + "-noapproval",
 				Namespace: tdNs,
 			},
-			Spec: operatorv1.HubTeardownSpec{
+			Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
 				DryRun: false,
 			},
 		}
@@ -229,9 +229,9 @@ var _ = Describe("HubTeardown controller", func() {
 				Name:      tdName + "-active",
 				Namespace: tdNs,
 			},
-			Spec: operatorv1.HubTeardownSpec{
-				DryRun:                     false,
-				ApprovedDestructiveActions: true,
+			Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
+				DryRun:                       false,
+				AcknowledgeCloudResourceRisk: true,
 			},
 		}
 
@@ -371,7 +371,7 @@ var _ = Describe("HubTeardown controller", func() {
 				Name:      tdName + "-pause",
 				Namespace: tdNs,
 			},
-			Spec: operatorv1.HubTeardownSpec{
+			Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
 				DryRun: true,
 			},
 		}
