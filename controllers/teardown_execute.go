@@ -9,11 +9,13 @@ import (
 
 	"github.com/go-logr/logr"
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
+	"github.com/stolostron/multiclusterhub-operator/pkg/ownership"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -654,8 +656,8 @@ func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context
 
 // phaseDetachManagedClusters deletes non-local ManagedClusters so the MCH webhook passes.
 // With DF-4 (import-controller ManifestWork finalizer sweep), ManifestWork finalizers
-// are force-cleaned during teardown so ManagedClusters terminate faster. The tiered
-// force-strip logic remains as a safety net for finalizers not covered by DF-4.
+// are force-cleaned during teardown so ManagedClusters terminate faster. Finalizers
+// are only removed through the policy gate; unknown finalizers are reported and retained.
 func (r *HubTeardownReconciler) phaseDetachManagedClusters(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (bool, error) {
 	log.Info("Phase: DetachManagedClusters")
 
@@ -700,38 +702,12 @@ func (r *HubTeardownReconciler) phaseDetachManagedClusters(ctx context.Context, 
 				}
 				if resolved {
 					remaining--
-				} else if td.Spec.ApprovedDestructiveActions {
-					// Gap 12 safety net: if allowlisted resolution did not clear all finalizers
-					// (e.g. agent-side finalizers from an offline/destroyed cluster), force-strip
-					// ALL remaining finalizers after the timeout. This prevents indefinite hang.
-					// Require acknowledgeCloudResourceRisk if any cloud-protecting finalizers remain.
-					hasCloudFinalizer := false
-					for _, f := range mc.GetFinalizers() {
-						if IsCloudProtectingFinalizer(f) {
-							hasCloudFinalizer = true
-							break
-						}
-					}
-					if hasCloudFinalizer && !td.Spec.AcknowledgeCloudResourceRisk {
-						log.Info("Skipping force-strip: ManagedCluster has cloud-protecting finalizers but acknowledgeCloudResourceRisk is not set",
-							"name", mc.GetName())
-					} else {
-						ref := operatorv1.ResourceRef{
-							Group: "cluster.open-cluster-management.io",
-							Kind:  "ManagedCluster",
-							Name:  mc.GetName(),
-						}
-						gvk := schema.GroupVersionKind{
-							Group:   "cluster.open-cluster-management.io",
-							Version: "v1",
-							Kind:    "ManagedCluster",
-						}
-						if err := r.forceStripAllFinalizers(ctx, log, td, ref, gvk); err != nil {
-							log.Error(err, "Failed to force-strip finalizers on ManagedCluster", "name", mc.GetName())
-						} else {
-							remaining--
-						}
-					}
+				} else {
+					log.Info("Finalizers remain on ManagedCluster; ownership/liveness policy does not permit removal",
+						"name", mc.GetName(), "finalizers", mc.GetFinalizers())
+					r.Recorder.Eventf(td, corev1.EventTypeWarning, "FinalizersRetained",
+						"ManagedCluster %s still has %d finalizer(s); manual action required",
+						mc.GetName(), len(mc.GetFinalizers()))
 				}
 			}
 			continue
@@ -1163,6 +1139,7 @@ func (r *HubTeardownReconciler) phaseDeleteACMCRDs(ctx context.Context, log logr
 	if err := r.Client.List(ctx, crdList); err != nil {
 		return false, fmt.Errorf("listing CRDs: %w", err)
 	}
+	observedAt := metav1.Now()
 
 	// Pre-check: verify no stuck-terminating CRs remain before deleting CRDs.
 	// Deleting a CRD while CRs with finalizers are still terminating can wedge
@@ -1171,6 +1148,12 @@ func (r *HubTeardownReconciler) phaseDeleteACMCRDs(ctx context.Context, log logr
 	for i := range crdList.Items {
 		crd := &crdList.Items[i]
 		if !isACMAPIGroup(crd.Spec.Group) || crd.Name == hubteardownCRDName {
+			continue
+		}
+		verdict := crdOwnershipVerdict(crd, observedAt)
+		if !ownership.AllowsDestruction(verdict) {
+			log.Info("Skipping CRD: ownership not established",
+				"crd", crd.Name, "group", crd.Spec.Group, "confidence", verdict.Confidence)
 			continue
 		}
 		version := preferredVersion(crd)
@@ -1223,7 +1206,22 @@ func (r *HubTeardownReconciler) phaseDeleteACMCRDs(ctx context.Context, log logr
 			continue
 		}
 
+		verdict := crdOwnershipVerdict(crd, observedAt)
+		if !ownership.AllowsDestruction(verdict) {
+			log.Info("Retaining CRD: ownership not established",
+				"crd", crd.Name, "group", crd.Spec.Group, "confidence", verdict.Confidence)
+			r.Recorder.Eventf(td, corev1.EventTypeWarning, "CRDRetained",
+				"CRD %s retained: ownership confidence %s", crd.Name, verdict.Confidence)
+			continue
+		}
+
 		if crd.GetDeletionTimestamp() != nil {
+			remaining++
+			continue
+		}
+
+		if err := r.disableConversionWebhookBeforeDelete(ctx, log, crd); err != nil {
+			log.Error(err, "Failed to disable conversion webhook before CRD deletion", "name", crd.Name)
 			remaining++
 			continue
 		}
@@ -1249,6 +1247,30 @@ func (r *HubTeardownReconciler) phaseDeleteACMCRDs(ctx context.Context, log logr
 	r.Recorder.Event(td, corev1.EventTypeNormal, "CRDsDeleted",
 		"All RHACM/MCE CRDs and their instances have been garbage-collected")
 	return true, nil
+}
+
+// crdOwnershipVerdict classifies a CRD from the evidence it carries. The group
+// boundary lives here because pkg/ownership does not own the product list.
+func crdOwnershipVerdict(crd *apixv1.CustomResourceDefinition, observedAt metav1.Time) ownership.OwnershipVerdict {
+	meta := metav1.PartialObjectMetadata{ObjectMeta: *crd.ObjectMeta.DeepCopy()}
+	return ownership.ClassifyCRD(meta, ownsACMGroups(crd.Spec.Group), observedAt)
+}
+
+// disableConversionWebhookBeforeDelete clears a conversion webhook before the
+// CRD is deleted. A CRD whose conversion webhook points at a Service that the
+// teardown already removed can otherwise stay Terminating.
+func (r *HubTeardownReconciler) disableConversionWebhookBeforeDelete(ctx context.Context, log logr.Logger, crd *apixv1.CustomResourceDefinition) error {
+	if crd.Spec.Conversion == nil || crd.Spec.Conversion.Strategy != apixv1.WebhookConverter {
+		return nil
+	}
+	patch := client.MergeFrom(crd.DeepCopy())
+	crd.Spec.Conversion.Strategy = apixv1.NoneConverter
+	crd.Spec.Conversion.Webhook = nil
+	if err := r.Client.Patch(ctx, crd, patch); err != nil {
+		return fmt.Errorf("disabling conversion webhook on CRD %s: %w", crd.Name, err)
+	}
+	log.Info("Disabled conversion webhook before CRD deletion", "crd", crd.Name)
+	return nil
 }
 
 // isResourceGone checks if all instances of a resource type have been deleted.

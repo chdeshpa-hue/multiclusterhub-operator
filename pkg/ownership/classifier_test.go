@@ -275,3 +275,69 @@ func hasEvidence(evidence []Evidence, kind EvidenceKind) bool {
 	}
 	return false
 }
+
+func TestClassifyCRD(t *testing.T) {
+	crdMeta := func(name string, labels map[string]string) metav1.PartialObjectMetadata {
+		obj := metav1.PartialObjectMetadata{}
+		obj.SetName(name)
+		obj.SetLabels(labels)
+		return obj
+	}
+
+	tests := []struct {
+		name          string
+		crd           metav1.PartialObjectMetadata
+		acmOwnedGroup bool
+		wantConf      Confidence
+		wantAllowed   bool
+	}{
+		{
+			name:          "ACM group is Strong without installer labels",
+			crd:           crdMeta("managedclusters.cluster.open-cluster-management.io", nil),
+			acmOwnedGroup: true,
+			wantConf:      ConfidenceStrong,
+			wantAllowed:   true,
+		},
+		{
+			name:          "metal3 group is not ACM-owned",
+			crd:           crdMeta("baremetalhosts.metal3.io", nil),
+			acmOwnedGroup: false,
+			wantConf:      ConfidenceNone,
+			wantAllowed:   false,
+		},
+		{
+			name:          "installer labels authorise even outside the ACM group boundary",
+			crd:           crdMeta("example.com", installerLabels()),
+			acmOwnedGroup: false,
+			wantConf:      ConfidenceDefinitive,
+			wantAllowed:   true,
+		},
+		{
+			name:          "name match alone is Weak and never authorises",
+			crd:           crdMeta("open-cluster-management-example.example.com", nil),
+			acmOwnedGroup: false,
+			wantConf:      ConfidenceWeak,
+			wantAllowed:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ClassifyCRD(tt.crd, tt.acmOwnedGroup, testObservedAt)
+			if got.Confidence != tt.wantConf {
+				t.Fatalf("confidence = %s, want %s", got.Confidence, tt.wantConf)
+			}
+			if AllowsDestruction(got) != tt.wantAllowed {
+				t.Fatalf("AllowsDestruction = %v, want %v", AllowsDestruction(got), tt.wantAllowed)
+			}
+			if got.Owned != tt.wantAllowed {
+				t.Fatalf("Owned = %v, want %v", got.Owned, tt.wantAllowed)
+			}
+			for _, ev := range got.Evidence {
+				if ev.Observed.IsZero() {
+					t.Fatalf("evidence %s has no observed timestamp", ev.Kind)
+				}
+			}
+		})
+	}
+}

@@ -76,10 +76,69 @@ func Classify(obj metav1.PartialObjectMetadata, idx *inventory.Index, mch types.
 
 	confidence := ConfidenceFromEvidence(evidence)
 	return OwnershipVerdict{
-		Owned:      rank(confidence) >= rank(ConfidenceStrong),
+		Owned:      allowsConfidence(confidence),
 		Confidence: confidence,
 		Evidence:   evidence,
 	}
+}
+
+// ClassifyCRD returns the ownership verdict for a CustomResourceDefinition.
+// A CRD is the defining object for its kind, so the object index cannot answer
+// "which CRD defines this CRD" the way it does for an instance. The caller
+// supplies whether the group is inside the ACM/MCE ownership boundary; the
+// confidence rules stay here so CRD deletion and instance deletion cannot
+// drift apart.
+func ClassifyCRD(crd metav1.PartialObjectMetadata, acmOwnedGroup bool, observedAt metav1.Time) OwnershipVerdict {
+	evidence := make([]Evidence, 0, 3)
+
+	if labels := crd.GetLabels(); labels["installer.name"] != "" && labels["installer.namespace"] != "" {
+		evidence = append(evidence, Evidence{
+			Kind:     EvidenceInstallerLabel,
+			Detail:   installerDetail(labels),
+			Source:   "metadata.labels",
+			Observed: observedAt,
+		})
+	}
+	if acmOwnedGroup {
+		evidence = append(evidence, Evidence{
+			Kind:     EvidenceACMGroupCRD,
+			Detail:   fmt.Sprintf("CRD %s defines an ACM/MCE API group", crd.GetName()),
+			Source:   "CustomResourceDefinition.spec.group",
+			Observed: observedAt,
+		})
+	}
+	if nameMatchesACM(crd.GetName()) {
+		evidence = append(evidence, Evidence{
+			Kind:     EvidenceNameMatch,
+			Detail:   fmt.Sprintf("name %q matches an ACM naming pattern", crd.GetName()),
+			Source:   "metadata.name",
+			Observed: observedAt,
+		})
+	}
+
+	sort.Slice(evidence, func(i, j int) bool {
+		if evidence[i].Kind != evidence[j].Kind {
+			return evidence[i].Kind < evidence[j].Kind
+		}
+		return evidence[i].Detail < evidence[j].Detail
+	})
+
+	confidence := ConfidenceFromEvidence(evidence)
+	return OwnershipVerdict{
+		Owned:      allowsConfidence(confidence),
+		Confidence: confidence,
+		Evidence:   evidence,
+	}
+}
+
+// AllowsDestruction reports whether the verdict authorises a destructive
+// action. Definitive and Strong qualify; Weak and None never do.
+func AllowsDestruction(v OwnershipVerdict) bool {
+	return allowsConfidence(v.Confidence)
+}
+
+func allowsConfidence(c Confidence) bool {
+	return rank(c) >= rank(ConfidenceStrong)
 }
 
 // ConfidenceFromEvidence applies the maximum-over-evidence rule. Weak evidence
