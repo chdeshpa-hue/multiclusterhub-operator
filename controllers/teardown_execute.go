@@ -675,9 +675,10 @@ func (r *HubTeardownReconciler) resolveAddonFinalizers(ctx context.Context, log 
 	}
 }
 
-// phaseDeleteInfrastructureCRs deletes all infrastructure provisioning CRs (HostedClusters,
-// ClusterDeployments, ClusterPools, NodePools, InfraEnvs) while their controllers are still
-// alive to handle graceful deprovisioning. Force-resolves finalizers after timeout.
+// phaseDeleteInfrastructureCRs deletes resources carrying Tier-1 cloud-protecting
+// finalizers while their controllers are still alive to handle graceful
+// deprovisioning. The candidate set comes from the inventory graph; no product
+// kind or name makes an object eligible.
 //
 // The acknowledgeCloudResourceRisk gate is only applied when infrastructure CRs
 // actually exist. Hubs with no cloud-provisioned clusters skip this gate entirely.
@@ -689,71 +690,33 @@ func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context
 		return false, err
 	}
 
-	infraTypes := []struct {
-		group   string
-		version string
-		kind    string
-	}{
-		{"hypershift.openshift.io", "v1beta1", "HostedCluster"},
-		{"hypershift.openshift.io", "v1beta1", "NodePool"},
-		{"hive.openshift.io", "v1", "ClusterDeployment"},
-		{"hive.openshift.io", "v1", "ClusterPool"},
-		{"agent-install.openshift.io", "v1beta1", "InfraEnv"},
-		{"siteconfig.open-cluster-management.io", "v1alpha1", "ClusterInstance"},
-	}
-
-	// Collect all existing infrastructure CR instances first.
-	type infraItem struct {
-		obj     *unstructured.Unstructured
-		group   string
-		version string
-		kind    string
-	}
-	var allItems []infraItem
-
-	for _, it := range infraTypes {
-		listGVK := schema.GroupVersionKind{
-			Group:   it.group,
-			Version: it.version,
-			Kind:    it.kind + "List",
-		}
-		list := &unstructured.UnstructuredList{}
-		list.SetGroupVersionKind(listGVK)
-
-		if err := r.Client.List(ctx, list); err != nil {
-			if isNoMatchError(err) {
-				continue
-			}
-			return false, fmt.Errorf("listing %s: %w", it.kind, err)
-		}
-
-		for i := range list.Items {
-			allItems = append(allItems, infraItem{
-				obj:     &list.Items[i],
-				group:   it.group,
-				version: it.version,
-				kind:    it.kind,
-			})
-		}
-	}
+	candidates := authz.graph.InfrastructureResources
 
 	// No infrastructure CRs on this hub — skip the cloud risk gate entirely.
-	if len(allItems) == 0 {
-		log.Info("No infrastructure CRs found, skipping phase")
+	if len(candidates) == 0 {
+		log.Info("No Tier-1 infrastructure resources found, skipping phase")
 		return true, nil
 	}
 
 	remaining := 0
-	for _, ii := range allItems {
-		item := ii.obj
+	for i := range candidates {
+		dr := &candidates[i]
+		if dr.UID == "" {
+			log.Info("Infrastructure CR has no observed UID; retaining it",
+				"kind", dr.Ref.Kind, "namespace", dr.Ref.Namespace, "name", dr.Ref.Name)
+			r.Recorder.Eventf(td, corev1.EventTypeWarning, "InfrastructureCRRetained",
+				"Retained %s %s/%s: inventory did not record an object UID", dr.Ref.Kind, dr.Ref.Namespace, dr.Ref.Name)
+			remaining++
+			continue
+		}
+		item := unstructuredForDiscoveredResource(*dr)
 
-		if item.GetDeletionTimestamp() != nil {
-			if r.shouldResolveStuckFinalizers(td, item) {
-				dr := drFromUnstructured(item, ii.group, ii.version, ii.kind)
-				resolved, err := r.resolveStuckFinalizers(ctx, log, td, []DiscoveredResource{dr})
+		if dr.DeletionTimestamp != nil {
+			if r.shouldResolveStuckFinalizersTime(td, dr.DeletionTimestamp) {
+				resolved, err := r.resolveStuckFinalizers(ctx, log, td, []DiscoveredResource{*dr})
 				if err != nil {
 					log.Error(err, "Error resolving finalizers on infrastructure CR",
-						"kind", ii.kind, "name", item.GetName(), "namespace", item.GetNamespace())
+						"kind", dr.Ref.Kind, "name", dr.Ref.Name, "namespace", dr.Ref.Namespace)
 				}
 				if !resolved {
 					remaining++
@@ -766,30 +729,35 @@ func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context
 
 		decision, authzErr := r.authorize(ctx, authz, authzRequest{
 			Action:     actionDeleteObject,
-			Object:     partialFromUnstructured(item),
-			Finalizers: item.GetFinalizers(),
-			Platform:   detectPlatform(ii.kind, item),
+			Object:     partialMetadata(dr),
+			Finalizers: dr.Finalizers,
+			Platform:   dr.Platform,
 		})
 		if authzErr != nil {
 			return false, authzErr
 		}
 		if !decision.Allowed {
 			log.Info("Infrastructure CR deletion not authorized; retaining it",
-				"kind", ii.kind, "namespace", item.GetNamespace(), "name", item.GetName(),
+				"kind", dr.Ref.Kind, "namespace", dr.Ref.Namespace, "name", dr.Ref.Name,
 				"reason", decision.Reason)
 			r.Recorder.Eventf(td, corev1.EventTypeWarning, "InfrastructureCRRetained",
-				"Retained %s %s/%s: %s", ii.kind, item.GetNamespace(), item.GetName(), decision.Reason)
+				"Retained %s %s/%s: %s", dr.Ref.Kind, dr.Ref.Namespace, dr.Ref.Name, decision.Reason)
 			remaining++
 			continue
 		}
 
 		log.Info("Deleting infrastructure CR",
-			"kind", ii.kind, "name", item.GetName(), "namespace", item.GetNamespace())
-		if err := r.Client.Delete(ctx, item); err != nil && !errors.IsNotFound(err) {
-			return false, fmt.Errorf("deleting %s %s/%s: %w", ii.kind, item.GetNamespace(), item.GetName(), err)
+			"kind", dr.Ref.Kind, "name", dr.Ref.Name, "namespace", dr.Ref.Namespace)
+		var deleteOptions []client.DeleteOption
+		if dr.UID != "" {
+			uid := dr.UID
+			deleteOptions = append(deleteOptions, client.Preconditions{UID: &uid})
+		}
+		if err := r.Client.Delete(ctx, item, deleteOptions...); err != nil && !errors.IsNotFound(err) {
+			return false, fmt.Errorf("deleting %s %s/%s: %w", dr.Ref.Kind, dr.Ref.Namespace, dr.Ref.Name, err)
 		}
 		r.Recorder.Eventf(td, corev1.EventTypeNormal, "InfrastructureCRDeleted",
-			"Deleted %s %s/%s", ii.kind, item.GetNamespace(), item.GetName())
+			"Deleted %s %s/%s", dr.Ref.Kind, dr.Ref.Namespace, dr.Ref.Name)
 		remaining++
 	}
 
@@ -803,6 +771,19 @@ func (r *HubTeardownReconciler) phaseDeleteInfrastructureCRs(ctx context.Context
 
 	log.Info("All infrastructure CRs deleted")
 	return true, nil
+}
+
+func unstructuredForDiscoveredResource(dr DiscoveredResource) *unstructured.Unstructured {
+	item := &unstructured.Unstructured{}
+	item.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   dr.Ref.Group,
+		Version: dr.Version,
+		Kind:    dr.Ref.Kind,
+	})
+	item.SetNamespace(dr.Ref.Namespace)
+	item.SetName(dr.Ref.Name)
+	item.SetUID(dr.UID)
+	return item
 }
 
 // phaseDetachManagedClusters deletes non-local ManagedClusters so the MCH webhook passes.

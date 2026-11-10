@@ -4,12 +4,14 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -19,6 +21,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
@@ -52,6 +55,31 @@ func newGateTestReconciler(t *testing.T, objs ...client.Object) *HubTeardownReco
 		Scheme:   s,
 		Log:      ctrllog.Log,
 		Recorder: record.NewFakeRecorder(50),
+	}
+}
+
+func newInfrastructurePhaseReconciler(t *testing.T, objs []client.Object, gvks ...schema.GroupVersionKind) *HubTeardownReconciler {
+	t.Helper()
+	s := newTestScheme()
+	registerUnstructured(t, s, gvks...)
+	return &HubTeardownReconciler{
+		Client:   fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build(),
+		Scheme:   s,
+		Log:      ctrllog.Log,
+		Recorder: record.NewFakeRecorder(50),
+	}
+}
+
+func newTestCRD(group, version, kind, plural string) *apixv1.CustomResourceDefinition {
+	return &apixv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: plural + "." + group},
+		Spec: apixv1.CustomResourceDefinitionSpec{
+			Group: group,
+			Names: apixv1.CustomResourceDefinitionNames{Kind: kind, Plural: plural},
+			Versions: []apixv1.CustomResourceDefinitionVersion{
+				{Name: version, Served: true, Storage: true},
+			},
+		},
 	}
 }
 
@@ -136,7 +164,11 @@ func TestPhaseDeleteInfrastructureCRs_CloudRiskConsentBlocks(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	hcp := ownedByTestHub(withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1",
 		"hypershift.openshift.io/finalizer"), "AWS"))
-	r := newGateTestReconciler(t, hcp)
+	hcp.SetUID(types.UID("hcp1-uid"))
+	r := newInfrastructurePhaseReconciler(t, []client.Object{
+		newTestCRD("hypershift.openshift.io", "v1beta1", "HostedCluster", "hostedclusters"),
+		hcp,
+	}, hostedClusterGVK)
 	td := newTeardownCR()
 
 	done, err := r.phaseDeleteInfrastructureCRs(context.Background(), ctrllog.Log.WithName("test"), td)
@@ -164,7 +196,11 @@ func TestPhaseDeleteInfrastructureCRs_CloudRiskConsentAllowsDeletion(t *testing.
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 	hcp := ownedByTestHub(withPlatform(newUnstructured(hostedClusterGVK, "clusters", "hcp1",
 		"hypershift.openshift.io/finalizer"), "AWS"))
-	r := newGateTestReconciler(t, hcp)
+	hcp.SetUID(types.UID("hcp1-uid"))
+	r := newInfrastructurePhaseReconciler(t, []client.Object{
+		newTestCRD("hypershift.openshift.io", "v1beta1", "HostedCluster", "hostedclusters"),
+		hcp,
+	}, hostedClusterGVK)
 	td := newTeardownCR()
 	grantTestCloudConsent(td)
 
@@ -189,6 +225,267 @@ func TestPhaseDeleteInfrastructureCRs_CloudRiskConsentAllowsDeletion(t *testing.
 	events := strings.Join(drainEvents(r), "\n")
 	if strings.Contains(events, "InfrastructureCRRetained") {
 		t.Fatalf("cloud-risk gate must not retain the CR after consent, got:\n%s", events)
+	}
+}
+
+func TestPhaseDeleteInfrastructureCRs_UsesDiscoveredTier1Candidates(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	aciGVK := schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "AgentClusterInstall"}
+	poolGVK := schema.GroupVersionKind{Group: "hive.openshift.io", Version: "v1", Kind: "ClusterPool"}
+	aci := ownedByTestHub(newUnstructured(aciGVK, "clusters", "aci1",
+		"agentclusterinstall.agent-install.openshift.io/ai-deprovision"))
+	aci.SetUID(types.UID("aci-uid"))
+	pool := ownedByTestHub(newUnstructured(poolGVK, "clusters", "pool-without-finalizer"))
+
+	r := newInfrastructurePhaseReconciler(t, []client.Object{
+		newTestCRD("agent-install.openshift.io", "v1beta1", "AgentClusterInstall", "agentclusterinstalls"),
+		newTestCRD("hive.openshift.io", "v1", "ClusterPool", "clusterpools"),
+		aci,
+		pool,
+	}, aciGVK, poolGVK)
+	td := newTeardownCR()
+	grantTestCloudConsent(td)
+
+	done, err := r.phaseDeleteInfrastructureCRs(context.Background(), ctrllog.Log.WithName("test"), td)
+	if err != nil {
+		t.Fatalf("phaseDeleteInfrastructureCRs error: %v", err)
+	}
+	if done {
+		t.Fatal("phase must wait for a newly discovered finalizer-bearing infrastructure object to terminate")
+	}
+
+	gotACI := &unstructured.Unstructured{}
+	gotACI.SetGroupVersionKind(aciGVK)
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: "clusters", Name: "aci1"}, gotACI); err != nil {
+		t.Fatalf("get AgentClusterInstall: %v", err)
+	}
+	if gotACI.GetDeletionTimestamp() == nil {
+		t.Fatal("a discovered Tier-1 resource absent from the old six-kind list must be selected for deletion")
+	}
+
+	gotPool := &unstructured.Unstructured{}
+	gotPool.SetGroupVersionKind(poolGVK)
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: "clusters", Name: "pool-without-finalizer"}, gotPool); err != nil {
+		t.Fatalf("get ClusterPool: %v", err)
+	}
+	if gotPool.GetDeletionTimestamp() != nil {
+		t.Fatal("kind alone must not make a no-finalizer object a P3 candidate")
+	}
+}
+
+func TestPhaseDeleteInfrastructureCRs_KubeVirtNeedsNoCloudConsent(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	hcp := ownedByTestHub(withPlatform(newUnstructured(hostedClusterGVK, "clusters", "kv-hcp",
+		"hypershift.openshift.io/finalizer"), "KUBEVIRT"))
+	hcp.SetUID(types.UID("kv-hcp-uid"))
+	r := newInfrastructurePhaseReconciler(t, []client.Object{
+		newTestCRD("hypershift.openshift.io", "v1beta1", "HostedCluster", "hostedclusters"),
+		hcp,
+	}, hostedClusterGVK)
+	td := newTeardownCR()
+
+	done, err := r.phaseDeleteInfrastructureCRs(context.Background(), ctrllog.Log.WithName("test"), td)
+	if err != nil {
+		t.Fatalf("phaseDeleteInfrastructureCRs error: %v", err)
+	}
+	if done {
+		t.Fatal("phase must wait for the KubeVirt infrastructure object to terminate")
+	}
+
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(hostedClusterGVK)
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: "clusters", Name: "kv-hcp"}, got); err != nil {
+		t.Fatalf("get HostedCluster: %v", err)
+	}
+	if got.GetDeletionTimestamp() == nil {
+		t.Fatal("KubeVirt infrastructure must be released without cloud-risk consent")
+	}
+}
+
+func TestPhaseDeleteInfrastructureCRs_CandidateIsNotAuthorization(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	bmhGVK := schema.GroupVersionKind{Group: "metal3.io", Version: "v1alpha1", Kind: "BareMetalHost"}
+	bmh := newUnstructured(bmhGVK, "openshift-machine-api", "unowned-tier1",
+		"hypershift.openshift.io/finalizer")
+	bmh.SetUID(types.UID("bmh-uid"))
+	r := newInfrastructurePhaseReconciler(t, []client.Object{
+		newTestCRD("metal3.io", "v1alpha1", "BareMetalHost", "baremetalhosts"),
+		bmh,
+	}, bmhGVK)
+	td := newTeardownCR()
+	grantTestCloudConsent(td)
+
+	done, err := r.phaseDeleteInfrastructureCRs(context.Background(), ctrllog.Log.WithName("test"), td)
+	if err != nil {
+		t.Fatalf("phaseDeleteInfrastructureCRs error: %v", err)
+	}
+	if done {
+		t.Fatal("an unowned candidate must remain outstanding")
+	}
+
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(bmhGVK)
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: "openshift-machine-api", Name: "unowned-tier1"}, got); err != nil {
+		t.Fatalf("get BareMetalHost: %v", err)
+	}
+	if got.GetDeletionTimestamp() != nil {
+		t.Fatal("being a Tier-1 candidate must never replace ownership evidence")
+	}
+	events := strings.Join(drainEvents(r), "\n")
+	if !strings.Contains(events, "InfrastructureCRRetained") || !strings.Contains(events, "ownership confidence is None") {
+		t.Fatalf("expected a retained-candidate event naming ownership, got:\n%s", events)
+	}
+}
+
+func TestPhaseDeleteInfrastructureCRs_DeleteUsesObservedUID(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	aciGVK := schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "AgentClusterInstall"}
+	const observedUID = types.UID("observed-aci-uid")
+	aci := ownedByTestHub(newUnstructured(aciGVK, "clusters", "aci1",
+		"agentclusterinstall.agent-install.openshift.io/ai-deprovision"))
+	aci.SetUID(observedUID)
+
+	s := newTestScheme()
+	registerUnstructured(t, s, aciGVK)
+	base := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		newTestCRD("agent-install.openshift.io", "v1beta1", "AgentClusterInstall", "agentclusterinstalls"),
+		aci,
+	).Build()
+	var deletedUID types.UID
+	intercepted := interceptor.NewClient(base, interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			deleteOptions := &client.DeleteOptions{}
+			for _, opt := range opts {
+				opt.ApplyToDelete(deleteOptions)
+			}
+			if deleteOptions.Preconditions != nil && deleteOptions.Preconditions.UID != nil {
+				deletedUID = *deleteOptions.Preconditions.UID
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	r := &HubTeardownReconciler{
+		Client:   intercepted,
+		Scheme:   s,
+		Log:      ctrllog.Log,
+		Recorder: record.NewFakeRecorder(50),
+	}
+	td := newTeardownCR()
+	grantTestCloudConsent(td)
+
+	if _, err := r.phaseDeleteInfrastructureCRs(context.Background(), ctrllog.Log.WithName("test"), td); err != nil {
+		t.Fatalf("phaseDeleteInfrastructureCRs error: %v", err)
+	}
+	if deletedUID != observedUID {
+		t.Fatalf("delete UID precondition = %q, want %q", deletedUID, observedUID)
+	}
+}
+
+func TestPhaseDeleteInfrastructureCRs_UIDConflictRetainsReplacement(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	aciGVK := schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "AgentClusterInstall"}
+	const (
+		observedUID    = types.UID("observed-aci-uid")
+		replacementUID = types.UID("replacement-aci-uid")
+		finalizer      = "agentclusterinstall.agent-install.openshift.io/ai-deprovision"
+	)
+	replacement := ownedByTestHub(newUnstructured(aciGVK, "clusters", "aci1", finalizer))
+	replacement.SetUID(replacementUID)
+
+	s := newTestScheme()
+	registerUnstructured(t, s, aciGVK)
+	base := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		newTestCRD("agent-install.openshift.io", "v1beta1", "AgentClusterInstall", "agentclusterinstalls"),
+		replacement,
+	).Build()
+	intercepted := interceptor.NewClient(base, interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			deleteOptions := &client.DeleteOptions{}
+			for _, opt := range opts {
+				opt.ApplyToDelete(deleteOptions)
+			}
+			if deleteOptions.Preconditions == nil || deleteOptions.Preconditions.UID == nil {
+				return fmt.Errorf("delete had no UID precondition")
+			}
+			current := &unstructured.Unstructured{}
+			current.SetGroupVersionKind(aciGVK)
+			if err := base.Get(ctx, types.NamespacedName{Namespace: "clusters", Name: "aci1"}, current); err != nil {
+				return err
+			}
+			if current.GetUID() != *deleteOptions.Preconditions.UID {
+				return apierrors.NewConflict(schema.GroupResource{Group: aciGVK.Group, Resource: "agentclusterinstalls"}, "aci1",
+					fmt.Errorf("precondition UID %s does not match current UID %s", *deleteOptions.Preconditions.UID, current.GetUID()))
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	r := &HubTeardownReconciler{
+		Client:   intercepted,
+		Scheme:   s,
+		Log:      ctrllog.Log,
+		Recorder: record.NewFakeRecorder(50),
+	}
+	td := newTeardownCR()
+	grantTestCloudConsent(td)
+
+	stale := testDiscovered("agent-install.openshift.io", "v1beta1", "AgentClusterInstall", "clusters", "aci1", string(observedUID), finalizer)
+	stale.Labels = replacement.GetLabels()
+	stale.Platform = "AWS"
+	graph := &DependencyGraph{
+		DiscoveredResources:     []DiscoveredResource{stale},
+		InfrastructureResources: []DiscoveredResource{stale},
+		ScanTime:                metav1.Now(),
+	}
+	r.authz = r.authzFromGraph(td, graph)
+
+	if _, err := r.phaseDeleteInfrastructureCRs(context.Background(), ctrllog.Log.WithName("test"), td); err == nil || !apierrors.IsConflict(err) {
+		t.Fatalf("phaseDeleteInfrastructureCRs error = %v, want a UID-conflict error", err)
+	}
+
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(aciGVK)
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: "clusters", Name: "aci1"}, got); err != nil {
+		t.Fatalf("get replacement AgentClusterInstall: %v", err)
+	}
+	if got.GetUID() != replacementUID {
+		t.Fatalf("replacement UID = %q, want %q", got.GetUID(), replacementUID)
+	}
+	if got.GetDeletionTimestamp() != nil {
+		t.Fatal("the same-name replacement must not be deleted after its UID no longer matches the scan")
+	}
+}
+
+func TestPhaseDeleteInfrastructureCRs_MissingUIDIsRetained(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+	aciGVK := schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "AgentClusterInstall"}
+	aci := ownedByTestHub(newUnstructured(aciGVK, "clusters", "aci-without-uid",
+		"agentclusterinstall.agent-install.openshift.io/ai-deprovision"))
+	r := newInfrastructurePhaseReconciler(t, []client.Object{
+		newTestCRD("agent-install.openshift.io", "v1beta1", "AgentClusterInstall", "agentclusterinstalls"),
+		aci,
+	}, aciGVK)
+	td := newTeardownCR()
+	grantTestCloudConsent(td)
+
+	done, err := r.phaseDeleteInfrastructureCRs(context.Background(), ctrllog.Log.WithName("test"), td)
+	if err != nil {
+		t.Fatalf("phaseDeleteInfrastructureCRs error: %v", err)
+	}
+	if done {
+		t.Fatal("a candidate without an observed UID must remain outstanding")
+	}
+
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(aciGVK)
+	if err := r.Client.Get(context.Background(), types.NamespacedName{Namespace: "clusters", Name: "aci-without-uid"}, got); err != nil {
+		t.Fatalf("get AgentClusterInstall: %v", err)
+	}
+	if got.GetDeletionTimestamp() != nil {
+		t.Fatal("name-based deletion must not be used when the inventory omitted the UID")
+	}
+	events := strings.Join(drainEvents(r), "\n")
+	if !strings.Contains(events, "inventory did not record an object UID") {
+		t.Fatalf("expected a missing-UID retention event, got:\n%s", events)
 	}
 }
 

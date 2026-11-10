@@ -52,7 +52,12 @@ type DependencyGraph struct {
 	// Resources that block MCH webhook validation.
 	BlockingResources []operatorv1.BlockingResource
 
-	// Resources with Tier 1 (cloud-protecting) finalizers.
+	// Resources with Tier 1 (cloud-protecting) finalizers. This is the P3
+	// candidate set; selection is by finalizer evidence, never by kind.
+	InfrastructureResources []DiscoveredResource
+
+	// Resources whose Tier-1 finalizers may orphan resources outside the hub.
+	// KubeVirt is excluded here but remains in InfrastructureResources.
 	CloudRiskResources []DiscoveredResource
 
 	// Resources with Tier 2 (non-cloud) finalizers.
@@ -207,6 +212,7 @@ func (r *HubTeardownReconciler) buildDependencyGraph(ctx context.Context, td *op
 		}
 	}
 	graph.InventoryComplete = len(graph.Incomplete) == 0
+	classifyFinalizerResources(graph)
 
 	r.classifyBlockingResources(graph)
 	r.classifyManagedClusters(graph)
@@ -383,32 +389,72 @@ func (r *HubTeardownReconciler) scanCRDInstances(ctx context.Context, log logr.L
 
 	for i := range list.Items {
 		item := &list.Items[i]
-		finalizers := item.GetFinalizers()
-
 		dr := newDiscoveredResource(item, crd, version)
-
 		graph.DiscoveredResources = append(graph.DiscoveredResources, dr)
+	}
 
-		for _, f := range finalizers {
-			if requiresCloudAcknowledgement(f, dr.Platform) {
-				graph.CloudRiskResources = append(graph.CloudRiskResources, dr)
-				break
+	return nil
+}
+
+// classifyFinalizerResources derives every finalizer-based planning view from
+// the same inventory snapshot. P3 selects infrastructure candidates by Tier-1
+// finalizer evidence, not by a product-kind list; a resource name or kind can
+// never make an object destructive on its own.
+func classifyFinalizerResources(graph *DependencyGraph) {
+	graph.InfrastructureResources = nil
+	graph.CloudRiskResources = nil
+	graph.NonCloudFinalizerResources = nil
+
+	for i := range graph.DiscoveredResources {
+		dr := graph.DiscoveredResources[i]
+		infrastructure := false
+		cloudRisk := false
+		nonCloud := false
+		for _, finalizer := range dr.Finalizers {
+			if IsCloudProtectingFinalizer(finalizer) {
+				infrastructure = true
+				if requiresCloudAcknowledgement(finalizer, dr.Platform) {
+					cloudRisk = true
+				}
+				continue
+			}
+			if IsAllowlistedFinalizer(finalizer) {
+				nonCloud = true
 			}
 		}
-
-		hasNonCloudFinalizer := false
-		for _, f := range finalizers {
-			if !IsCloudProtectingFinalizer(f) && IsAllowlistedFinalizer(f) {
-				hasNonCloudFinalizer = true
-				break
-			}
+		if infrastructure {
+			graph.InfrastructureResources = append(graph.InfrastructureResources, dr)
 		}
-		if hasNonCloudFinalizer {
+		if cloudRisk {
+			graph.CloudRiskResources = append(graph.CloudRiskResources, dr)
+		}
+		if nonCloud {
 			graph.NonCloudFinalizerResources = append(graph.NonCloudFinalizerResources, dr)
 		}
 	}
 
-	return nil
+	sortDiscoveredResources(graph.InfrastructureResources)
+	sortDiscoveredResources(graph.CloudRiskResources)
+	sortDiscoveredResources(graph.NonCloudFinalizerResources)
+}
+
+func sortDiscoveredResources(resources []DiscoveredResource) {
+	sort.Slice(resources, func(i, j int) bool {
+		a, b := resources[i], resources[j]
+		if a.Ref.Group != b.Ref.Group {
+			return a.Ref.Group < b.Ref.Group
+		}
+		if a.Ref.Kind != b.Ref.Kind {
+			return a.Ref.Kind < b.Ref.Kind
+		}
+		if a.Ref.Namespace != b.Ref.Namespace {
+			return a.Ref.Namespace < b.Ref.Namespace
+		}
+		if a.Ref.Name != b.Ref.Name {
+			return a.Ref.Name < b.Ref.Name
+		}
+		return a.UID < b.UID
+	})
 }
 
 // newDiscoveredResource is the one place a scanned object becomes a graph
@@ -699,23 +745,26 @@ func (r *HubTeardownReconciler) buildDryRunReport(graph *DependencyGraph) *opera
 	// Phase: DeleteInfrastructureCRs
 	infraDetails := make([]string, 0)
 	infraCount := 0
-	for _, cr := range graph.CloudRiskResources {
-		if cr.Ref.Kind == "HostedCluster" || cr.Ref.Kind == "ClusterDeployment" ||
-			cr.Ref.Kind == "InfraEnv" || cr.Ref.Kind == "NodePool" ||
-			cr.Ref.Kind == "HostedControlPlane" {
-			detail := fmt.Sprintf("%s/%s/%s", cr.Ref.Kind, cr.Ref.Namespace, cr.Ref.Name)
-			if cr.Platform != "" {
-				detail += fmt.Sprintf(" (platform: %s)", cr.Platform)
+	infraCloudRiskCount := 0
+	for _, cr := range graph.InfrastructureResources {
+		detail := fmt.Sprintf("%s/%s/%s", cr.Ref.Kind, cr.Ref.Namespace, cr.Ref.Name)
+		if cr.Platform != "" {
+			detail += fmt.Sprintf(" (platform: %s)", cr.Platform)
+		}
+		infraDetails = append(infraDetails, detail)
+		infraCount++
+		for _, finalizer := range cr.Finalizers {
+			if requiresCloudAcknowledgement(finalizer, cr.Platform) {
+				infraCloudRiskCount++
+				break
 			}
-			infraDetails = append(infraDetails, detail)
-			infraCount++
 		}
 	}
 	phases = append(phases, operatorv1.PlannedPhase{
 		Phase:              operatorv1.TeardownPhaseDeleteInfrastructureCRs,
-		Action:             "Delete Hive ClusterDeployments, HyperShift HostedClusters, InfraEnvs, NodePools",
+		Action:             "Delete discovered resources carrying Tier-1 cloud-protecting finalizers while their controllers are alive",
 		ResourcesAffected:  infraCount,
-		CloudRiskResources: infraCount,
+		CloudRiskResources: infraCloudRiskCount,
 		Details:            infraDetails,
 	})
 

@@ -342,6 +342,13 @@ func TestBuildDryRunReport(t *testing.T) {
 			{Kind: "MultiClusterObservability", Group: "observability.open-cluster-management.io", Name: "observability", Reason: "test"},
 			{Kind: "ManagedCluster", Group: "cluster.open-cluster-management.io", Name: "my-hcp", Reason: "test"},
 		},
+		InfrastructureResources: []DiscoveredResource{
+			{
+				Ref:        operatorv1.ResourceRef{Kind: "HostedCluster", Group: "hypershift.openshift.io", Namespace: "clusters", Name: "my-hcp"},
+				Finalizers: []string{"hypershift.openshift.io/finalizer"},
+				Platform:   "AWS",
+			},
+		},
 		CloudRiskResources: []DiscoveredResource{
 			{
 				Ref:        operatorv1.ResourceRef{Kind: "HostedCluster", Group: "hypershift.openshift.io", Namespace: "clusters", Name: "my-hcp"},
@@ -389,9 +396,17 @@ func TestBuildDryRunReport(t *testing.T) {
 	if report.TotalCloudRiskResources != 1 {
 		t.Errorf("TotalCloudRiskResources = %d, want 1", report.TotalCloudRiskResources)
 	}
-
 	if len(report.PlannedPhases) != 9 {
 		t.Errorf("PlannedPhases count = %d, want 9", len(report.PlannedPhases))
+	}
+	if len(report.PlannedPhases) > 2 {
+		infraPhase := report.PlannedPhases[2]
+		if infraPhase.ResourcesAffected != 1 || infraPhase.CloudRiskResources != 1 {
+			t.Errorf("infrastructure phase counts = %d/%d, want 1/1", infraPhase.ResourcesAffected, infraPhase.CloudRiskResources)
+		}
+		if len(infraPhase.Details) != 1 || !strings.Contains(infraPhase.Details[0], "HostedCluster/clusters/my-hcp") {
+			t.Errorf("infrastructure phase details = %v, want HostedCluster/clusters/my-hcp", infraPhase.Details)
+		}
 	}
 
 	if report.Summary == "" {
