@@ -3,6 +3,7 @@
 package verify
 
 import (
+	"strings"
 	"testing"
 
 	operatorv1 "github.com/stolostron/multiclusterhub-operator/api/v1"
@@ -88,15 +89,25 @@ func TestEvaluateIncompleteNeverComplete(t *testing.T) {
 
 func TestEvaluateWebhooks(t *testing.T) {
 	report := Evaluate(Input{Webhooks: []WebhookRef{
-		{Kind: "ValidatingWebhookConfiguration", Name: "no-service"},
+		{Kind: "ValidatingWebhookConfiguration", Name: "platform-url-webhook"},
 		{Kind: "MutatingWebhookConfiguration", Name: "removed-ns", ServiceNamespace: "multicluster-engine"},
 	}}, testPolicy)
 
 	if report.Complete {
 		t.Fatal("dangling webhooks are residue")
 	}
-	if len(report.Residue) != 2 {
+	if len(report.Residue) != 1 || report.Residue[0].Name != "removed-ns" {
 		t.Fatalf("residue = %+v", report.Residue)
+	}
+}
+
+func TestEvaluateURLWebhookWithoutACMProvenanceIsNotResidue(t *testing.T) {
+	report := Evaluate(Input{Webhooks: []WebhookRef{
+		{Kind: "ValidatingWebhookConfiguration", Name: "network-node-identity.openshift.io"},
+	}}, testPolicy)
+
+	if !report.Complete || len(report.Residue) != 0 {
+		t.Fatalf("platform URL-based webhook must not be residue: %+v", report.Residue)
 	}
 }
 
@@ -129,6 +140,70 @@ func TestEvaluateUnlabelledWebhookInOperatorNamespaceIsNotResidue(t *testing.T) 
 
 	if !report.Complete {
 		t.Fatalf("an unlabelled webhook in the preserved namespace must not be residue: %+v", report.Residue)
+	}
+}
+
+// F-v30-LIVE-1: backing-Service absence is an observation independent of
+// ownership. An unlabelled webhook in the preserved namespace must be residue
+// when every one of its backing Services is gone.
+func TestEvaluateDanglingUnlabelledWebhookIsResidue(t *testing.T) {
+	report := Evaluate(Input{Webhooks: []WebhookRef{
+		{
+			Kind:             "ValidatingWebhookConfiguration",
+			Name:             "application-webhook-validator",
+			ServiceNamespace: testPolicy.OperatorNamespace,
+			BackingServices: []ServiceRef{
+				{Namespace: testPolicy.OperatorNamespace, Name: "multicluster-operators-application-svc"},
+			},
+			ServicesAbsent: true,
+		},
+	}}, testPolicy)
+
+	if report.Complete {
+		t.Fatal("a webhook whose backing Service is absent is residue")
+	}
+	if len(report.Residue) != 1 || report.Residue[0].Name != "application-webhook-validator" {
+		t.Fatalf("residue = %+v", report.Residue)
+	}
+	reason := report.Residue[0].Reason
+	if !strings.Contains(reason, testPolicy.OperatorNamespace+"/multicluster-operators-application-svc") {
+		t.Fatalf("residue reason does not name the absent backing Service: %q", reason)
+	}
+}
+
+func TestEvaluateWebhookWithPresentBackingServiceIsNotResidue(t *testing.T) {
+	report := Evaluate(Input{Webhooks: []WebhookRef{
+		{
+			Kind:             "ValidatingWebhookConfiguration",
+			Name:             "healthy-unlabelled",
+			ServiceNamespace: testPolicy.OperatorNamespace,
+			BackingServices: []ServiceRef{
+				{Namespace: testPolicy.OperatorNamespace, Name: "still-there"},
+			},
+		},
+	}}, testPolicy)
+
+	if !report.Complete || len(report.Residue) != 0 {
+		t.Fatalf("a healthy unlabelled webhook must not be residue: %+v", report.Residue)
+	}
+}
+
+func TestEvaluateDanglingACMWebhookIsReportedOnce(t *testing.T) {
+	report := Evaluate(Input{Webhooks: []WebhookRef{
+		{
+			Kind:             "ValidatingWebhookConfiguration",
+			Name:             "acm-and-dangling",
+			ServiceNamespace: testPolicy.OperatorNamespace,
+			ACMOwned:         true,
+			BackingServices: []ServiceRef{
+				{Namespace: testPolicy.OperatorNamespace, Name: "gone"},
+			},
+			ServicesAbsent: true,
+		},
+	}}, testPolicy)
+
+	if len(report.Residue) != 1 {
+		t.Fatalf("a webhook must be reported once: %+v", report.Residue)
 	}
 }
 

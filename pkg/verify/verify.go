@@ -42,6 +42,22 @@ type WebhookRef struct {
 	// invisible to the removed-namespace rule, so ownership has to travel with
 	// the observation rather than be inferred from where the Service lives.
 	ACMOwned bool
+
+	// BackingServices are the Service-backed client configurations, in the
+	// order the webhook declares them. It is empty for a URL-based webhook,
+	// whose backing cannot be observed from the cluster.
+	BackingServices []ServiceRef
+	// ServicesAbsent is true only when every client configuration is
+	// Service-backed and every referenced Service was observed absent. That is
+	// the evidence that makes the registration dangling. Ownership is a
+	// separate question: it gates deletion, never the observation.
+	ServicesAbsent bool
+}
+
+// ServiceRef is one Service-backed admission webhook client configuration.
+type ServiceRef struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
 }
 
 // Input is everything Verify observed.
@@ -231,17 +247,17 @@ func Evaluate(in Input, p Policy) Report {
 	}
 
 	for _, hook := range in.Webhooks {
+		if hook.ServicesAbsent {
+			report.Residue = append(report.Residue, operatorv1.ResidueItem{
+				Kind: hook.Kind, Name: hook.Name, Namespace: hook.ServiceNamespace,
+				Reason: danglingWebhookReason(hook.BackingServices),
+			})
+			continue
+		}
 		if hook.ACMOwned {
 			report.Residue = append(report.Residue, operatorv1.ResidueItem{
 				Kind: hook.Kind, Name: hook.Name, Namespace: hook.ServiceNamespace,
 				Reason: "ACM admission webhook still present after teardown",
-			})
-			continue
-		}
-		if hook.ServiceNamespace == "" {
-			report.Residue = append(report.Residue, operatorv1.ResidueItem{
-				Kind: hook.Kind, Name: hook.Name,
-				Reason: "admission webhook has no backing Service",
 			})
 			continue
 		}
@@ -276,6 +292,25 @@ func residueItem(obj ObjectRef, reason string) operatorv1.ResidueItem {
 		Name:       obj.Name,
 		Reason:     reason,
 	}
+}
+
+// danglingWebhookReason names the absent backing Services. Deletion still
+// requires evidence-backed ownership; an unowned registration is retained and
+// reported, never suppressed, because the observation does not depend on who
+// owns the object.
+func danglingWebhookReason(services []ServiceRef) string {
+	names := make([]string, 0, len(services))
+	seen := make(map[string]struct{}, len(services))
+	for _, service := range services {
+		name := service.Namespace + "/" + service.Name
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return "dangling admission webhook: backing Service(s) absent: " + strings.Join(names, ", ")
 }
 
 func objectKey(group, kind, namespace, name string) string {

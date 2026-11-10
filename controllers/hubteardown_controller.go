@@ -155,8 +155,11 @@ func (r *HubTeardownReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	// Ensure the finalizer is present to protect the CR while teardown is active.
-	if !controllerutil.ContainsFinalizer(teardown, teardownJobFinalizer) {
+	// Ensure the finalizer is present while teardown can create Jobs. A pure
+	// dry-run CR creates nothing, so it must remain deletable without the
+	// controller's cleanup path (LC-2). A CR that later becomes active gets the
+	// finalizer before any Job is created.
+	if !teardown.Spec.DryRun && !controllerutil.ContainsFinalizer(teardown, teardownJobFinalizer) {
 		controllerutil.AddFinalizer(teardown, teardownJobFinalizer)
 		if err := r.Client.Update(ctx, teardown); err != nil {
 			return ctrl.Result{}, err
@@ -174,6 +177,13 @@ func (r *HubTeardownReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 func (r *HubTeardownReconciler) reconcileDryRun(ctx context.Context, log logr.Logger, td *operatorv1.HubTeardown) (ctrl.Result, error) {
 	log.Info("Dry-run mode: scanning cluster state")
 	originalStatus := td.Status.DeepCopy()
+
+	// A CR switched to report-only must not keep an active-mode block in its
+	// status. Dry-run never evaluates the destructive preflight.
+	if prev := meta.FindStatusCondition(td.Status.Conditions, conditionTypePreflightBlocked); prev != nil && prev.Status == metav1.ConditionTrue {
+		r.setCondition(td, conditionTypePreflightBlocked, metav1.ConditionFalse, "DryRun",
+			"Dry-run mode is report-only; the destructive APIService preflight is not evaluated.")
+	}
 
 	// Pausing an active teardown stops the deadline from accruing. The shift is
 	// applied on resume, so a long pause cannot fail a later run.
@@ -268,6 +278,10 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 		if err != nil {
 			log.Error(err, "Failed to scan on activation; proceeding without a fresh report")
 		} else {
+			// The preflight needs the same evidence snapshot as the report.
+			// Cache it so one activation scan serves both and the start gate
+			// cannot decide against a second, later observation.
+			r.authz = r.authzFromGraph(td, graph)
 			freshReport := r.buildDryRunReport(graph)
 			if td.Status.DryRunReport != nil {
 				oldBlocking := td.Status.DryRunReport.TotalBlockingResources
@@ -365,17 +379,6 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 		r.Recorder.Event(td, corev1.EventTypeNormal, "StallCleared", "Teardown is making progress again")
 	}
 
-	handoffErr := r.ensureHandoff(ctx, log, td)
-	if handoffErr != nil {
-		// Visible, not fatal: teardown can still finish in-process, but the
-		// missing handoff identity must never be silent (J-6).
-		r.setCondition(td, conditionTypeHandoffReady, metav1.ConditionFalse, "HandoffUnavailable", handoffErr.Error())
-		log.Error(handoffErr, "Failed to ensure teardown handoff (controller will continue without resilient Job)")
-	} else if teardownConsentGiven(td) {
-		r.setCondition(td, conditionTypeHandoffReady, metav1.ConditionTrue, "HandoffReady",
-			fmt.Sprintf("Handoff Job runs as ServiceAccount %s bound to ClusterRole %s.", handoffSAName, handoffRoleName))
-	}
-
 	// The destructive phases run in the Job. The operator holds at the boundary
 	// rather than duplicating them, and holds there entirely until the admin has
 	// authorised destructive work.
@@ -408,11 +411,49 @@ func (r *HubTeardownReconciler) reconcileActive(ctx context.Context, log logr.Lo
 		return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
 	}
 
+	// Start gate: an APIService whose backing Service is gone cannot serve, and
+	// an unavailable aggregated API fails namespace discovery for every
+	// namespace the teardown deletes. The Job sweep would correctly retain an
+	// unowned registration, which is exactly the v28 wedge. Refuse to create
+	// the handoff identity or Job until the registration is healthy or gone.
+	// The gate applies only before a Job starts; a run already in flight is
+	// governed by the Job's own retain policy.
+	started, err := r.teardownJobStarted(ctx, td)
+	if err != nil {
+		r.blockOnPreflight(ctx, log, td, preflightReasonError,
+			"Active teardown is blocked before a teardown Job starts: the controller could not read teardown Job state: "+err.Error())
+		return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
+	}
+	if !started {
+		stale, preflightErr := r.preflightStaleAPIServices(ctx, log, td)
+		if preflightErr != nil {
+			r.blockOnPreflight(ctx, log, td, preflightReasonError,
+				"Active teardown is blocked before a teardown Job starts: the APIService preflight could not complete: "+preflightErr.Error())
+			return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
+		}
+		if len(stale) > 0 {
+			r.blockOnPreflight(ctx, log, td, preflightReasonStaleAPIService, staleAPIServiceBlockMessage(stale))
+			return ctrl.Result{RequeueAfter: teardownResyncActive}, nil
+		}
+		r.clearPreflightBlocked(ctx, log, td)
+	}
+
+	handoffErr := r.ensureHandoff(ctx, log, td)
+	if handoffErr != nil {
+		// Visible, not fatal: teardown can still finish in-process, but the
+		// missing handoff identity must never be silent (J-6).
+		r.setCondition(td, conditionTypeHandoffReady, metav1.ConditionFalse, "HandoffUnavailable", handoffErr.Error())
+		log.Error(handoffErr, "Failed to ensure teardown handoff (controller will continue without resilient Job)")
+	} else {
+		r.setCondition(td, conditionTypeHandoffReady, metav1.ConditionTrue, "HandoffReady",
+			fmt.Sprintf("Handoff Job runs as ServiceAccount %s bound to ClusterRole %s.", handoffSAName, handoffRoleName))
+	}
+
 	// A Job that cannot be created is not a running Job. The destructive work
 	// lives in the Job, so an unavailable handoff must be reported as the
 	// reason teardown is not progressing rather than hidden behind
 	// PrepareJobRunning.
-	if handoffErr != nil && teardownConsentGiven(td) {
+	if handoffErr != nil {
 		r.setCondition(td, conditionTypeTeardownProgressing, metav1.ConditionTrue, "HandoffUnavailable",
 			"The destructive Job cannot start: "+handoffErr.Error())
 		if statusErr := r.Client.Status().Update(ctx, td); statusErr != nil {

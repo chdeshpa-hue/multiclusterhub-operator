@@ -268,6 +268,14 @@ func (r *HubTeardownReconciler) walkInventory(ctx context.Context, log logr.Logg
 		if parseErr != nil || !isACMAPIGroup(groupVersion.Group) {
 			continue
 		}
+		// The HubTeardown CR is the controller's own control object. Its
+		// finalizer must not appear in the inventory: adding the finalizer
+		// when the CR becomes active would otherwise add a blocker and change
+		// the report digest, making the acknowledged dry-run digest lapse
+		// before the teardown Job can start.
+		if isTeardownControlResource(groupVersion.Group, object.Kind) {
+			continue
+		}
 		dr := discoveredResourceFromMetadata(object, groupVersion)
 		if needsFullObject(dr.Ref.Kind) {
 			if enrichErr := r.enrichDiscoveredResource(ctx, &dr); enrichErr != nil {
@@ -284,6 +292,10 @@ func (r *HubTeardownReconciler) walkInventory(ctx context.Context, log logr.Logg
 		log.Error(err, "Inventory walk returned an error with a partial result")
 	}
 	return nil
+}
+
+func isTeardownControlResource(group, kind string) bool {
+	return group == operatorv1.GroupVersion.Group && kind == "HubTeardown"
 }
 
 func discoveredResourceFromMetadata(object *metav1.PartialObjectMetadata, groupVersion schema.GroupVersion) DiscoveredResource {

@@ -5,6 +5,7 @@ package controllers
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -145,6 +146,27 @@ func TestIsACMAPIGroup(t *testing.T) {
 			got := isACMAPIGroup(tt.group)
 			if got != tt.want {
 				t.Errorf("isACMAPIGroup(%q) = %v, want %v", tt.group, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsTeardownControlResource(t *testing.T) {
+	tests := []struct {
+		name  string
+		group string
+		kind  string
+		want  bool
+	}{
+		{"active teardown CR", operatorv1.GroupVersion.Group, "HubTeardown", true},
+		{"target MCH is not a control object", operatorv1.GroupVersion.Group, "MultiClusterHub", false},
+		{"foreign HubTeardown kind", "example.com", "HubTeardown", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTeardownControlResource(tt.group, tt.kind); got != tt.want {
+				t.Errorf("isTeardownControlResource(%q, %q) = %v, want %v", tt.group, tt.kind, got, tt.want)
 			}
 		})
 	}
@@ -606,7 +628,7 @@ func TestEnsureTeardownJob_CreatesJob(t *testing.T) {
 	}
 }
 
-func TestEnsureTeardownJob_NoImageSkips(t *testing.T) {
+func TestEnsureTeardownJob_NoImageFails(t *testing.T) {
 	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
 
 	td := &operatorv1.HubTeardown{
@@ -617,23 +639,66 @@ func TestEnsureTeardownJob_NoImageSkips(t *testing.T) {
 	}
 
 	r := newTeardownTestReconciler()
-	os.Unsetenv("OPERATOR_IMAGE")
-	os.Unsetenv("RELATED_IMAGE_MULTICLUSTERHUB_OPERATOR")
+	t.Setenv("OPERATOR_IMAGE", "")
+	t.Setenv("RELATED_IMAGE_MULTICLUSTERHUB_OPERATOR", "")
+	t.Setenv("POD_NAMESPACE", "")
 
 	ctx := context.Background()
 	log := ctrllog.Log.WithName("test")
 
-	if err := r.ensurePrepareJob(ctx, log, td); err != nil {
-		t.Fatalf("ensurePrepareJob should not fail when image is unset: %v", err)
+	err := r.ensurePrepareJob(ctx, log, td)
+	if err == nil {
+		t.Fatal("ensurePrepareJob must fail when no teardown Job image can be resolved")
+	}
+	if !strings.Contains(err.Error(), "image") {
+		t.Fatalf("error should explain the missing image, got: %v", err)
+	}
+}
+
+func TestEnsureTeardownJob_UsesOperatorDeploymentImage(t *testing.T) {
+	ctrllog.SetLogger(zap.New(zap.UseDevMode(true)))
+
+	t.Setenv("OPERATOR_IMAGE", "")
+	t.Setenv("RELATED_IMAGE_MULTICLUSTERHUB_OPERATOR", "")
+	t.Setenv("POD_NAMESPACE", "open-cluster-management")
+
+	s := newTestScheme()
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      operatorDeploymentName,
+			Namespace: "open-cluster-management",
+		},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: operatorContainerName, Image: "quay.io/test/from-deployment:latest"},
+					},
+				},
+			},
+		},
+	}
+	r := &HubTeardownReconciler{
+		Client:   fake.NewClientBuilder().WithScheme(s).WithObjects(deployment).Build(),
+		Scheme:   s,
+		Log:      ctrllog.Log,
+		Recorder: record.NewFakeRecorder(10),
+	}
+	td := &operatorv1.HubTeardown{
+		ObjectMeta: metav1.ObjectMeta{Name: "teardown", Namespace: "open-cluster-management"},
+	}
+
+	ctx := context.Background()
+	if err := r.ensurePrepareJob(ctx, ctrllog.Log.WithName("test"), td); err != nil {
+		t.Fatalf("ensurePrepareJob failed: %v", err)
 	}
 
 	job := &batchv1.Job{}
-	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      prepareJobName,
-		Namespace: td.Namespace,
-	}, job)
-	if err == nil {
-		t.Error("expected Job NOT to be created when image is unset")
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: prepareJobName, Namespace: td.Namespace}, job); err != nil {
+		t.Fatalf("expected Job to be created, got error: %v", err)
+	}
+	if got := job.Spec.Template.Spec.Containers[0].Image; got != "quay.io/test/from-deployment:latest" {
+		t.Fatalf("Job image = %q, want the operator Deployment image", got)
 	}
 }
 

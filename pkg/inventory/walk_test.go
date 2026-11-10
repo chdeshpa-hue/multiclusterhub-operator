@@ -64,6 +64,15 @@ func listable(groupVersion string, names ...string) *metav1.APIResourceList {
 	return resourceList
 }
 
+func listableWithKind(groupVersion, kind, name string) *metav1.APIResourceList {
+	return &metav1.APIResourceList{
+		GroupVersion: groupVersion,
+		APIResources: []metav1.APIResource{
+			{Name: name, Kind: kind, Verbs: metav1.Verbs{"get", "list", "watch"}},
+		},
+	}
+}
+
 type listerCall struct {
 	gvr   schema.GroupVersionResource
 	limit int64
@@ -210,6 +219,33 @@ func TestWalkListsOnlyThroughPageLister(t *testing.T) {
 	}
 	if got := lister.callCount(); got != 2 {
 		t.Fatalf("expected exactly 2 lister calls (one per GVR), got %d", got)
+	}
+}
+
+// A metadata list leaves TypeMeta at meta.k8s.io/v1 / PartialObjectMetadata.
+// The walk must replace it with the discovered GVK, otherwise the graph's
+// ACM-group filter drops every object and the teardown sees an empty cluster.
+func TestWalkStampsDiscoveredGroupVersionKind(t *testing.T) {
+	lister := newFakeLister()
+	lister.setPages(gvrWidgets, &metav1.PartialObjectMetadataList{Items: []Object{
+		object("1", "a", "one", schema.GroupVersionKind{Group: "meta.k8s.io", Version: "v1", Kind: "PartialObjectMetadata"}),
+	}})
+
+	walker := &Walker{
+		Discovery: newStubDiscovery([]*metav1.APIResourceList{listableWithKind("acme.io/v1", "Widget", "widgets")}),
+		Lister:    lister,
+	}
+
+	result, err := walker.Walk(context.Background(), WalkOptions{})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(result.Objects) != 1 {
+		t.Fatalf("expected 1 object, got %d", len(result.Objects))
+	}
+	want := schema.GroupVersionKind{Group: "acme.io", Version: "v1", Kind: "Widget"}
+	if got := result.Objects[0].GroupVersionKind(); got != want {
+		t.Fatalf("object GVK = %v, want %v", got, want)
 	}
 }
 
@@ -374,7 +410,7 @@ func TestWalkExcludesEventsAndSaysSo(t *testing.T) {
 	if lister.calledFor(schema.GroupVersionResource{Group: "events.k8s.io", Version: "v1", Resource: "events"}) {
 		t.Fatalf("events.k8s.io events must not be listed")
 	}
-	if len(result.Excluded) != 2 {
+	if len(result.Excluded) != len(DefaultExclusions()) {
 		t.Fatalf("exclusions must be reported, got %+v", result.Excluded)
 	}
 	for _, exclusion := range result.Excluded {
@@ -503,6 +539,18 @@ func TestWalkOptionsDefaults(t *testing.T) {
 	if len(opts.Exclusions) != len(DefaultExclusions()) {
 		t.Fatalf("default exclusions not applied: %+v", opts.Exclusions)
 	}
+}
+
+func TestDefaultExclusionsExcludeProjectRequests(t *testing.T) {
+	for _, exclusion := range DefaultExclusions() {
+		if exclusion.Group == "project.openshift.io" && exclusion.Resource == "projectrequests" {
+			if exclusion.Reason == "" {
+				t.Fatal("projectrequests exclusion must state why it is omitted")
+			}
+			return
+		}
+	}
+	t.Fatal("projectrequests must be excluded from the metadata walk")
 }
 
 // I-16: a discovery endpoint that never answers is bounded, not waited on.

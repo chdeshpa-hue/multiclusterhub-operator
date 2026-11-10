@@ -57,13 +57,26 @@ type Exclusion struct {
 // DefaultExclusions returns the resources left out unless the caller opts in.
 //
 // events carry no ownership signal for teardown and can be the largest
-// collection on a hub. This is the only judgement call in the measured
-// constraint set; everything else came from a number.
+// collection on a hub. projectrequests is a virtual request endpoint: it
+// advertises list, but a metadata list returns a Status object instead of
+// object metadata.
 func DefaultExclusions() []Exclusion {
-	const reason = "events carry no ownership signal for teardown and can be the largest collection on a hub"
 	return []Exclusion{
-		{Group: "", Resource: "events", Reason: reason},
-		{Group: "events.k8s.io", Resource: "events", Reason: reason},
+		{
+			Group:    "",
+			Resource: "events",
+			Reason:   "events carry no ownership signal for teardown and can be the largest collection on a hub",
+		},
+		{
+			Group:    "events.k8s.io",
+			Resource: "events",
+			Reason:   "events carry no ownership signal for teardown and can be the largest collection on a hub",
+		},
+		{
+			Group:    "project.openshift.io",
+			Resource: "projectrequests",
+			Reason:   "virtual create-only request resource; a metadata list returns a Status object, not object metadata",
+		},
 	}
 }
 
@@ -277,8 +290,13 @@ func (w *Walker) discoveryPath() string {
 	return DiscoveryPathLegacy
 }
 
-func (w *Walker) listableResources(resources []*metav1.APIResourceList, exclusions []Exclusion) []schema.GroupVersionResource {
-	var gvrs []schema.GroupVersionResource
+type listTarget struct {
+	gvr  schema.GroupVersionResource
+	kind string
+}
+
+func (w *Walker) listableResources(resources []*metav1.APIResourceList, exclusions []Exclusion) []listTarget {
+	var targets []listTarget
 	for _, resourceList := range resources {
 		if resourceList == nil {
 			continue
@@ -298,24 +316,27 @@ func (w *Walker) listableResources(resources []*metav1.APIResourceList, exclusio
 			if isExcluded(exclusions, gv.Group, resource.Name) {
 				continue
 			}
-			gvrs = append(gvrs, gv.WithResource(resource.Name))
+			targets = append(targets, listTarget{
+				gvr:  gv.WithResource(resource.Name),
+				kind: resource.Kind,
+			})
 		}
 	}
-	sort.Slice(gvrs, func(i, j int) bool {
-		if gvrs[i].Group != gvrs[j].Group {
-			return gvrs[i].Group < gvrs[j].Group
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].gvr.Group != targets[j].gvr.Group {
+			return targets[i].gvr.Group < targets[j].gvr.Group
 		}
-		if gvrs[i].Version != gvrs[j].Version {
-			return gvrs[i].Version < gvrs[j].Version
+		if targets[i].gvr.Version != targets[j].gvr.Version {
+			return targets[i].gvr.Version < targets[j].gvr.Version
 		}
-		return gvrs[i].Resource < gvrs[j].Resource
+		return targets[i].gvr.Resource < targets[j].gvr.Resource
 	})
-	return gvrs
+	return targets
 }
 
 // walkResources lists every GVR with a bounded worker pool and returns the
 // number of pages fetched.
-func (w *Walker) walkResources(ctx context.Context, gvrs []schema.GroupVersionResource, opts WalkOptions, result *WalkResult) int {
+func (w *Walker) walkResources(ctx context.Context, targets []listTarget, opts WalkOptions, result *WalkResult) int {
 	var (
 		mu    sync.Mutex
 		pages int
@@ -324,17 +345,17 @@ func (w *Walker) walkResources(ctx context.Context, gvrs []schema.GroupVersionRe
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(opts.Concurrency)
 
-	for _, resource := range gvrs {
-		resource := resource
+	for _, target := range targets {
+		target := target
 		group.Go(func() error {
-			objects, fetched, err := w.listAll(groupCtx, resource, opts)
+			objects, fetched, err := w.listAll(groupCtx, target, opts)
 			mu.Lock()
 			defer mu.Unlock()
 			pages += fetched
 			if err != nil {
 				result.Incomplete = append(result.Incomplete, Incomplete{
-					Group:    resource.Group,
-					Resource: resource.Resource,
+					Group:    target.gvr.Group,
+					Resource: target.gvr.Resource,
 					Reason:   err.Error(),
 				})
 				return nil
@@ -349,19 +370,25 @@ func (w *Walker) walkResources(ctx context.Context, gvrs []schema.GroupVersionRe
 	return pages
 }
 
-func (w *Walker) listAll(ctx context.Context, gvr schema.GroupVersionResource, opts WalkOptions) ([]Object, int, error) {
+func (w *Walker) listAll(ctx context.Context, target listTarget, opts WalkOptions) ([]Object, int, error) {
 	var objects []Object
 	pages := 0
 
 	listOptions := metav1.ListOptions{Limit: opts.PageLimit}
 	for {
 		pageCtx, cancel := context.WithTimeout(ctx, opts.ListTimeout)
-		page, err := w.Lister.ListPage(pageCtx, gvr, listOptions)
+		page, err := w.Lister.ListPage(pageCtx, target.gvr, listOptions)
 		cancel()
 		if err != nil {
 			return objects, pages, err
 		}
 		pages++
+		// A metadata list returns meta.k8s.io/v1 / PartialObjectMetadata in
+		// each item's TypeMeta. Stamp the discovered GVK back onto the item so
+		// callers can classify it by its real group and kind.
+		for i := range page.Items {
+			page.Items[i].SetGroupVersionKind(target.gvr.GroupVersion().WithKind(target.kind))
+		}
 		objects = append(objects, page.Items...)
 
 		if page.GetContinue() == "" {

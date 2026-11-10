@@ -387,6 +387,16 @@ func reportDigest(report inspectReport) string {
 		zeroObservationTimes(reflect.ValueOf(blocker).Elem())
 		canonicalBlockers = append(canonicalBlockers, *blocker)
 	}
+	canonicalIncomplete := append([]ScanIncomplete(nil), report.Inventory.Incomplete...)
+	sort.Slice(canonicalIncomplete, func(i, j int) bool {
+		if canonicalIncomplete[i].Group != canonicalIncomplete[j].Group {
+			return canonicalIncomplete[i].Group < canonicalIncomplete[j].Group
+		}
+		if canonicalIncomplete[i].Resource != canonicalIncomplete[j].Resource {
+			return canonicalIncomplete[i].Resource < canonicalIncomplete[j].Resource
+		}
+		return canonicalIncomplete[i].Reason < canonicalIncomplete[j].Reason
+	})
 	canonical := struct {
 		Summary    operatorv1.BlockerSummary `json:"summary"`
 		Blockers   []operatorv1.Blocker      `json:"blockers"`
@@ -395,7 +405,7 @@ func reportDigest(report inspectReport) string {
 	}{
 		Summary:    report.Summary,
 		Blockers:   canonicalBlockers,
-		Incomplete: report.Inventory.Incomplete,
+		Incomplete: canonicalIncomplete,
 		Ownership:  report.Inventory.Ownership,
 	}
 	body, err := json.Marshal(canonical)

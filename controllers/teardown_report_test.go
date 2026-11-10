@@ -156,6 +156,24 @@ func TestBuildInspectReportDigestIgnoresScanTime(t *testing.T) {
 	}
 }
 
+func TestBuildInspectReportDigestIgnoresIncompleteOrdering(t *testing.T) {
+	graph := &DependencyGraph{
+		Incomplete: []ScanIncomplete{
+			{Group: "b.example.com", Resource: "widgets", Reason: "discovery failed"},
+			{Group: "a.example.com", Resource: "gadgets", Reason: "list failed"},
+		},
+	}
+	td := testTeardown()
+
+	_, firstMeta := buildInspectReport(td, graph, testScanTime, "")
+	graph.Incomplete[0], graph.Incomplete[1] = graph.Incomplete[1], graph.Incomplete[0]
+	_, secondMeta := buildInspectReport(td, graph, testScanTime, "")
+
+	if firstMeta.Digest != secondMeta.Digest {
+		t.Fatalf("digest must ignore inventory-incomplete ordering: %s != %s", firstMeta.Digest, secondMeta.Digest)
+	}
+}
+
 // graphWithEvidence builds a one-blocker graph whose ownership verdict carries
 // evidence observed at the supplied time.
 func graphWithEvidence(observed metav1.Time) *DependencyGraph {

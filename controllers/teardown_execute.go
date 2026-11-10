@@ -263,18 +263,7 @@ func (r *HubTeardownReconciler) sweepDanglingRegistrations(
 	authz *authzContext,
 ) (bool, error) {
 	servicePresent := func(namespace, name string) (bool, error) {
-		if namespace == "" || name == "" {
-			return false, nil
-		}
-		svc := &corev1.Service{}
-		err := r.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, svc)
-		if err == nil {
-			return true, nil
-		}
-		if errors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, err
+		return r.servicePresent(ctx, namespace, name)
 	}
 
 	allSettled := true
@@ -405,6 +394,24 @@ func allServicesAbsent(
 		}
 	}
 	return len(services) > 0, nil
+}
+
+// servicePresent reports whether the named Service object exists. An empty
+// reference cannot be absent, so it is reported false. Any read error other
+// than NotFound is returned so the caller can refuse to claim absence.
+func (r *HubTeardownReconciler) servicePresent(ctx context.Context, namespace, name string) (bool, error) {
+	if namespace == "" || name == "" {
+		return false, nil
+	}
+	svc := &corev1.Service{}
+	err := r.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, svc)
+	if err == nil {
+		return true, nil
+	}
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (r *HubTeardownReconciler) deleteDanglingRegistration(

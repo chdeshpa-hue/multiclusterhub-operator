@@ -16,9 +16,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -75,6 +77,7 @@ var _ = Describe("HubTeardown controller", func() {
 		Expect(subv1alpha1.AddToScheme(clientScheme)).Should(Succeed())
 		Expect(admissionregistrationv1.AddToScheme(clientScheme)).Should(Succeed())
 		Expect(rbacv1.AddToScheme(clientScheme)).Should(Succeed())
+		Expect(apiregistrationv1.AddToScheme(clientScheme)).Should(Succeed())
 
 		k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
 			Scheme: clientScheme,
@@ -149,14 +152,14 @@ var _ = Describe("HubTeardown controller", func() {
 		Expect(fetched.Status.DryRunReport).NotTo(BeNil())
 	})
 
-	It("should add the teardown finalizer on the CR", func() {
+	It("should add the teardown finalizer on an active CR", func() {
 		td := &operatorv1.HubTeardown{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      tdName + "-fin",
 				Namespace: tdNs,
 			},
 			Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
-				DryRun: true,
+				DryRun: false,
 			},
 		}
 
@@ -174,6 +177,74 @@ var _ = Describe("HubTeardown controller", func() {
 			}
 			return false
 		}, tdTimeout, tdInterval).Should(BeTrue(), "teardown finalizer should be added to the CR")
+	})
+
+	It("should not add the teardown finalizer to a dry-run CR", func() {
+		td := &operatorv1.HubTeardown{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      tdName + "-dryfin",
+				Namespace: tdNs,
+			},
+			Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
+				DryRun: true,
+			},
+		}
+
+		Expect(k8sClient.Create(ctxTD, td)).Should(Succeed())
+
+		Eventually(func() bool {
+			fetched := &operatorv1.HubTeardown{}
+			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, fetched); err != nil {
+				return false
+			}
+			for _, c := range fetched.Status.Conditions {
+				if c.Type == conditionTypeDryRunComplete && c.Status == metav1.ConditionTrue {
+					return true
+				}
+			}
+			return false
+		}, tdTimeout, tdInterval).Should(BeTrue(), "DryRunComplete condition should be True")
+
+		fetched := &operatorv1.HubTeardown{}
+		Expect(k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, fetched)).Should(Succeed())
+		Expect(fetched.GetFinalizers()).NotTo(ContainElement(teardownJobFinalizer),
+			"a dry-run CR creates no handoff objects and must not be blocked from deletion")
+	})
+
+	It("should delete a dry-run CR without waiting for a finalizer", func() {
+		td := &operatorv1.HubTeardown{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      tdName + "-drydelete",
+				Namespace: tdNs,
+			},
+			Spec: operatorv1.HubTeardownSpec{HubRef: testHubRef(),
+				DryRun: true,
+			},
+		}
+
+		Expect(k8sClient.Create(ctxTD, td)).Should(Succeed())
+
+		Eventually(func() bool {
+			fetched := &operatorv1.HubTeardown{}
+			if err := k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, fetched); err != nil {
+				return false
+			}
+			for _, c := range fetched.Status.Conditions {
+				if c.Type == conditionTypeDryRunComplete && c.Status == metav1.ConditionTrue {
+					return true
+				}
+			}
+			return false
+		}, tdTimeout, tdInterval).Should(BeTrue(), "DryRunComplete condition should be True")
+
+		fetched := &operatorv1.HubTeardown{}
+		Expect(k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, fetched)).Should(Succeed())
+		Expect(k8sClient.Delete(ctxTD, fetched)).Should(Succeed())
+
+		Eventually(func() bool {
+			err := k8sClient.Get(ctxTD, types.NamespacedName{Name: td.Name, Namespace: tdNs}, &operatorv1.HubTeardown{})
+			return apierrors.IsNotFound(err)
+		}, tdTimeout, tdInterval).Should(BeTrue(), "dry-run CR should not be held by a finalizer")
 	})
 
 	It("should hold at the approval boundary when dryRun is disabled without consent", func() {

@@ -82,13 +82,9 @@ func (r *HubTeardownReconciler) ensureJobNamed(ctx context.Context, log logr.Log
 		return fmt.Errorf("checking for existing teardown Job: %w", err)
 	}
 
-	operatorImage := os.Getenv("OPERATOR_IMAGE")
-	if operatorImage == "" {
-		operatorImage = os.Getenv("RELATED_IMAGE_MULTICLUSTERHUB_OPERATOR")
-	}
-	if operatorImage == "" {
-		log.Info("OPERATOR_IMAGE not set, skipping Job creation (teardown will rely on controller only)")
-		return nil
+	operatorImage, err := r.teardownJobImage(ctx)
+	if err != nil {
+		return err
 	}
 
 	backoffLimit := int32(2)

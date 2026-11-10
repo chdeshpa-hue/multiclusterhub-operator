@@ -62,11 +62,14 @@ func verifyOperatorNamespaceKeepObjects(namespace string) []verify.ObjectRef {
 func verifyPolicy(td *operatorv1.HubTeardown) verify.Policy {
 	return verify.Policy{
 		OperatorNamespace: td.Namespace,
-		ACMGroupSuffixes:  acmAPIGroupSuffixes,
-		ACMNamespaces:     verifyACMNamespaces,
-		KeepCRDs:          verifyKeepCRDs,
-		KeepObjects:       verifyOperatorNamespaceKeepObjects(td.Namespace),
-		OperatorAPIGroup:  verifyOperatorAPIGroup,
+		// Verification classifies ownership, not scan reach. metal3.io is
+		// scanned because ACM integrates with it, but its CRDs belong to the
+		// platform and must not be reported as ACM residue.
+		ACMGroupSuffixes: acmOwnedGroupSuffixes,
+		ACMNamespaces:    verifyACMNamespaces,
+		KeepCRDs:         verifyKeepCRDs,
+		KeepObjects:      verifyOperatorNamespaceKeepObjects(td.Namespace),
+		OperatorAPIGroup: verifyOperatorAPIGroup,
 	}
 }
 
@@ -176,12 +179,20 @@ func (r *HubTeardownReconciler) observeForVerification(ctx context.Context, log 
 		input.Incomplete = append(input.Incomplete, "validatingwebhookconfigurations: "+err.Error())
 	}
 	for i := range vwcList.Items {
-		input.Webhooks = append(input.Webhooks, verify.WebhookRef{
+		item := &vwcList.Items[i]
+		ref := verify.WebhookRef{
 			Kind:             "ValidatingWebhookConfiguration",
-			Name:             vwcList.Items[i].Name,
-			ServiceNamespace: firstValidatingWebhookServiceNamespace(vwcList.Items[i].Webhooks),
-			ACMOwned:         hasInstallerLabels(vwcList.Items[i].Labels, td.Namespace),
-		})
+			Name:             item.Name,
+			ServiceNamespace: firstValidatingWebhookServiceNamespace(item.Webhooks),
+			ACMOwned:         hasInstallerLabels(item.Labels, td.Namespace),
+		}
+		services, decisive := validatingRegistrationServices(item.Webhooks)
+		ref.BackingServices, ref.ServicesAbsent, err = r.webhookBackingServices(ctx, services, decisive)
+		if err != nil {
+			input.Incomplete = append(input.Incomplete,
+				fmt.Sprintf("validatingwebhookconfigurations/%s: %v", item.Name, err))
+		}
+		input.Webhooks = append(input.Webhooks, ref)
 	}
 
 	mwcList := &admissionregistrationv1.MutatingWebhookConfigurationList{}
@@ -189,12 +200,20 @@ func (r *HubTeardownReconciler) observeForVerification(ctx context.Context, log 
 		input.Incomplete = append(input.Incomplete, "mutatingwebhookconfigurations: "+err.Error())
 	}
 	for i := range mwcList.Items {
-		input.Webhooks = append(input.Webhooks, verify.WebhookRef{
+		item := &mwcList.Items[i]
+		ref := verify.WebhookRef{
 			Kind:             "MutatingWebhookConfiguration",
-			Name:             mwcList.Items[i].Name,
-			ServiceNamespace: firstMutatingWebhookServiceNamespace(mwcList.Items[i].Webhooks),
-			ACMOwned:         hasInstallerLabels(mwcList.Items[i].Labels, td.Namespace),
-		})
+			Name:             item.Name,
+			ServiceNamespace: firstMutatingWebhookServiceNamespace(item.Webhooks),
+			ACMOwned:         hasInstallerLabels(item.Labels, td.Namespace),
+		}
+		services, decisive := mutatingRegistrationServices(item.Webhooks)
+		ref.BackingServices, ref.ServicesAbsent, err = r.webhookBackingServices(ctx, services, decisive)
+		if err != nil {
+			input.Incomplete = append(input.Incomplete,
+				fmt.Sprintf("mutatingwebhookconfigurations/%s: %v", item.Name, err))
+		}
+		input.Webhooks = append(input.Webhooks, ref)
 	}
 
 	// Core-group objects in the preserved namespace are not residue under D-G.
@@ -246,6 +265,31 @@ func (r *HubTeardownReconciler) observeForVerification(ctx context.Context, log 
 	}
 
 	return input, nil
+}
+
+// webhookBackingServices records the Service-backed client configurations and
+// whether every one of them was observed absent. decisive is false when the
+// configuration has a URL-based client: without a Service reference there is
+// nothing to prove absent, so the registration stays report-only.
+func (r *HubTeardownReconciler) webhookBackingServices(
+	ctx context.Context,
+	services []registrationService,
+	decisive bool,
+) ([]verify.ServiceRef, bool, error) {
+	if !decisive {
+		return nil, false, nil
+	}
+	refs := make([]verify.ServiceRef, 0, len(services))
+	for _, service := range services {
+		refs = append(refs, verify.ServiceRef{Namespace: service.Namespace, Name: service.Name})
+	}
+	absent, err := allServicesAbsent(services, func(namespace, name string) (bool, error) {
+		return r.servicePresent(ctx, namespace, name)
+	})
+	if err != nil {
+		return refs, false, err
+	}
+	return refs, absent, nil
 }
 
 // hasInstallerLabels reports whether an object carries the labels ACM stamps on
